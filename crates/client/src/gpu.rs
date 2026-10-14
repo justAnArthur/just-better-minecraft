@@ -36,9 +36,25 @@ impl Gpu {
     /// adapter. Never panics.
     pub fn headless() -> Result<Gpu, GpuError> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        Self::connect(instance, None)
+    }
+
+    /// Creates a GPU connection that can present to `surface`. The
+    /// instance must be the one the surface was created from.
+    pub fn for_surface(
+        instance: wgpu::Instance,
+        surface: &wgpu::Surface<'_>,
+    ) -> Result<Gpu, GpuError> {
+        Self::connect(instance, Some(surface))
+    }
+
+    fn connect(
+        instance: wgpu::Instance,
+        compatible_surface: Option<&wgpu::Surface<'_>>,
+    ) -> Result<Gpu, GpuError> {
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
+            compatible_surface,
             force_fallback_adapter: false,
             apply_limit_buckets: Default::default(),
         }))

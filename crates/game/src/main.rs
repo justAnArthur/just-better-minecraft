@@ -1,7 +1,6 @@
-//! The `jbm` binary: starts the client and an in-process server.
+//! The `jbm` binary: starts the client window. The in-process server
+//! (task 1.3) and its wiring arrive in Stage 1 wave B.
 
-fn main() {
-    // jbm-client and jbm-server are linked in so the binary pulls in both
-    // sides; nothing starts them yet (Stage 0 is an empty workspace).
-    println!("{} v{}", jbm_core::ENGINE_NAME, env!("CARGO_PKG_VERSION"));
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    jbm_client::app::run()
 }
