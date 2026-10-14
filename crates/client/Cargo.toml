@@ -24,5 +24,10 @@ bytemuck.workspace = true
 font8x8.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 # Self dev-dependency so `tests/` can enable the `testing` feature.
 jbm-client = { path = ".", features = ["testing"] }
+
+[[bench]]
+name = "mesh_bench"
+harness = false

@@ -1,11 +1,16 @@
-//! Window, surface and the frame loop: fly camera over the sky with the
-//! debug overlay on top.
+//! Window, surface and the frame loop: the client runtime. Drains the
+//! server link into a [`ClientWorld`], re-meshes dirty cubes on a
+//! [`MeshPool`], uploads finished meshes within a per-frame budget, and
+//! renders sky + terrain + debug overlay.
 
 use std::error::Error;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use glam::DVec3;
+use jbm_core::block::{BlockRegistry, builtin};
+use jbm_core::link::ClientLink;
+use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION, ServerMsg};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -15,17 +20,34 @@ use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 use crate::camera::Camera;
 use crate::gpu::Gpu;
 use crate::input::{FlyController, InputState, Key as MoveKey};
+use crate::mesh::appearance::BlockAppearance;
+use crate::mesh::pool::MeshPool;
+use crate::render::chunks::TerrainPass;
 use crate::render::overlay::{FrameStats, OverlayText};
 use crate::render::renderer::{DepthTarget, Renderer};
+use crate::render::texture_array::BlockTextures;
+use crate::world::ClientWorld;
 
 /// Frame dt is clamped so a pause (window drag, debugger) does not
 /// teleport the camera.
 const MAX_DT: f32 = 0.25;
 
-/// Spawns the game window and runs the frame loop until the user quits.
-pub fn run() -> Result<(), Box<dyn Error>> {
+/// PlayerInput sends are rate-limited to 20 per second.
+const INPUT_PERIOD: Duration = Duration::from_millis(50);
+
+/// Dirty cubes handed to the mesh pool per frame.
+const SUBMIT_BUDGET: usize = 16;
+
+/// Finished meshes uploaded to the GPU per frame, so streaming never
+/// hitches a frame. Leftover results stay queued for the next frame.
+const UPLOAD_BUDGET: usize = 32;
+
+/// Spawns the game window and runs the frame loop until the user quits
+/// (or the server link dies). `link` is the client's end of a connection;
+/// `main` wires it to an in-process server.
+pub fn run(link: ClientLink) -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::new()?;
-    let mut app = App::new();
+    let mut app = App::new(link);
     event_loop.run_app(&mut app)?;
     Ok(())
 }
@@ -38,6 +60,7 @@ struct Windowed {
     config: wgpu::SurfaceConfiguration,
     renderer: Renderer,
     depth: DepthTarget,
+    terrain: TerrainPass,
 }
 
 struct App {
@@ -51,10 +74,32 @@ struct App {
     /// pauses until it is visible again.
     occluded: bool,
     last_frame: Option<Instant>,
+    /// Server link; drained every frame without blocking.
+    link: ClientLink,
+    world: ClientWorld,
+    pool: MeshPool,
+    /// Mesh jobs submitted but not yet received back.
+    in_flight: usize,
+    joined: bool,
+    client_tick: u64,
+    last_input: Option<Instant>,
+    /// Set when the server refused, disconnected or the link closed; the
+    /// loop exits cleanly after the current frame.
+    fatal: Option<String>,
 }
 
 impl App {
-    fn new() -> App {
+    fn new(link: ClientLink) -> App {
+        let mut registry = BlockRegistry::new();
+        builtin::register(&mut registry);
+        let appearance = Arc::new(BlockAppearance::new(&registry));
+        let mut link = link;
+        if let Err(err) = link.send(ClientMsg::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            name: "player".to_owned(),
+        }) {
+            eprintln!("cannot reach the server: {err}");
+        }
         App {
             windowed: None,
             camera: Camera::new(
@@ -68,6 +113,14 @@ impl App {
             cursor_grabbed: false,
             occluded: false,
             last_frame: None,
+            link,
+            world: ClientWorld::new(),
+            pool: MeshPool::new(appearance, 0),
+            in_flight: 0,
+            joined: false,
+            client_tick: 0,
+            last_input: None,
+            fatal: None,
         }
     }
 
@@ -116,6 +169,10 @@ impl App {
         renderer.set_viewport(config.width, config.height);
         self.camera.aspect = config.width as f32 / config.height as f32;
 
+        let (layers, _) = crate::mesh::appearance::builtin_textures();
+        let textures = BlockTextures::new(&gpu, &layers)?;
+        let terrain = TerrainPass::new(&gpu, format, renderer.uniform_layout(), &textures);
+
         window.request_redraw();
         self.windowed = Some(Windowed {
             window,
@@ -124,6 +181,7 @@ impl App {
             config,
             renderer,
             depth,
+            terrain,
         });
         Ok(())
     }
@@ -133,6 +191,87 @@ impl App {
         w.depth
             .resize(&w.gpu.device, w.config.width, w.config.height);
         w.renderer.set_viewport(w.config.width, w.config.height);
+    }
+
+    /// Drains every queued server message (bounded work per message, no
+    /// cap on count) and applies it. Sets `fatal` on terminal errors.
+    fn pump_link(&mut self, w: &mut Windowed) {
+        loop {
+            match self.link.try_recv() {
+                Ok(Some(msg)) => match &msg {
+                    ServerMsg::Welcome { spawn, .. } => {
+                        self.camera.position = DVec3::from(*spawn);
+                        self.joined = true;
+                    }
+                    ServerMsg::Rejected { reason } => {
+                        eprintln!("server rejected the connection: {reason}");
+                        self.fatal = Some(reason.clone());
+                        return;
+                    }
+                    ServerMsg::Disconnected { reason } => {
+                        eprintln!("server disconnected: {reason}");
+                        self.fatal = Some(reason.clone());
+                        return;
+                    }
+                    ServerMsg::CubeData { .. } | ServerMsg::UnloadCube { .. } => {
+                        if let crate::world::WorldChange::Unloaded(pos) = self.world.apply(&msg) {
+                            w.terrain.remove(pos);
+                        }
+                    }
+                    ServerMsg::Tick { .. } | ServerMsg::Pong { .. } => {}
+                },
+                Ok(None) => return,
+                Err(err) => {
+                    eprintln!("server link closed: {err}");
+                    self.fatal = Some(err.to_string());
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Sends the camera state at most [`INPUT_PERIOD`].
+    fn send_input(&mut self) {
+        if !self.joined || self.last_input.is_some_and(|t| t.elapsed() < INPUT_PERIOD) {
+            return;
+        }
+        let p = self.camera.position;
+        let message = ClientMsg::PlayerInput {
+            client_tick: self.client_tick,
+            position: [p.x, p.y, p.z],
+            yaw: self.camera.yaw,
+            pitch: self.camera.pitch,
+        };
+        self.client_tick += 1;
+        self.last_input = Some(Instant::now());
+        if let Err(err) = self.link.send(message) {
+            eprintln!("cannot send input, server link closed: {err}");
+            self.fatal = Some(err.to_string());
+        }
+    }
+
+    /// Submits dirty cubes to the pool and receives finished meshes,
+    /// uploading at most [`UPLOAD_BUDGET`] of them. Stale results (the
+    /// cube changed again) are dropped.
+    fn pump_meshing(&mut self, w: &mut Windowed) {
+        let inputs = self.world.take_dirty(SUBMIT_BUDGET, self.camera.position);
+        self.in_flight += inputs.len();
+        for (pos, version, input) in inputs {
+            self.pool.submit(pos, version, input);
+        }
+
+        let mut uploads = 0;
+        while uploads < UPLOAD_BUDGET {
+            let Some(result) = self.pool.try_recv() else {
+                break;
+            };
+            self.in_flight -= 1;
+            if self.world.version(result.pos) != Some(result.version) {
+                continue; // stale: a newer version exists and is queued
+            }
+            w.terrain.upload(&w.gpu, result.pos, &result.output);
+            uploads += 1;
+        }
     }
 
     fn frame(&mut self, w: &mut Windowed) {
@@ -146,6 +285,10 @@ impl App {
         let dt = dt.as_secs_f32().min(MAX_DT);
 
         self.controller.update(&mut self.camera, &self.input, dt);
+
+        self.pump_link(w);
+        self.send_input();
+        self.pump_meshing(w);
 
         let mut overlay = OverlayText::new();
         let p = self.camera.position;
@@ -165,6 +308,18 @@ impl App {
             "YAW {:.1} PITCH {:.1}",
             self.camera.yaw.to_degrees(),
             self.camera.pitch.to_degrees()
+        ));
+        let terrain_stats = w.terrain.stats();
+        overlay.push(format!(
+            "CUBES {} MESHED {} PENDING {}",
+            self.world.cube_count(),
+            w.terrain.meshed_count(),
+            self.world.dirty_count() + self.in_flight
+        ));
+        overlay.push(format!(
+            "FACES {} DRAWS {}",
+            w.terrain.total_faces(),
+            terrain_stats.draws
         ));
 
         // Every skipped frame still asks for the next one: the first frames
@@ -193,8 +348,14 @@ impl App {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        w.renderer
-            .render(&w.gpu, &view, w.depth.view(), &self.camera, Some(&overlay));
+        w.renderer.render(
+            &w.gpu,
+            &view,
+            w.depth.view(),
+            &self.camera,
+            Some(&overlay),
+            Some(&mut w.terrain),
+        );
         w.gpu.queue.present(frame);
         if !self.occluded {
             w.window.request_redraw();
@@ -324,6 +485,9 @@ impl ApplicationHandler for App {
                 };
                 self.frame(&mut w);
                 self.windowed = Some(w);
+                if self.fatal.is_some() {
+                    event_loop.exit();
+                }
             }
             _ => {}
         }
