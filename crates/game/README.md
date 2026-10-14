@@ -3,8 +3,9 @@
 The `jbm` binary: starts the client and an in-process server talking over a
 channel (see docs/design.md, "Architecture overview").
 
-**Public API so far:** a `main` that prints the engine name and version and
-exits 0. Stage 0 scaffolding; nothing starts yet.
+**Public API so far:** `main` calls `jbm_client::app::run()`, which opens
+the game window (fly camera over the sky with a debug overlay). The
+in-process server (task 1.3) and its wiring arrive in Stage 1 wave B.
 
 **Invariants**
 

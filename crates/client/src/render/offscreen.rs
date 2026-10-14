@@ -96,12 +96,14 @@ impl OffscreenTarget {
         buffer.map_async(wgpu::MapMode::Read, .., move |result| {
             let _ = sender.send(result);
         });
-        // Wait for the submitted copy and the mapping to complete.
+        // Wait for the submitted copy and the mapping to complete. A poll
+        // failure must panic in release builds too (with the error), not
+        // hang on recv() waiting for a callback that will never fire.
         let poll = gpu.device.poll(wgpu::PollType::Wait {
             submission_index: None,
             timeout: None,
         });
-        debug_assert!(poll.is_ok(), "device poll failed: {poll:?}");
+        assert!(poll.is_ok(), "device poll failed: {poll:?}");
         receiver
             .recv()
             .expect("map callback dropped without sending")

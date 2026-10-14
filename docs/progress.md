@@ -2,7 +2,7 @@
 
 ## Next up
 
-Stage 1 · Voxel sandbox, wave A: 1.1 cube storage + palette (core), 1.2 window/wgpu/camera/texture array (client), 1.3 tick loop + channel + protocol (server, core). Write specs in docs/tasks/, then delegate in parallel. Remote: github.com/justAnArthur/just-better-minecraft (private).
+Stage 1 · Voxel sandbox, wave B: 1.4 greedy mesher + worker pool + packed faces + vertex pulling (client), 1.5 noise terrain + cube streaming around the player (server). Wave B also wires the server thread into `jbm-game` (client connects over `in_process_pair`). Before specs: run bench-1 for idle-machine baselines of the new cube/* and server/* benches.
 
 ## Benchmarks
 
@@ -15,14 +15,19 @@ Baseline = bench-0 run on an otherwise idle machine. Compare only runs made with
 
 ## Decisions
 
+- 2026-10-14: Reverse-Z infinite projection (Depth32Float, clear 0, compare Greater) and camera-relative rendering (camera pos f64, geometry offset in f64 then cast) are renderer invariants, chosen for Stage 2 view distances.
+- 2026-10-14: Cube palette lookup: linear scan up to 16 entries, local Fx-style HashMap above. `Cube::compact()` is explicit (after bulk edits / before save), never automatic on `set`.
+- 2026-10-14: Client↔server boundary is `jbm_core::link::Link<Out, In>`; in-process uses `std::sync::mpsc`. Server thread is owned by `ServerHandle` (join on drop, panics surface in `stop`).
+
 - 2026-10-14: Crate packages are prefixed `jbm-` (a package named `core` would clash with Rust's `core`). Dirs stay `crates/core` etc.
 - 2026-10-14: Workers run through `scripts/delegate.sh` (the `glm` CLI directly, in the background) rather than the haiku relay agent, so long Rust builds aren't cut off by the relay's 10-minute Bash timeout.
 - 2026-10-14: Screenshot tests compare with a tolerance and skip when no GPU adapter exists, unless `JBM_REQUIRE_GPU=1` (set in CI on Linux with Mesa lavapipe).
 
 ## Known issues
 
-- client/render/offscreen.rs: device poll failure is only a debug_assert; in release a failed poll could hang `recv()`. Fix when readback is used outside tests.
-- testkit re-derives TICK_PERIOD instead of reusing a server constant. Export one canonical constant in 1.3.
+- client/render/texture_array.rs: mip box filter applies the sRGB curve to alpha too. Fix in 1.4 before translucent textures (filter alpha linearly).
+- client/render/overlay.rs: `layout` and `glyph_count` duplicate the char filter (keep in sync or return both counts); `FrameStats` grows unbounded on repeated zero-dt frames (unreachable in app); `render` trusts `set_viewport`.
+- server/run.rs: stop/drop can wait up to one tick (≤50 ms) while the thread sleeps. Fine until shutdown latency matters.
 - First release/bench build is slow (wgpu + thin LTO + codegen-units=1). Revisit profile if CI bench-smoke gets too slow.
 
 ## Log
@@ -34,3 +39,4 @@ Baseline = bench-0 run on an otherwise idle machine. Compare only runs made with
 - Repo: github.com/justAnArthur/just-better-minecraft (private).
 - 0.4 done: bench brief exercised via bench-0 (report in format). Baseline numbers recorded above.
 - **Stage 0 gate passed.** PR #1 merged with CI green on macOS and Ubuntu; the triangle golden (made on Metal) matches on Mesa lavapipe in CI, so screenshot tolerances work across backends.
+- Stage 1 wave A merged on branch stage-1/wave-a: 1.1 cube storage + palette + block registry, 1.2 window/fly camera/sky/overlay/texture array (goldens checked by orchestrator; binary launched and ran clean), 1.3 protocol + Link + Server tick phases + real-time server thread + 100-tick headless test. All reviewers: MERGE. 92 tests green.
