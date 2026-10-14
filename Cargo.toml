@@ -19,6 +19,7 @@ all = { level = "warn", priority = -1 }
 jbm-core = { path = "crates/core" }
 jbm-client = { path = "crates/client" }
 jbm-server = { path = "crates/server" }
+criterion = "0.8.2"
 
 [profile.dev.package."*"]
 opt-level = 2
