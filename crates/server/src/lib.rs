@@ -2,10 +2,15 @@
 //! side of the protocol. Talks to the client only through `jbm-core`
 //! protocol messages.
 
+pub mod gen_pool;
 pub mod run;
 pub mod server;
+mod streaming;
+pub mod terrain;
 pub mod tick;
 
+pub use gen_pool::GenPool;
 pub use run::ServerHandle;
-pub use server::{PlayerInput, PlayerView, Server};
+pub use server::{DEFAULT_SEED, PlayerInput, PlayerView, Server, ServerConfig};
+pub use terrain::Generator;
 pub use tick::TickClock;
