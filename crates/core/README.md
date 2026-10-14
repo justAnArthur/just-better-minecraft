@@ -66,6 +66,22 @@ server exchange.
 - Invariants (unique palette entries; array empty iff uniform; every index
   `< palette.len()`) are asserted by `#[cfg(test)] Cube::check_invariants`,
   which tests call after operations.
+## Protocol and links
+
+`protocol` holds the message enums the client and server exchange:
+`PROTOCOL_VERSION`, `PlayerId`, `ClientMsg` (`Hello`, `PlayerInput`,
+`Ping`, `Disconnect`) and `ServerMsg` (`Welcome`, `Rejected`, `Tick`,
+`Pong`, `Disconnected`). Messages are plain owned data — no `Arc`, no
+references, no trait objects — all derive `Debug, Clone, PartialEq`, and
+stay serializable for a future network transport (no serde yet).
+
+`link` is the transport boundary: `trait Link<Out, In>: Send` with
+non-blocking `try_recv` (returns `Ok(None)` when empty) and
+`send`/`try_recv` returning `LinkClosed` only once the other end is gone
+and the queue has drained. `ClientLink`/`ServerLink` are boxed trait
+aliases for the two ends, and `in_process_pair()` builds a connected pair
+on `std::sync::mpsc`. A network socket can implement `Link` later without
+either side changing.
 
 ## Benchmarks
 
