@@ -14,6 +14,12 @@ jbm-client.workspace = true
 jbm-core.workspace = true
 jbm-server.workspace = true
 
+[dev-dependencies]
+# End-to-end screenshot: real server terrain rendered by the real client.
+jbm-client = { workspace = true, features = ["testing"] }
+jbm-testkit.workspace = true
+glam.workspace = true
+
 [[bin]]
 name = "jbm"
 path = "src/main.rs"

@@ -19,6 +19,7 @@ all = { level = "warn", priority = -1 }
 jbm-core = { path = "crates/core" }
 jbm-client = { path = "crates/client" }
 jbm-server = { path = "crates/server" }
+jbm-testkit = { path = "crates/testkit" }
 criterion = "0.8.2"
 wgpu = "30.0.1"
 pollster = "1.0.1"
@@ -27,6 +28,11 @@ winit = "0.30"
 glam = { version = "0.34.1", features = ["bytemuck"] }
 bytemuck = { version = "1.25.2", features = ["derive"] }
 font8x8 = "0.3.1"
+
+# Our own crates: light optimization keeps debug runs and tests fast
+# (the greedy-mesh property test is ~6x slower at opt-level 0).
+[profile.dev]
+opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 2
