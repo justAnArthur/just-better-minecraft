@@ -15,7 +15,10 @@ pub const TICKS_PER_SECOND: u32 = 20;
 /// [`TickClock::dropped_ticks`].
 pub const MAX_CATCH_UP_TICKS: u32 = 10;
 
-const TICK_PERIOD: Duration = Duration::from_millis(1000 / TICKS_PER_SECOND as u64);
+/// The one canonical tick period: `1 / TICKS_PER_SECOND`. Everything that
+/// needs "one tick of time" (including sleep pacing in the run loop) uses
+/// this constant instead of re-deriving it.
+pub const TICK_PERIOD: Duration = Duration::from_millis(1000 / TICKS_PER_SECOND as u64);
 
 /// Accumulates elapsed time and hands out whole ticks at
 /// [`TICKS_PER_SECOND`].
@@ -44,6 +47,14 @@ impl TickClock {
     /// Whole ticks dropped by the [`MAX_CATCH_UP_TICKS`] cap.
     pub const fn dropped_ticks(&self) -> u64 {
         self.dropped_ticks
+    }
+
+    /// Time left before the next whole tick is due. The leftover is always
+    /// strictly below [`TICK_PERIOD`], so this is always positive — a fresh
+    /// full period after a tick just ran, shrinking towards zero as time
+    /// accumulates. The real-time loop sleeps for exactly this long.
+    pub fn until_next_tick(&self) -> Duration {
+        TICK_PERIOD.saturating_sub(self.leftover)
     }
 
     /// Feed `elapsed` time into the clock and return how many whole ticks
@@ -112,5 +123,40 @@ mod tests {
         assert_eq!(clock.advance(Duration::ZERO), 0);
         assert_eq!(clock.tick_count(), 0);
         assert_eq!(clock.dropped_ticks(), 0);
+    }
+
+    #[test]
+    fn fresh_clock_owes_a_full_period() {
+        let clock = TickClock::new();
+        assert_eq!(clock.until_next_tick(), TICK_PERIOD);
+    }
+
+    #[test]
+    fn until_next_tick_shrinks_with_accumulated_time() {
+        let mut clock = TickClock::new();
+        clock.advance(Duration::from_millis(10));
+        assert_eq!(clock.until_next_tick(), Duration::from_millis(40));
+        clock.advance(Duration::from_millis(15));
+        assert_eq!(clock.until_next_tick(), Duration::from_millis(25));
+    }
+
+    #[test]
+    fn until_next_tick_is_a_full_period_right_after_a_tick() {
+        let mut clock = TickClock::new();
+        clock.advance(Duration::from_millis(50));
+        assert_eq!(clock.until_next_tick(), TICK_PERIOD);
+        // Sub-period accumulation resets the leftover to zero as well.
+        clock.advance(Duration::from_millis(25));
+        clock.advance(Duration::from_millis(25));
+        assert_eq!(clock.until_next_tick(), TICK_PERIOD);
+    }
+
+    #[test]
+    fn until_next_tick_is_always_positive() {
+        let mut clock = TickClock::new();
+        clock.advance(Duration::from_millis(49));
+        assert!(!clock.until_next_tick().is_zero());
+        clock.advance(Duration::from_nanos(999_999_999));
+        assert!(!clock.until_next_tick().is_zero());
     }
 }

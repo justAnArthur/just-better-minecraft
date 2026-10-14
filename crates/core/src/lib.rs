@@ -4,6 +4,9 @@
 /// The engine's canonical name, reported by the game binary and in logs.
 pub const ENGINE_NAME: &str = "just-better-minecraft";
 
+pub mod link;
+pub mod protocol;
+
 #[cfg(test)]
 mod tests {
     use super::ENGINE_NAME;
