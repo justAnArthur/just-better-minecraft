@@ -63,6 +63,9 @@ server exchange.
 - `iter()` yields all `CUBE_VOLUME` states in index order (one cached word at
   a time); `from_fn` builds a cube from per-position states in index order
   and collapses to uniform on a single distinct state.
+- `PartialEq`/`Eq` compare content (every block), not storage: palette
+  order, width and stale palette entries don't matter. `Debug` prints the
+  palette and width only.
 - Invariants (unique palette entries; array empty iff uniform; every index
   `< palette.len()`) are asserted by `#[cfg(test)] Cube::check_invariants`,
   which tests call after operations.
@@ -70,8 +73,9 @@ server exchange.
 
 `protocol` holds the message enums the client and server exchange:
 `PROTOCOL_VERSION`, `PlayerId`, `ClientMsg` (`Hello`, `PlayerInput`,
-`Ping`, `Disconnect`) and `ServerMsg` (`Welcome`, `Rejected`, `Tick`,
-`Pong`, `Disconnected`). Messages are plain owned data — no `Arc`, no
+`Ping`, `Disconnect`) and `ServerMsg` (`Welcome` with the spawn position,
+`Rejected`, `Tick`, `Pong`, `Disconnected`, `CubeData { pos, cube }`,
+`UnloadCube { pos }`). Messages are plain owned data — no `Arc`, no
 references, no trait objects — all derive `Debug, Clone, PartialEq`, and
 stay serializable for a future network transport (no serde yet).
 

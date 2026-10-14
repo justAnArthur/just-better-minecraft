@@ -10,9 +10,12 @@
 //!   them directly.
 //! - No serde yet; serialization arrives with the network transport.
 
+use crate::coords::CubePos;
+use crate::cube::Cube;
+
 /// Version of the client/server protocol. A `Hello` carrying any other
 /// version is rejected.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Identifies a joined player inside one server. Ids start at 1 and count up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -46,6 +49,8 @@ pub enum ServerMsg {
         player_id: PlayerId,
         server_tick: u64,
         tick_rate: u32,
+        /// Where the player starts, in world block coordinates.
+        spawn: [f64; 3],
     },
     /// A `Hello` was refused; the connection is dropped right after.
     Rejected { reason: String },
@@ -55,4 +60,11 @@ pub enum ServerMsg {
     Pong { nonce: u64, server_tick: u64 },
     /// The server dropped this connection.
     Disconnected { reason: String },
+    /// A cube the player should now have loaded: newly in range, or
+    /// replaced wholesale. Uniform cubes (all air, all stone) are cheap,
+    /// so they are sent too: "loaded and empty" differs from "not loaded".
+    /// Boxed so the enum stays small for the common small messages.
+    CubeData { pos: CubePos, cube: Box<Cube> },
+    /// The cube left the player's range; the client drops it and its mesh.
+    UnloadCube { pos: CubePos },
 }

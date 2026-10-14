@@ -214,6 +214,8 @@ impl Server {
                     player_id,
                     server_tick: self.tick_number,
                     tick_rate: TICKS_PER_SECOND,
+                    // Placeholder until terrain exists (task 1.5).
+                    spawn: [0.0, 80.0, 0.0],
                 };
                 if conn.link.send(welcome).is_err() {
                     return Outcome::Drop;
@@ -344,6 +346,7 @@ mod tests {
                 player_id,
                 server_tick: 1,
                 tick_rate: 20,
+                ..
             }, ServerMsg::Tick { tick: 1 }] if player_id.0 == 1
         ));
         let players: Vec<_> = server.players().collect();

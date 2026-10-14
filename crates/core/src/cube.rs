@@ -120,6 +120,29 @@ pub struct Cube {
     bits: u32,
 }
 
+/// Content equality: two cubes are equal when every block matches, whatever
+/// their palette order, width or unused palette entries.
+impl PartialEq for Cube {
+    fn eq(&self, other: &Self) -> bool {
+        match (self.uniform(), other.uniform()) {
+            (Some(a), Some(b)) => a == b,
+            _ => self.iter().eq(other.iter()),
+        }
+    }
+}
+
+impl Eq for Cube {}
+
+/// Summarises the storage instead of dumping 32768 states.
+impl std::fmt::Debug for Cube {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cube")
+            .field("palette", &self.palette)
+            .field("bits", &self.bits)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Cube {
     /// A cube where every block is `state`. Costs only its palette entry.
     pub fn filled(state: BlockStateId) -> Self {
@@ -531,6 +554,28 @@ mod tests {
             self.0 = x;
             x
         }
+    }
+
+    #[test]
+    fn equality_compares_content_not_storage() {
+        let stone = BlockStateId(1);
+        let dirt = BlockStateId(2);
+        let mut a = Cube::filled(stone);
+        a.set_index(5, dirt);
+        let mut b = Cube::default();
+        b.fill(stone);
+        b.set_index(9, BlockStateId(3));
+        b.set_index(9, stone);
+        b.set_index(5, dirt);
+        // Different palettes and widths, same blocks.
+        assert_ne!(a.palette(), b.palette());
+        assert_eq!(a, b);
+
+        // A stale palette entry still equals the uniform cube.
+        a.set_index(5, stone);
+        assert_eq!(a, Cube::filled(stone));
+        assert_ne!(a, Cube::filled(dirt));
+        assert_ne!(b, Cube::filled(stone));
     }
 
     #[test]
