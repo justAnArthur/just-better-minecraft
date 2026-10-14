@@ -2,7 +2,7 @@
 
 ## Next up
 
-Stage 0 gate: CI green on the wave B PR, then the bench brief run (0.4's last check), then merge and /clear. Next stage: Stage 1 wave A (1.1, 1.2, 1.3). Remote: github.com/justAnArthur/just-better-minecraft (private).
+Stage 1 · Voxel sandbox, wave A: 1.1 cube storage + palette (core), 1.2 window/wgpu/camera/texture array (client), 1.3 tick loop + channel + protocol (server, core). Write specs in docs/tasks/, then delegate in parallel. Remote: github.com/justAnArthur/just-better-minecraft (private).
 
 ## Benchmarks
 
@@ -33,3 +33,4 @@ Baseline = bench-0 run on an otherwise idle machine. Compare only runs made with
 - Wave B merged on branch stage-0/wave-b: 0.2 CI workflow, 0.5 screenshot harness (wgpu 30.0.1, golden triangle checked by orchestrator), 0.6 TickClock + HeadlessServer + criterion 0.8.2. All reviewers: MERGE.
 - Repo: github.com/justAnArthur/just-better-minecraft (private).
 - 0.4 done: bench brief exercised via bench-0 (report in format). Baseline numbers recorded above.
+- **Stage 0 gate passed.** PR #1 merged with CI green on macOS and Ubuntu; the triangle golden (made on Metal) matches on Mesa lavapipe in CI, so screenshot tolerances work across backends.
