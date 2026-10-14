@@ -104,20 +104,27 @@ fn take_welcome(client: &mut TestClient) -> [f64; 3] {
 }
 
 /// Step (draining the client each tick) until `cond` holds, bounded by
-/// `max_ticks` and a 2 s wall clock. Returns every `CubeData` received.
+/// `max_ticks` and a 10 s wall clock. While generation is in flight the
+/// loop sleeps 1 ms per tick, so threaded mode is bounded by time rather
+/// than by how fast ticks spin (slow CI runners need far more ticks than a
+/// laptop before the gen threads catch up). Returns every `CubeData`
+/// received.
 fn step_until_collected(
     server: &mut HeadlessServer,
     client: &mut TestClient,
     mut cond: impl FnMut(&TestClient) -> bool,
     max_ticks: u32,
 ) -> Vec<(CubePos, jbm_core::cube::Cube)> {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(10);
     let mut collected = Vec::new();
     for _ in 0..max_ticks {
         assert!(
             Instant::now() < deadline,
-            "streaming did not settle within 2 s"
+            "streaming did not settle within 10 s"
         );
+        if server.server().in_flight() > 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         server.step(1);
         for msg in client.drain() {
             if let ServerMsg::CubeData { pos, cube } = msg {
@@ -294,8 +301,12 @@ fn threaded_generation_matches_inline() {
     let spawn = take_welcome(&mut client);
     let center = cube_of(spawn);
     let expected = desired(center);
-    let collected =
-        step_until_collected(&mut server, &mut client, |c| c.loaded() == &expected, 2000);
+    let collected = step_until_collected(
+        &mut server,
+        &mut client,
+        |c| c.loaded() == &expected,
+        100_000,
+    );
 
     assert_eq!(client.loaded(), &expected);
     let reference = reference_generator();
