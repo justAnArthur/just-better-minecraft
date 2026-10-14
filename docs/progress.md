@@ -2,7 +2,7 @@
 
 ## Next up
 
-Stage 0 · Setup. Wave A: 0.1 (workspace). Wave B: 0.2 (CI), 0.5 (screenshot harness), 0.6 (testkit + benches), in parallel after 0.1 merges.
+Stage 0 · Setup, wave B: 0.2 (CI), 0.5 (screenshot harness), 0.6 (testkit + benches) running in parallel. Then: create GitHub repo (needs user OK), push, CI green = gate.
 
 ## Benchmarks
 
@@ -22,3 +22,4 @@ None yet.
 
 ### 2026-10-14
 - Repo created. 0.3 done: CLAUDE.md, docs/design.md, docs/plan.md, docs/progress.md. 0.4 drafted: docs/briefs/, scripts/delegate.sh (validated by running 0.1 through it).
+- 0.1 merged: Cargo workspace (core, server, client, modhost, game, testkit), toolchain 1.98.1, edition 2024. Implementer + reviewer briefs worked end to end (reports in format), so the 0.4 brief check passed for implementer/reviewer; bench brief gets exercised by 0.6.
