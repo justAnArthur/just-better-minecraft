@@ -1,0 +1,5 @@
+/target
+.agents/
+*.actual.png
+*.diff.png
+.DS_Store
