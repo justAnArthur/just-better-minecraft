@@ -12,8 +12,15 @@ When the window closes (or the server drops the link), `app::run` returns
 and `handle.stop()` joins the server thread. The server thread is never
 detached; stopping it propagates a server panic rather than swallowing it.
 
-Until task 1.5 (terrain generation and cube streaming) merges,
-`Server::new()` sends no cubes, so the client flies over empty sky.
+`Server::new()` streams generated terrain around the player (task 1.5).
+
+**End-to-end screenshot:** `tests/terrain_screenshot.rs` is the one test
+that crosses both halves. A `HeadlessServer` (inline generation, R = 3,
+V = 2) streams to a `TestClient`; every message goes into a real
+`ClientWorld`, each cube is meshed and the view from spawn is rendered
+offscreen against the `terrain_spawn` golden (stored with the client's
+goldens in `crates/client/tests/golden/`). It skips without a GPU, like
+the client's screenshot tests.
 
 **Invariants**
 

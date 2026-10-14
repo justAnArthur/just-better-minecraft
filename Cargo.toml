@@ -19,6 +19,7 @@ all = { level = "warn", priority = -1 }
 jbm-core = { path = "crates/core" }
 jbm-client = { path = "crates/client" }
 jbm-server = { path = "crates/server" }
+jbm-testkit = { path = "crates/testkit" }
 criterion = "0.8.2"
 wgpu = "30.0.1"
 pollster = "1.0.1"
