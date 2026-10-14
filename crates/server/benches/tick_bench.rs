@@ -1,5 +1,6 @@
-//! Criterion benches for the server: the tick clock, and a full
-//! `Server::tick` with 8 connected clients.
+//! Criterion benches for the server: the tick clock, a full `Server::tick`
+//! with 8 connected clients (protocol-only, so it stays comparable across
+//! stages), and one idle streaming tick with everything already sent.
 
 use std::time::Duration;
 
@@ -7,7 +8,23 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use jbm_core::link::in_process_pair;
 use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION};
 use jbm_server::Server;
+use jbm_server::server::ServerConfig;
 use jbm_server::tick::TickClock;
+
+/// Drain every queued message from a client link (untimed helper).
+trait TryRecvDrain {
+    fn try_recv_drain(&mut self) -> Vec<jbm_core::protocol::ServerMsg>;
+}
+
+impl TryRecvDrain for jbm_core::link::ClientLink {
+    fn try_recv_drain(&mut self) -> Vec<jbm_core::protocol::ServerMsg> {
+        let mut messages = Vec::new();
+        while let Ok(Some(msg)) = self.try_recv() {
+            messages.push(msg);
+        }
+        messages
+    }
+}
 
 fn bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("tick_clock");
@@ -24,7 +41,7 @@ fn bench(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("server");
     group.bench_function("tick_8_clients", |b| {
-        let mut server = Server::new();
+        let mut server = Server::with_config(ServerConfig::protocol_only());
         let mut clients = Vec::new();
         for i in 0..8u64 {
             let (mut client, server_end) = in_process_pair();
@@ -55,6 +72,61 @@ fn bench(c: &mut Criterion) {
                         })
                         .unwrap();
                 }
+            },
+            |_| server.tick(),
+            BatchSize::PerIteration,
+        );
+    });
+
+    group.bench_function("tick_streaming_idle", |b| {
+        // One player fully loaded at R = 8, inline generation. Measures a
+        // tick with nothing left to send: the idle-player floor.
+        let mut server = Server::with_config(ServerConfig {
+            gen_threads: 0,
+            ..ServerConfig::default()
+        });
+        let (mut client, server_end) = in_process_pair();
+        client
+            .send(ClientMsg::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                name: "bench-idle".to_owned(),
+            })
+            .unwrap();
+        server.add_connection(server_end);
+        server.tick();
+        let _ = client.try_recv_drain();
+
+        // Load everything: with R = 8, V = 4 the desired set is 1773 cubes;
+        // the inline budget of 64/tick settles in well under 60 ticks. Loop
+        // until a full quiet pass produces no CubeData.
+        let player_id = server.players().next().unwrap().id;
+        let expected: usize = {
+            let mut columns = 0usize;
+            for dx in -8i64..=8 {
+                for dz in -8i64..=8 {
+                    if dx * dx + dz * dz <= 64 {
+                        columns += 1;
+                    }
+                }
+            }
+            columns * 9 // dy in -4..=4
+        };
+        for _ in 0..200 {
+            server.tick();
+            let quiet = client
+                .try_recv_drain()
+                .into_iter()
+                .all(|msg| !matches!(msg, jbm_core::protocol::ServerMsg::CubeData { .. }));
+            if quiet && server.sent_count(player_id) == expected {
+                break;
+            }
+        }
+        assert_eq!(server.sent_count(player_id), expected);
+
+        b.iter_batched(
+            || {
+                // Untimed: drain the Tick messages of the previous run.
+                while client.try_recv().unwrap().is_some() {}
             },
             |_| server.tick(),
             BatchSize::PerIteration,

@@ -3,33 +3,76 @@
 The authoritative simulation: world generation, lighting, storage, and the
 server side of the protocol.
 
-## Tick clock (`tick`)
+## Terrain (`terrain`)
 
-- `TICKS_PER_SECOND: u32 = 20`, `TICK_PERIOD` (the one canonical tick
-  period — never re-derive it), `MAX_CATCH_UP_TICKS: u32 = 10`.
-- `TickClock::new()` / `Default`, `tick_count()`, `dropped_ticks()`,
-  `until_next_tick()`, and `advance(elapsed) -> u32`, which accumulates
-  elapsed time and returns the whole ticks due, capped at
-  `MAX_CATCH_UP_TICKS`. Excess whole ticks are dropped (no spiral of
-  death) and counted in `dropped_ticks()`; only the sub-tick remainder is
-  kept. `until_next_tick()` is how long the real-time loop sleeps.
-  Pure logic: no threads, no sleeping, no real clock reads — the caller
-  feeds in time.
+Temporary noise terrain (task 2.1 replaces it with the declarative density
+graph). `Generator::new(seed, Blocks)` produces cubes;
+`generate(CubePos) -> Cube` is a pure function of `(seed, pos)`, and
+`surface_height(x, z) -> i64` is public (the spawn point is
+`[0.5, h(0,0) + 2.0, 0.5]`).
+
+- **Layering per column with surface height `h`:** grass_block at `h`, dirt
+  from `h-3` to `h-1`, stone below; sand replaces grass and dirt where
+  `h ≤ 61`. No water, trees or caves yet.
+- **Height range:** `h = 64 + clamp(40 · hilliness · rolling, ±28)`, so
+  heights provably stay in `[36, 92]`. `rolling` is a 5-octave fractal
+  (±28 hills); `hilliness` is a very low frequency mask that leaves some
+  areas flat and others mountainous.
+- **Determinism rule:** only IEEE-754 `+ - * floor` on `f64` plus integer
+  hashing into a fixed 256-entry gradient table — no `sin`/`cos`/`exp`,
+  which are not bit-exact across platforms. The same seed gives identical
+  terrain everywhere, well past |x| = 10⁹.
+- **Fast paths:** a cube above the column-max height of its 32² area is a
+  uniform air cube; one whose top is below `min height - 4` is uniform
+  stone. The 32² heightmap of a column is computed once (bounded cache of
+  64 columns) and shared by all `cy` values. Mixed cubes are built in one
+  `Cube::from_fn` pass — never per-block `set`.
+
+## Generation pool (`gen_pool`)
+
+`GenPool::new(threads, Arc<Generator>)` — named workers `jbm-gen-N`, or
+inline mode with `threads == 0` (requests queue; `try_recv` generates on
+the calling thread — the deterministic mode tests and benches use).
+
+- `request(pos)` / `try_recv() -> Option<(CubePos, Cube)>`. Requests are
+  deduplicated while in flight (queued, generating, or done-but-uncollected).
+- **Shutdown:** dropping the pool flags shutdown, closes the queue and
+  joins every thread; queued-but-unstarted jobs are discarded, so drop
+  returns promptly and never detaches.
+- A panic inside generation is caught and forwarded; `try_recv` resumes it
+  on the tick thread so it never silently vanishes with a worker.
 
 ## Server (`server`)
 
-`Server::new()`, `add_connection(ServerLink)`, `tick()` runs exactly one
-tick, `update(elapsed) -> u32` feeds the clock and runs every due tick.
-Read access for tests: `tick_count()`, `dropped_ticks()`,
-`players() -> impl Iterator<Item = PlayerView>` (id, name, latest input,
-input count).
+`Server::new()` (default config), `Server::with_config(ServerConfig)`,
+`add_connection(ServerLink)`, `tick()` runs exactly one tick, `update(elapsed)
+-> u32` feeds the clock and runs every due tick. Read access for tests:
+`tick_count()`, `dropped_ticks()`, `players()`, `world_cube_count()`,
+`in_flight()`, `sent_count(PlayerId)`.
 
-A connection is pending until a valid `Hello` (matching
-`jbm-core`'s `PROTOCOL_VERSION`), then joined with a fresh `PlayerId`
-starting at 1. Wrong version → `Rejected` + drop; a non-`Hello` while
-pending → `Disconnected` + drop; `Ping` → `Pong`; `PlayerInput` → stored
-as latest input and counted; `Disconnect` or a closed link → the player is
-removed. Sends to closed links remove the player and never panic.
+`ServerConfig` (all fields public):
+
+| field | default | meaning |
+| --- | --- | --- |
+| `seed: u64` | `DEFAULT_SEED` | terrain seed |
+| `streaming: bool` | `true` | cube streaming on/off |
+| `view_radius: u32` | 8 | horizontal radius, cubes |
+| `vertical_radius: u32` | 4 | vertical radius, cubes |
+| `send_budget_per_tick: usize` | 64 | CubeData per player per tick |
+| `gen_threads: usize` | `available_parallelism() - 2`, min 1 | 0 = inline mode |
+| `gen_budget_per_tick: usize` | 64 | inline generation per tick |
+| `max_in_flight: usize` | 512 | queued + generating + uncollected |
+
+`ServerConfig::protocol_only()` turns streaming off with no generation
+threads — what exact-message-sequence tests and benches use.
+
+A connection is pending until a valid `Hello` (matching `PROTOCOL_VERSION`),
+then joined with a fresh `PlayerId` starting at 1. `Welcome.spawn` is the
+terrain spawn over column (0, 0). Wrong version → `Rejected` + drop; a
+non-`Hello` while pending → `Disconnected` + drop; `Ping` → `Pong`;
+`PlayerInput` → stored as latest input and counted; `Disconnect` or a
+closed link → the player is removed. Sends to closed links remove the
+player and never panic.
 
 **Tick phases** (fixed order, per `docs/design.md` "Simulation"):
 
@@ -38,25 +81,62 @@ removed. Sends to closed links remove the player and never panic.
 2. Scheduled block ticks — stub until Stage 2.
 3. Block update queue — stub until Stage 2.
 4. ECS systems — stub until bevy_ecs (task 1.5+).
-5. Light and outgoing changes — send `Tick { tick }` to every joined
-   player.
+5. Light and outgoing changes — the streaming pass (below), then `Tick`
+   is sent to every joined player (so cubes always precede their tick).
+
+## Cube streaming (phase 5)
+
+For a player whose center cube is `c` (latest `PlayerInput` position, else
+the spawn cube):
+
+- **Desired set:** every cube with `dx² + dz² ≤ R²` and `|dy| ≤ V`. The
+  offset list is precomputed once per config, sorted nearest-first by
+  `dx² + dy² + dz²` with ties broken by `(x, y, z)`.
+- **Keep set:** the same shape with `R + 1`, `V + 1`. A cube is unloaded
+  only when it leaves the keep set — the hysteresis band that stops a
+  player standing on a border from making cubes flap.
+
+Each tick: collect finished generation results (inline mode generates up
+to `gen_budget_per_tick` first), then per player, in join order:
+
+1. If the center cube moved: send `UnloadCube` for every sent cube outside
+   the keep set, and reset the send cursor.
+2. Walk the desired offsets nearest-first from the cursor: send `CubeData`
+   for generated, unsent cubes up to `send_budget_per_tick`; a cube is
+   never sent twice while it stays loaded. The walk pauses at the first
+   not-yet-generated cube (order stays strictly nearest-first).
+3. Request generation for missing cubes (also ahead of the cursor, keeping
+   the pool fed) while `in_flight() < max_in_flight`.
+
+**Idle cost:** with an unchanged center and everything sent, one player
+costs a few hash lookups per tick — the cursor sits at the end of the
+offset list, so nothing is scanned. Unload scans and world eviction run
+only when something changed (a player moved or left, results arrived).
+
+**Eviction:** cubes are dropped from server memory when no player's keep
+set contains them. Regeneration is exact, so this is lossless — for now.
+**Task 1.7 must pin edited cubes (or they will be lost on walk-away) until
+persistence lands in 2.3.**
+
+**Disconnect:** the player's sent-set is freed and its cubes are evicted
+on the next tick unless another player keeps them.
 
 ## Run loop (`run`)
 
 `run::spawn(Server) -> ServerHandle` starts one thread named
 `"jbm-server"` that loops: measure elapsed time with `Instant`, call
 `server.update(elapsed)`, sleep `until_next_tick()`. New connections
-arrive via `ServerHandle::connect(&self, ServerLink)` (an mpsc the loop
-drains at the start of each tick). `ServerHandle::stop(self) -> Server`
-sets a stop flag, joins the thread and returns the `Server` for
+arrive via `ServerHandle::connect(&self, ServerLink)`. `ServerHandle::stop(self)
+-> Server` sets a stop flag, joins the thread and returns the `Server` for
 inspection; a thread panic propagates through `stop` instead of being
 swallowed. Dropping a handle also stops and joins the thread — it never
-detaches.
+detaches. (Dropping the `Server` also drops its `GenPool`, which joins the
+generation threads.)
 
 **Threading model:** one server thread owns the `Server`; tests talk to
 it only through links (or by `stop()` returning the `Server`). The tick
-loop itself is single-threaded; region-parallel tick work arrives in a
-later stage.
+loop itself is single-threaded; generation runs on the `GenPool` threads,
+never on the tick thread (inline test mode excepted).
 
 ## Benchmarks
 
@@ -68,20 +148,27 @@ name = "tick_bench"
 harness = false
 ```
 
-To add a case, add a function to `benches/tick_bench.rs` inside a
-`benchmark_group` named for the area, with the case as the function name,
-so reports read `<area>/<case>` (e.g. `tick_clock/advance_1000`).
-`criterion` is a dev-dependency via `[workspace.dependencies]` only —
-never a runtime dep.
+To add a case, add a function inside a `benchmark_group` named for the
+area, with the case as the function name, so reports read `<area>/<case>`
+(e.g. `tick_clock/advance_1000`). `criterion` is a dev-dependency via
+`[workspace.dependencies]` only — never a runtime dep.
 
 ```bash
 cargo bench -p jbm-server -- --test   # run each bench once (what CI calls)
 cargo bench -p jbm-server             # full criterion run with numbers
 ```
 
-Current cases: `tick_clock/advance_1000` and `server/tick_8_clients`
-(one `Server::tick()` with 8 joined in-process clients, each sending one
-`PlayerInput`; replies drained outside the timed section).
+Current cases:
+
+- `tick_clock/advance_1000`
+- `server/tick_8_clients` — one tick, 8 joined clients, `protocol_only()`
+  so it stays comparable across stages.
+- `server/tick_streaming_idle` — one tick, one player fully loaded at
+  R = 8 (1773 cubes), inline mode, nothing left to send: the idle floor.
+- `worldgen/heightmap_32x32` — a 32×32 patch of surface heights.
+- `worldgen/surface_cube` — a cube intersecting the surface (mixed path,
+  heightmap cached).
+- `worldgen/air_cube` — a cube far above the surface (fast path).
 
 **Invariants**
 
