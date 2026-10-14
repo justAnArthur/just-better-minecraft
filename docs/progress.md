@@ -2,7 +2,7 @@
 
 ## Next up
 
-Stage 0 · Setup, wave B: 0.2 (CI), 0.5 (screenshot harness), 0.6 (testkit + benches) running in parallel. Then: create GitHub repo (needs user OK), push, CI green = gate.
+Stage 0 · Setup, wave B: 0.2 (CI), 0.5 (screenshot harness), 0.6 (testkit + benches) running in parallel. Then: open a PR with wave B, CI green on it = gate. Remote: github.com/justAnArthur/just-better-minecraft (private).
 
 ## Benchmarks
 
