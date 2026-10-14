@@ -4,6 +4,7 @@
 # Creates ../jbm-wt/<task-id> on branch task/<task-id> (from main) if missing,
 # fills docs/briefs/<role>.md, runs the `glm` CLI there, and writes the final
 # report to .agents/reports/<task-id>-<role>.md (stderr to .agents/logs/).
+# New branches start from $JBM_BASE (default: main).
 set -euo pipefail
 
 role="${1:?role}"; id="${2:?task id}"; extra_file="${3:-}"
@@ -21,7 +22,7 @@ if [[ ! -d "$wt" ]]; then
   if git -C "$repo" show-ref --quiet "refs/heads/task/$id"; then
     git -C "$repo" worktree add -q "$wt" "task/$id"
   else
-    git -C "$repo" worktree add -q -b "task/$id" "$wt" main
+    git -C "$repo" worktree add -q -b "task/$id" "$wt" "${JBM_BASE:-main}"
   fi
 fi
 # The spec may be newer than the branch point; keep the worktree copy current.

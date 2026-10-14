@@ -2,11 +2,16 @@
 
 ## Next up
 
-Stage 0 · Setup, wave B: 0.2 (CI), 0.5 (screenshot harness), 0.6 (testkit + benches) running in parallel. Then: open a PR with wave B, CI green on it = gate. Remote: github.com/justAnArthur/just-better-minecraft (private).
+Stage 0 gate: CI green on the wave B PR, then the bench brief run (0.4's last check), then merge and /clear. Next stage: Stage 1 wave A (1.1, 1.2, 1.3). Remote: github.com/justAnArthur/just-better-minecraft (private).
 
 ## Benchmarks
 
-None yet.
+| bench | median | machine | date |
+|---|---|---|---|
+| sample/fill_32cubed | 118.16 µs | Apple M5 Pro (bench-0) | 2026-10-14 |
+| tick_clock/advance_1000 | 4.41 µs | Apple M5 Pro (bench-0) | 2026-10-14 |
+
+Baseline = bench-0 run on an otherwise idle machine. Compare only runs made without parallel builds (the implementer's 3.67 µs ran alongside other builds; ignore it).
 
 ## Decisions
 
@@ -16,10 +21,15 @@ None yet.
 
 ## Known issues
 
-None yet.
+- client/render/offscreen.rs: device poll failure is only a debug_assert; in release a failed poll could hang `recv()`. Fix when readback is used outside tests.
+- testkit re-derives TICK_PERIOD instead of reusing a server constant. Export one canonical constant in 1.3.
+- First release/bench build is slow (wgpu + thin LTO + codegen-units=1). Revisit profile if CI bench-smoke gets too slow.
 
 ## Log
 
 ### 2026-10-14
 - Repo created. 0.3 done: CLAUDE.md, docs/design.md, docs/plan.md, docs/progress.md. 0.4 drafted: docs/briefs/, scripts/delegate.sh (validated by running 0.1 through it).
 - 0.1 merged: Cargo workspace (core, server, client, modhost, game, testkit), toolchain 1.98.1, edition 2024. Implementer + reviewer briefs worked end to end (reports in format), so the 0.4 brief check passed for implementer/reviewer; bench brief gets exercised by 0.6.
+- Wave B merged on branch stage-0/wave-b: 0.2 CI workflow, 0.5 screenshot harness (wgpu 30.0.1, golden triangle checked by orchestrator), 0.6 TickClock + HeadlessServer + criterion 0.8.2. All reviewers: MERGE.
+- Repo: github.com/justAnArthur/just-better-minecraft (private).
+- 0.4 done: bench brief exercised via bench-0 (report in format). Baseline numbers recorded above.
