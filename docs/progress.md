@@ -8,7 +8,10 @@ Stage 0 gate: CI green on the wave B PR, then the bench brief run (0.4's last ch
 
 | bench | median | machine | date |
 |---|---|---|---|
-| tick_clock/advance_1000 | 3.67 µs | dev Mac (implementer run) | 2026-10-14 |
+| sample/fill_32cubed | 118.16 µs | Apple M5 Pro (bench-0) | 2026-10-14 |
+| tick_clock/advance_1000 | 4.41 µs | Apple M5 Pro (bench-0) | 2026-10-14 |
+
+Baseline = bench-0 run on an otherwise idle machine. Compare only runs made without parallel builds (the implementer's 3.67 µs ran alongside other builds; ignore it).
 
 ## Decisions
 
@@ -29,3 +32,4 @@ Stage 0 gate: CI green on the wave B PR, then the bench brief run (0.4's last ch
 - 0.1 merged: Cargo workspace (core, server, client, modhost, game, testkit), toolchain 1.98.1, edition 2024. Implementer + reviewer briefs worked end to end (reports in format), so the 0.4 brief check passed for implementer/reviewer; bench brief gets exercised by 0.6.
 - Wave B merged on branch stage-0/wave-b: 0.2 CI workflow, 0.5 screenshot harness (wgpu 30.0.1, golden triangle checked by orchestrator), 0.6 TickClock + HeadlessServer + criterion 0.8.2. All reviewers: MERGE.
 - Repo: github.com/justAnArthur/just-better-minecraft (private).
+- 0.4 done: bench brief exercised via bench-0 (report in format). Baseline numbers recorded above.

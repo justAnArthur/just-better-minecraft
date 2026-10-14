@@ -63,7 +63,7 @@ The orchestrator still checks itself before merging: screenshot tests (it reads 
 | [x] 0.1 Cargo workspace: `core`, `server`, `client`, `modhost`, `game`; pinned toolchain; `rustfmt`, `clippy` | implementer | `cargo build` and `cargo clippy -D warnings` pass |
 | [x] 0.2 CI on GitHub Actions: build, test, clippy on macOS and Linux | implementer | Green run on the first PR |
 | [x] 0.3 `CLAUDE.md`, `docs/design.md`, `docs/plan.md`, `docs/progress.md` | orchestrator | A fresh session can summarize the project from them |
-| [ ] 0.4 GLM brief templates (implementer, reviewer, bench) in `docs/briefs/` | orchestrator | A dummy task runs through implementer and reviewer and returns reports in format |
+| [x] 0.4 GLM brief templates (implementer, reviewer, bench) in `docs/briefs/` | orchestrator | A dummy task runs through implementer and reviewer and returns reports in format |
 | [x] 0.5 Offscreen screenshot test harness (wgpu renders to PNG, compared with golden images) | implementer | A test renders a triangle and matches its golden image |
 | [x] 0.6 Headless server test helpers and `criterion` bench skeleton | implementer | One sample test and one sample bench run in CI |
 
