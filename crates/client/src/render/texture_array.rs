@@ -123,6 +123,13 @@ impl BlockTextures {
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            // Greedy faces span many blocks and tile the texture per
+            // block: UVs run past 1.0 and must wrap, with the sampler
+            // (not fract() in the shader) doing it so mip derivatives
+            // stay correct across tile seams.
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
             ..Default::default()
         });
         Ok(BlockTextures {
@@ -193,23 +200,28 @@ fn write_layer_mip(
 }
 
 /// Halves the image with a 2x2 box filter computed in linear space
-/// (sRGB -> linear -> average -> sRGB).
+/// (sRGB -> linear -> average -> sRGB) for RGB. Alpha is already linear,
+/// so it is averaged directly without the sRGB curve.
 fn downsample_2x2(src: &RgbaImage) -> RgbaImage {
     let (w, h) = src.dimensions();
     let mut out = RgbaImage::new(w / 2, h / 2);
     for y in 0..h / 2 {
         for x in 0..w / 2 {
-            let mut linear = [0.0f32; 4];
+            let mut linear = [0.0f32; 3];
+            let mut alpha_sum = 0u32;
             for (dy, dx) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
                 let p = src.get_pixel(x * 2 + dx, y * 2 + dy).0;
-                for c in 0..4 {
+                for c in 0..3 {
                     linear[c] += srgb_to_linear(p[c]);
                 }
+                alpha_sum += u32::from(p[3]);
             }
             let mut pixel = [0u8; 4];
-            for c in 0..4 {
+            for c in 0..3 {
                 pixel[c] = linear_to_srgb(linear[c] / 4.0);
             }
+            // Linear average of alpha, rounded to nearest.
+            pixel[3] = ((alpha_sum + 2) / 4) as u8;
             out.put_pixel(x, y, Rgba(pixel));
         }
     }
@@ -419,6 +431,40 @@ mod tests {
                 .expect("creation should fail"),
             TextureError::NotSquarePowerOfTwo((12, 12))
         );
+    }
+
+    #[test]
+    fn mip1_of_half_alpha_layer_averages_alpha_linearly() {
+        // A 16x16 layer half alpha 0, half alpha 255. The 2x2 blocks that
+        // straddle the odd-column split average to 128 +- 1; pure blocks
+        // stay 0 or 255. Going through the sRGB curve instead of a linear
+        // average used to skew the mixed blocks toward 0.
+        let mut layer = RgbaImage::from_pixel(16, 16, Rgba([200, 200, 200, 255]));
+        for y in 0..16 {
+            for x in 0..9 {
+                layer.put_pixel(x, y, Rgba([200, 200, 200, 0]));
+            }
+        }
+        let mip1 = downsample_2x2(&layer);
+        assert_eq!(mip1.dimensions(), (8, 8));
+        let mut mixed = 0;
+        for (x, y, pixel) in mip1.enumerate_pixels() {
+            let alpha = i16::from(pixel.0[3]);
+            // Column 4 covers source columns 8 and 9, one of each half.
+            if x == 4 {
+                assert!(
+                    (alpha - 128).abs() <= 1,
+                    "mixed block at ({x}, {y}) has alpha {alpha}, not 128 +- 1"
+                );
+                mixed += 1;
+            } else {
+                assert!(
+                    alpha == 0 || alpha == 255,
+                    "pure block at ({x}, {y}) has alpha {alpha}"
+                );
+            }
+        }
+        assert_eq!(mixed, 8, "one mixed column of blocks");
     }
 
     #[test]
