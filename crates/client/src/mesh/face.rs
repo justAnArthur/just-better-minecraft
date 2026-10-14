@@ -109,6 +109,23 @@ impl Direction {
     }
 }
 
+/// The four quad corners c0..c3 of a face in cube-local block units: the
+/// CPU mirror of the corner math in `terrain.wgsl`'s `vs_main` (keep them
+/// identical). The quad starts at the owner's corner one block along the
+/// normal if it points positive, and one block along u or v if that axis
+/// points negative, then spans `width` along u and `height` along v.
+pub fn quad_corners(f: &FaceFields) -> [[i32; 3]; 4] {
+    let n = f.direction.normal();
+    let u = f.direction.u_axis();
+    let v = f.direction.v_axis();
+    let owner = [f.x as i32, f.y as i32, f.z as i32];
+    let base: [i32; 3] =
+        std::array::from_fn(|i| owner[i] + n[i].max(0) + (-u[i]).max(0) + (-v[i]).max(0));
+    let (w, h) = (f.width as i32, f.height as i32);
+    [(0, 0), (1, 0), (1, 1), (0, 1)]
+        .map(|(cu, cv)| std::array::from_fn(|i| base[i] + u[i] * cu * w + v[i] * cv * h))
+}
+
 /// The unpacked fields of a [`PackedFace`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FaceFields {
@@ -261,6 +278,57 @@ mod tests {
                 light: 15,
             };
             assert_eq!(unpack(pack(&fields)), fields, "{direction:?}");
+        }
+    }
+
+    #[test]
+    fn quad_corners_cover_exactly_the_owned_blocks() {
+        // A w x h face starting at its owner must cover the union of the
+        // unit faces of the blocks owner + i*u + j*v, on the face plane.
+        for direction in DIRECTIONS {
+            let (w, h) = (3u32, 2u32);
+            let fields = FaceFields {
+                x: 10,
+                y: 10,
+                z: 10,
+                width: w,
+                height: h,
+                direction,
+                layer: 0,
+                ao: [3; 4],
+                light: 15,
+            };
+            let corners = quad_corners(&fields);
+            let n = direction.normal();
+            let (u, v) = (direction.u_axis(), direction.v_axis());
+            let mut lo = [i32::MAX; 3];
+            let mut hi = [i32::MIN; 3];
+            for j in 0..h as i32 {
+                for i in 0..w as i32 {
+                    for axis in 0..3 {
+                        let block = 10 + i * u[axis] + j * v[axis];
+                        // The unit face spans [block, block + 1] in-plane
+                        // and sits at block + max(n, 0) along the normal.
+                        let (a, b) = if n[axis] != 0 {
+                            let p = block + n[axis].max(0);
+                            (p, p)
+                        } else {
+                            (block, block + 1)
+                        };
+                        lo[axis] = lo[axis].min(a);
+                        hi[axis] = hi[axis].max(b);
+                    }
+                }
+            }
+            for axis in 0..3 {
+                let cmin = corners.iter().map(|c| c[axis]).min().unwrap();
+                let cmax = corners.iter().map(|c| c[axis]).max().unwrap();
+                assert_eq!(
+                    (cmin, cmax),
+                    (lo[axis], hi[axis]),
+                    "{direction:?} axis {axis}"
+                );
+            }
         }
     }
 

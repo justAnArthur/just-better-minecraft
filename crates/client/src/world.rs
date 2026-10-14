@@ -26,8 +26,12 @@ pub enum WorldChange {
 
 /// Cubes the client has, plus re-mesh bookkeeping.
 ///
-/// - `CubeData` bumps the cube's version and dirties it and its 26 loaded
-///   neighbors (a new neighbor changes border faces and AO).
+/// - `CubeData` dirties the cube and its 26 loaded neighbors (a new
+///   neighbor changes border faces and AO).
+/// - Every dirtying gives the cube a fresh version from one world-wide
+///   counter that never resets, so a mesh job built from older data (even
+///   one from before an unload and reload) can never match the current
+///   version, whatever order the pool finishes jobs in.
 /// - `UnloadCube` removes the cube. Neighbors are NOT re-dirtied: their
 ///   meshes stay valid (a missing neighbor culls faces), and task 2.x
 ///   revisits this when streaming unloads matter visually.
@@ -35,6 +39,7 @@ pub struct ClientWorld {
     cubes: HashMap<CubePos, Arc<Cube>>,
     versions: HashMap<CubePos, u32>,
     dirty: HashSet<CubePos>,
+    next_version: u32,
 }
 
 impl Default for ClientWorld {
@@ -49,6 +54,7 @@ impl ClientWorld {
             cubes: HashMap::new(),
             versions: HashMap::new(),
             dirty: HashSet::new(),
+            next_version: 0,
         }
     }
 
@@ -58,8 +64,6 @@ impl ClientWorld {
         match msg {
             ServerMsg::CubeData { pos, cube } => {
                 self.cubes.insert(*pos, Arc::new(cube.as_ref().clone()));
-                let version = self.versions.entry(*pos).or_insert(0);
-                *version += 1;
                 self.mark_dirty(*pos);
                 // Loaded neighbors change border culling and AO.
                 for dy in -1..=1 {
@@ -91,8 +95,11 @@ impl ClientWorld {
         }
     }
 
-    /// Marks a cube for re-meshing.
+    /// Marks a cube for re-meshing and gives it a fresh version, which
+    /// invalidates any mesh job already in flight for it.
     fn mark_dirty(&mut self, pos: CubePos) {
+        self.next_version = self.next_version.wrapping_add(1);
+        self.versions.insert(pos, self.next_version);
         self.dirty.insert(pos);
     }
 
@@ -239,6 +246,30 @@ mod tests {
         // Other messages leave versions alone.
         world.apply(&ServerMsg::Tick { tick: 5 });
         assert_eq!(world.version(pos), Some(2));
+    }
+
+    #[test]
+    fn neighbor_arrival_invalidates_in_flight_mesh() {
+        let mut world = ClientWorld::new();
+        let a = CubePos { x: 0, y: 0, z: 0 };
+        let b = CubePos { x: 1, y: 0, z: 0 };
+        world.apply(&cube_data(a));
+        let (_, v_old, _) = world.take_dirty(1, DVec3::ZERO).remove(0);
+        // `b` arrives while `a`'s first mesh job is still in flight.
+        world.apply(&cube_data(b));
+        let v_now = world.version(a).unwrap();
+        assert_ne!(v_old, v_now, "the job built without b must be stale");
+    }
+
+    #[test]
+    fn reload_never_reuses_a_version() {
+        let mut world = ClientWorld::new();
+        let pos = CubePos { x: 0, y: 0, z: 0 };
+        world.apply(&cube_data(pos));
+        let v_before = world.version(pos).unwrap();
+        world.apply(&ServerMsg::UnloadCube { pos });
+        world.apply(&cube_data(pos));
+        assert!(world.version(pos).unwrap() > v_before);
     }
 
     #[test]

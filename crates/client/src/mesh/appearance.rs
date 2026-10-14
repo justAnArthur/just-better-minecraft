@@ -184,6 +184,16 @@ fn make_layer(name: &str, layer: u32) -> RgbaImage {
                 "stone" => shade([128, 128, 128], 14, n),
                 "dirt" => shade([121, 85, 58], 12, n),
                 "grass_top" => shade([94, 157, 52], 14, n),
+                "grass_side" => {
+                    // Dirt with a ragged grass band along the top edge
+                    // (row 0 is the top of the face).
+                    let band = 3 + (noise(x, 0, layer) % 3);
+                    if y < band {
+                        shade([94, 157, 52], 14, n)
+                    } else {
+                        shade([121, 85, 58], 12, n)
+                    }
+                }
                 "sand" => shade([219, 207, 163], 8, n),
                 // Opaque blue for now; translucency is a later task.
                 "water" => shade([47, 93, 197], 8, n),

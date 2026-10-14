@@ -112,9 +112,13 @@ fn vs_main(
     let n = normals()[direction];
     let ua = u_axes()[direction];
     let va = v_axes()[direction];
-    // The face plane sits one block along the normal when it points
-    // positive; at the block itself when negative.
-    let block = vec3i(i32(bx), i32(by), i32(bz)) + max(n, vec3i(0));
+    // The quad starts at the owning block's corner where the face plane
+    // and the u/v walk begin: one block along the normal when it points
+    // positive, and one block along u or v when that axis points negative
+    // (the owner is the first block along u/v, so a -Z walk starts at its
+    // +Z side). Mirrored by `quad_corners` in mesh/face.rs.
+    let block = vec3i(i32(bx), i32(by), i32(bz)) + max(n, vec3i(0))
+        + max(-ua, vec3i(0)) + max(-va, vec3i(0));
     let offset = ua * i32(c.x * width) + va * i32(c.y * height);
     let relative = origins[origin_index].xyz + vec3f(block + offset);
 

@@ -189,7 +189,7 @@ fn mesh_blocks_matches_golden() {
     let (_, _, blocks) = test_setup();
     let cube = mesh_blocks_scene(&blocks);
     // Camera above a corner, ~30 degrees down: three faces of each block.
-    let camera = looking_at((21.0, 12.0, 24.0), (7.5, 1.0, 7.5));
+    let camera = looking_at((12.5, 5.5, 14.5), (7.5, 1.5, 7.5));
     render_scene(
         "mesh_blocks",
         &[(CubePos { x: 0, y: 0, z: 0 }, cube)],
@@ -221,7 +221,7 @@ fn mesh_ao_scene(blocks: &builtin::Blocks) -> Cube {
 fn mesh_ao_matches_golden() {
     let (_, _, blocks) = test_setup();
     let cube = mesh_ao_scene(&blocks);
-    let camera = looking_at((34.0, 22.0, 34.0), (16.0, 2.0, 16.0));
+    let camera = looking_at((24.5, 11.0, 24.5), (16.0, 2.0, 16.0));
     render_scene("mesh_ao", &[(CubePos { x: 0, y: 0, z: 0 }, cube)], &camera);
 }
 
@@ -246,7 +246,7 @@ fn mesh_cube_border_matches_golden() {
         (CubePos { x: 0, y: 0, z: 0 }, make(0)),
         (CubePos { x: 1, y: 0, z: 0 }, make(32)),
     ];
-    let camera = looking_at((33.0, 26.0, 44.0), (33.0, 3.0, 16.0));
+    let camera = looking_at((36.0, 14.0, 31.0), (32.0, 3.0, 16.0));
     render_scene("mesh_cube_border", &scene, &camera);
 }
 
@@ -267,7 +267,7 @@ fn mesh_far_origin_matches_the_same_golden_as_mesh_ao() {
         cube,
     )];
     let world = DVec3::new(far as f64 * 32.0, 64.0, far as f64 * 32.0);
-    let eye = DVec3::new(34.0, 22.0, 34.0) + world;
+    let eye = DVec3::new(24.5, 11.0, 24.5) + world;
     let look_at = DVec3::new(16.0, 2.0, 16.0) + world;
     let d = look_at - eye;
     let yaw = f32::atan2(d.x as f32, -d.z as f32);
