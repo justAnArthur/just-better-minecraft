@@ -2,16 +2,22 @@
 
 ## Next up
 
-Stage 1 · Voxel sandbox, wave B: 1.4 greedy mesher + worker pool + packed faces + vertex pulling (client), 1.5 noise terrain + cube streaming around the player (server). Wave B also wires the server thread into `jbm-game` (client connects over `in_process_pair`). Before specs: run bench-1 for idle-machine baselines of the new cube/* and server/* benches.
+Stage 1 · Voxel sandbox, wave B: 1.4 greedy mesher + worker pool + packed faces + vertex pulling (client), 1.5 noise terrain + cube streaming around the player (server). Wave B also wires the server thread into `jbm-game` (client connects over `in_process_pair`).
 
 ## Benchmarks
 
 | bench | median | machine | date |
 |---|---|---|---|
-| sample/fill_32cubed | 118.16 µs | Apple M5 Pro (bench-0) | 2026-10-14 |
-| tick_clock/advance_1000 | 4.41 µs | Apple M5 Pro (bench-0) | 2026-10-14 |
+| sample/fill_32cubed | 105.76 µs | Apple M5 Pro (bench-1) | 2026-10-14 |
+| tick_clock/advance_1000 | 4.14 µs | Apple M5 Pro (bench-1) | 2026-10-14 |
+| cube/get_all_16_states | 91.66 µs | Apple M5 Pro (bench-1) | 2026-10-14 |
+| cube/set_all_16_states | 493.68 µs | Apple M5 Pro (bench-1) | 2026-10-14 |
+| cube/palette_growth_4096 | 626.19 µs | Apple M5 Pro (bench-1) | 2026-10-14 |
+| cube/iter_sum_16_states | 32.29 µs | Apple M5 Pro (bench-1) | 2026-10-14 |
+| cube/compact_4096_to_16 | 96.57 µs | Apple M5 Pro (bench-1) | 2026-10-14 |
+| server/tick_8_clients | 292.53 ns | Apple M5 Pro (bench-1) | 2026-10-14 |
 
-Baseline = bench-0 run on an otherwise idle machine. Compare only runs made without parallel builds (the implementer's 3.67 µs ran alongside other builds; ignore it).
+Baselines are bench worker runs on an otherwise idle machine. Run-to-run noise on this Mac is ±10–15%; treat smaller deltas as noise. `iter()` is ~3× faster than per-block `get`, so the mesher should iterate. Compare only runs made without parallel builds (the implementer's 3.67 µs ran alongside other builds; ignore it).
 
 ## Decisions
 
@@ -28,6 +34,7 @@ Baseline = bench-0 run on an otherwise idle machine. Compare only runs made with
 - client/render/texture_array.rs: mip box filter applies the sRGB curve to alpha too. Fix in 1.4 before translucent textures (filter alpha linearly).
 - client/render/overlay.rs: `layout` and `glyph_count` duplicate the char filter (keep in sync or return both counts); `FrameStats` grows unbounded on repeated zero-dt frames (unreachable in app); `render` trusts `set_viewport`.
 - server/run.rs: stop/drop can wait up to one tick (≤50 ms) while the thread sleeps. Fine until shutdown latency matters.
+- Windowed app path has no automated test (workers' sandbox can't open a window). The orchestrator launches `cargo run -p jbm-game` before merging any wave that touches `client/src/app.rs`; this caught a redraw loop that stalled on macOS.
 - First release/bench build is slow (wgpu + thin LTO + codegen-units=1). Revisit profile if CI bench-smoke gets too slow.
 
 ## Log
@@ -40,3 +47,6 @@ Baseline = bench-0 run on an otherwise idle machine. Compare only runs made with
 - 0.4 done: bench brief exercised via bench-0 (report in format). Baseline numbers recorded above.
 - **Stage 0 gate passed.** PR #1 merged with CI green on macOS and Ubuntu; the triangle golden (made on Metal) matches on Mesa lavapipe in CI, so screenshot tolerances work across backends.
 - Stage 1 wave A merged on branch stage-1/wave-a: 1.1 cube storage + palette + block registry, 1.2 window/fly camera/sky/overlay/texture array (goldens checked by orchestrator; binary launched and ran clean), 1.3 protocol + Link + Server tick phases + real-time server thread + 100-tick headless test. All reviewers: MERGE. 92 tests green.
+- Fix during review: redraw loop stopped after a skipped (Occluded) first frame, leaving a blank window on macOS; now every skipped frame requests the next, and the loop pauses on `WindowEvent::Occluded(true)`. User confirmed the sky renders.
+- bench-1 baselines recorded above. Repo setting "Allow auto-merge" turned on (user approved).
+- **Stage 1 wave A done.** PR #2 merged with CI green on macOS and Ubuntu (new sky goldens match on lavapipe).
