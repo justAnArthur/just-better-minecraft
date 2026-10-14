@@ -1,11 +1,12 @@
-//! The frame renderer: the per-frame uniform buffer, the sky pass, and
-//! dispatch into the debug overlay.
+//! The frame renderer: the per-frame uniform buffer, the sky pass, the
+//! terrain pass, and dispatch into the debug overlay.
 
 use bytemuck::{Pod, Zeroable};
 use glam::Mat4;
 
 use crate::camera::Camera;
 use crate::gpu::Gpu;
+use crate::render::chunks::TerrainPass;
 use crate::render::overlay::{OverlayRenderer, OverlayText};
 
 /// Depth buffer format. Reverse-Z (cleared to 0.0, `Greater` compare) with
@@ -95,12 +96,13 @@ impl DepthTarget {
     }
 }
 
-/// Owns the pipelines and buffers needed to draw a frame (sky + overlay)
-/// into a target of one specific color format. Create one per format: the
+/// Owns the pipelines and buffers needed to draw a frame (sky + terrain +
+/// overlay) into a target of one specific color format. Create one per format: the
 /// window surface (usually `Bgra8UnormSrgb`) and the offscreen test target
 /// (`Rgba8UnormSrgb`) differ.
 pub struct Renderer {
     uniform_buffer: wgpu::Buffer,
+    uniform_layout: wgpu::BindGroupLayout,
     uniform_bind_group: wgpu::BindGroup,
     sky_pipeline: wgpu::RenderPipeline,
     overlay: OverlayRenderer,
@@ -184,11 +186,18 @@ impl Renderer {
 
         Renderer {
             uniform_buffer,
+            uniform_layout,
             uniform_bind_group,
             sky_pipeline,
             overlay,
             viewport: (1, 1),
         }
+    }
+
+    /// The frame-uniform bind group layout (binding 0 in every pipeline),
+    /// for passes created outside the renderer (terrain, tests).
+    pub fn uniform_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.uniform_layout
     }
 
     /// Sets the target size in pixels (used by the overlay's pixel-space
@@ -217,8 +226,8 @@ impl Renderer {
         }
     }
 
-    /// Draws one frame: the sky pass (which also clears depth to 0.0) and,
-    /// when requested, the debug overlay on top.
+    /// Draws one frame: the sky pass (which also clears depth to 0.0),
+    /// then the terrain pass, then the debug overlay on top.
     pub fn render(
         &mut self,
         gpu: &Gpu,
@@ -226,6 +235,7 @@ impl Renderer {
         depth: &wgpu::TextureView,
         camera: &Camera,
         overlay: Option<&OverlayText>,
+        terrain: Option<&mut TerrainPass>,
     ) {
         let uniforms = self.build_uniforms(camera);
         gpu.queue
@@ -266,6 +276,17 @@ impl Renderer {
             pass.set_pipeline(&self.sky_pipeline);
             pass.set_bind_group(0, &self.uniform_bind_group, &[]);
             pass.draw(0..3, 0..1);
+        }
+
+        if let Some(terrain) = terrain {
+            terrain.draw(
+                gpu,
+                &mut encoder,
+                target,
+                depth,
+                camera,
+                &self.uniform_bind_group,
+            );
         }
 
         if let Some(text) = overlay {

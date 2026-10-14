@@ -1,6 +1,7 @@
-//! Rendering: offscreen targets, the frame renderer (sky + overlay), and
-//! the block texture array.
+//! Rendering: offscreen targets, the frame renderer (sky + terrain +
+//! overlay), the terrain pass, and the block texture array.
 
+pub mod chunks;
 pub mod offscreen;
 pub mod overlay;
 pub mod renderer;

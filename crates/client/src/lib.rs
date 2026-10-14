@@ -6,7 +6,9 @@ pub mod app;
 pub mod camera;
 pub mod gpu;
 pub mod input;
+pub mod mesh;
 pub mod render;
+pub mod world;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

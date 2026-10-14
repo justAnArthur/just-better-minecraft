@@ -2,17 +2,91 @@
 //! phases from the design doc's "Simulation" section. Clients are talked to
 //! only through [`ServerLink`]s.
 
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
+use jbm_core::coords::{BlockPos, CubePos};
 use jbm_core::link::{LinkClosed, ServerLink};
 use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION, PlayerId, ServerMsg};
 
+use crate::gen_pool::GenPool;
+use crate::streaming::{Offset, desired_offsets, in_keep, offset_pos};
+use crate::terrain::Generator;
 use crate::tick::{TICKS_PER_SECOND, TickClock};
 
 /// Most inbound messages one connection may deliver in a single tick.
 /// Leftovers wait for the next tick, so a flooding client cannot stall the
 /// tick.
 const MESSAGES_PER_CONNECTION_PER_TICK: usize = 256;
+
+/// The seed every default server generates its world with. Fixed so a
+/// fresh install always starts on the same terrain.
+pub const DEFAULT_SEED: u64 = 0x0055_EED1_5EED;
+
+/// Tuning knobs for a [`Server`]. The crate README documents what each field
+/// costs; the defaults fit one player streaming a view radius of 8 cubes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerConfig {
+    /// World seed fed to the terrain generator.
+    pub seed: u64,
+    /// Whether cubes are streamed to players at all.
+    pub streaming: bool,
+    /// Horizontal streaming radius, in cubes (`dx² + dz² ≤ r²`).
+    pub view_radius: u32,
+    /// Vertical streaming radius, in cubes (`|dy| ≤ v`).
+    pub vertical_radius: u32,
+    /// Most `CubeData` messages sent to one player per tick.
+    pub send_budget_per_tick: usize,
+    /// Generation worker threads. `0` selects inline mode: the tick thread
+    /// itself generates up to `gen_budget_per_tick` cubes per tick, which is
+    /// deterministic — what tests and benches use.
+    pub gen_threads: usize,
+    /// Most cubes generated inline per tick (inline mode only).
+    pub gen_budget_per_tick: usize,
+    /// Cap on cubes queued, generating, or generated but not yet collected.
+    pub max_in_flight: usize,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        let parallelism = std::thread::available_parallelism().map_or(1, |n| n.get());
+        Self {
+            seed: DEFAULT_SEED,
+            streaming: true,
+            view_radius: 8,
+            vertical_radius: 4,
+            send_budget_per_tick: 64,
+            gen_threads: parallelism.saturating_sub(2).max(1),
+            gen_budget_per_tick: 64,
+            max_in_flight: 512,
+        }
+    }
+}
+
+impl ServerConfig {
+    /// Streaming off and no generation threads: a server that only speaks
+    /// the handshake/ping/tick protocol. Tests and benches that assert
+    /// exact message sequences use this so their meaning stays unchanged.
+    pub fn protocol_only() -> Self {
+        Self {
+            streaming: false,
+            gen_threads: 0,
+            ..Self::default()
+        }
+    }
+}
+
+/// The cube containing a world position given in block coordinates.
+fn cube_containing(position: [f64; 3]) -> CubePos {
+    BlockPos {
+        x: position[0].floor() as i64,
+        y: position[1].floor() as i64,
+        z: position[2].floor() as i64,
+    }
+    .split()
+    .0
+}
 
 /// The player's latest movement state as stored server-side. Placeholder
 /// shape mirroring [`ClientMsg::PlayerInput`]; task 1.6 replaces it.
@@ -39,6 +113,16 @@ struct Player {
     name: String,
     latest_input: Option<PlayerInput>,
     input_count: u64,
+    /// The cube the player is centered on (latest input position, else the
+    /// spawn). Drives the desired and keep sets.
+    center: CubePos,
+    /// Cubes this player has been sent and not yet had unloaded. A cube is
+    /// never sent twice while it stays in this set.
+    sent: HashSet<CubePos>,
+    /// Index into the precomputed nearest-first desired offsets: the next
+    /// cube that may still need sending. Reset whenever the center moves,
+    /// so an idle player costs O(1) per tick.
+    cursor: usize,
 }
 
 enum ConnectionState {
@@ -80,15 +164,52 @@ pub struct Server {
     connections: Vec<Connection>,
     /// Next id to hand out. Ids start at 1 and count up.
     next_player_id: u32,
+    config: ServerConfig,
+    pool: GenPool,
+    /// Generated cubes the server keeps in memory, keyed by position.
+    world: HashMap<CubePos, jbm_core::cube::Cube>,
+    /// Desired-set offsets for the configured radii, sorted nearest-first.
+    /// Computed once per config.
+    desired: Vec<Offset>,
+    /// The spawn position handed out in every `Welcome`.
+    spawn: [f64; 3],
+    /// Whether world eviction should run this tick: set when anything might
+    /// have made a cube unwanted (a player moved or left, results arrived).
+    /// An idle server never scans.
+    eviction_dirty: bool,
+    /// Joined players counted by the previous streaming pass, to spot joins
+    /// and disconnects cheaply.
+    joined_count: usize,
 }
 
 impl Server {
-    pub const fn new() -> Self {
+    /// A server with the default [`ServerConfig`]. Not `const`: building it
+    /// starts the generation pool.
+    pub fn new() -> Self {
+        Self::with_config(ServerConfig::default())
+    }
+
+    /// A server with an explicit config: terrain seed, streaming shape and
+    /// generation threading.
+    pub fn with_config(config: ServerConfig) -> Self {
+        let mut registry = jbm_core::block::BlockRegistry::new();
+        let blocks = jbm_core::block::builtin::Blocks::register(&mut registry);
+        let generator = Arc::new(Generator::new(config.seed, blocks));
+        let pool = GenPool::new(config.gen_threads, Arc::clone(&generator));
+        let desired = desired_offsets(config.view_radius, config.vertical_radius);
+        let spawn = generator.spawn();
         Self {
             clock: TickClock::new(),
             tick_number: 0,
             connections: Vec::new(),
             next_player_id: 1,
+            config,
+            pool,
+            world: HashMap::new(),
+            desired,
+            spawn,
+            eviction_dirty: true,
+            joined_count: 0,
         }
     }
 
@@ -151,6 +272,26 @@ impl Server {
         })
     }
 
+    /// Cubes the server currently keeps in memory.
+    pub fn world_cube_count(&self) -> usize {
+        self.world.len()
+    }
+
+    /// Cubes queued for generation, generating, or generated but not yet
+    /// collected.
+    pub fn in_flight(&self) -> usize {
+        self.pool.in_flight()
+    }
+
+    /// Cubes currently sent to (and not unloaded from) the player.
+    pub fn sent_count(&self, id: PlayerId) -> usize {
+        self.connections
+            .iter()
+            .filter_map(Connection::joined_player)
+            .find(|player| player.id == id)
+            .map_or(0, |player| player.sent.len())
+    }
+
     /// Phase 1: apply player inputs and channel messages. Connections are
     /// drained in join order, each connection's messages in arrival order,
     /// at most [`MESSAGES_PER_CONNECTION_PER_TICK`] per connection.
@@ -204,18 +345,22 @@ impl Server {
                 }
                 let player_id = PlayerId(self.next_player_id);
                 self.next_player_id += 1;
+                let spawn = self.spawn;
                 conn.state = ConnectionState::Joined(Player {
                     id: player_id,
                     name,
                     latest_input: None,
                     input_count: 0,
+                    center: cube_containing(spawn),
+                    sent: HashSet::new(),
+                    cursor: 0,
                 });
                 let welcome = ServerMsg::Welcome {
                     player_id,
                     server_tick: self.tick_number,
                     tick_rate: TICKS_PER_SECOND,
-                    // Placeholder until terrain exists (task 1.5).
-                    spawn: [0.0, 80.0, 0.0],
+                    // Two blocks over the terrain surface at column (0, 0).
+                    spawn,
                 };
                 if conn.link.send(welcome).is_err() {
                     return Outcome::Drop;
@@ -281,11 +426,15 @@ impl Server {
     /// Empty stub until bevy_ecs lands (task 1.5+).
     fn phase_ecs_systems(&mut self) {}
 
-    /// Phase 5: recompute dirty light and send outgoing changes. The only
-    /// outgoing change so far is the `Tick` message every joined player
-    /// receives. A player whose link has closed is removed here — a failed
-    /// send never panics.
+    /// Phase 5: recompute dirty light and send outgoing changes — here, the
+    /// cube streaming pass (before the `Tick` message every joined player
+    /// receives, so cubes always precede their tick) followed by the `Tick`
+    /// itself. A player whose link has closed is removed — a failed send
+    /// never panics.
     fn phase_light_and_outgoing(&mut self) {
+        if self.config.streaming {
+            self.phase_streaming();
+        }
         let tick_msg = ServerMsg::Tick {
             tick: self.tick_number,
         };
@@ -299,6 +448,179 @@ impl Server {
             self.connections.remove(idx);
         }
     }
+
+    /// The streaming pass, once per tick. Collects finished generation
+    /// results, then per player (in join order): unloads cubes that left
+    /// their keep set, sends newly in-range cubes nearest-first up to the
+    /// send budget, and requests generation for missing ones within the
+    /// in-flight cap. Finally evicts world cubes no player keeps.
+    fn phase_streaming(&mut self) {
+        // 1. Collect finished generation results into the world. Inline
+        //    mode generates up to the budget first; threaded mode drains
+        //    whatever the workers finished (bounded by max_in_flight).
+        let mut collected = false;
+        if self.config.gen_threads == 0 {
+            for _ in 0..self.config.gen_budget_per_tick {
+                match self.pool.try_recv() {
+                    Some((pos, cube)) => {
+                        collected = true;
+                        self.world.insert(pos, cube);
+                    }
+                    None => break,
+                }
+            }
+        } else {
+            while let Some((pos, cube)) = self.pool.try_recv() {
+                collected = true;
+                self.world.insert(pos, cube);
+            }
+        }
+
+        // A join or disconnect changes who keeps which cubes.
+        let joined_now = self
+            .connections
+            .iter()
+            .filter(|conn| conn.joined_player().is_some())
+            .count();
+        let dirty = self.eviction_dirty || collected || joined_now != self.joined_count;
+        self.joined_count = joined_now;
+
+        // 2. Per player, in join order. The split borrows (connection vs
+        //    world/pool/config) are disjoint fields of `self`.
+        let mut dropped: Vec<usize> = Vec::new();
+        let mut eviction_dirty = dirty;
+        for idx in 0..self.connections.len() {
+            let conn = &mut self.connections[idx];
+            let ConnectionState::Joined(player) = &mut conn.state else {
+                continue;
+            };
+            if stream_player(
+                &mut conn.link,
+                player,
+                &self.world,
+                &mut self.pool,
+                &self.config,
+                &self.desired,
+                &mut eviction_dirty,
+            ) {
+                dropped.push(idx);
+            }
+        }
+        for idx in dropped.into_iter().rev() {
+            self.connections.remove(idx);
+        }
+
+        // 3. Eviction: drop world cubes no player's keep set contains.
+        //    Regeneration is exact, so dropping is lossless — but task 1.7
+        //    must pin edited cubes here or player builds will be lost on
+        //    walk-away until persistence lands in 2.3.
+        if eviction_dirty {
+            let (r, v) = (self.config.view_radius, self.config.vertical_radius);
+            let centers: Vec<CubePos> = self
+                .connections
+                .iter()
+                .filter_map(|conn| conn.joined_player().map(|player| player.center))
+                .collect();
+            self.world
+                .retain(|pos, _| centers.iter().any(|&c| in_keep(*pos, c, r, v)));
+            self.eviction_dirty = false;
+        }
+    }
+}
+
+/// One player's slice of the streaming pass. Returns `true` when the link
+/// closed and the connection must be dropped.
+///
+/// Cost contract: with an unchanged center and everything sent, this is a
+/// handful of map lookups (the cursor already sits at the end of the offset
+/// list) — no scans of the desired or sent sets.
+fn stream_player(
+    link: &mut ServerLink,
+    player: &mut Player,
+    world: &HashMap<CubePos, jbm_core::cube::Cube>,
+    pool: &mut GenPool,
+    config: &ServerConfig,
+    desired: &[Offset],
+    eviction_dirty: &mut bool,
+) -> bool {
+    // Center: the latest input position, else the spawn cube.
+    let center = player
+        .latest_input
+        .map(|input| cube_containing(input.position))
+        .unwrap_or(player.center);
+    let (r, v) = (config.view_radius, config.vertical_radius);
+
+    if center != player.center {
+        player.center = center;
+        // Everything must be re-walked nearest-first from the new center.
+        player.cursor = 0;
+        *eviction_dirty = true;
+        // Unload what left the keep set (the desired set grown by one in
+        // each radius — hysteresis against border flapping).
+        let to_unload: Vec<CubePos> = player
+            .sent
+            .iter()
+            .copied()
+            .filter(|&pos| !in_keep(pos, center, r, v))
+            .collect();
+        for pos in to_unload {
+            player.sent.remove(&pos);
+            if link.send(ServerMsg::UnloadCube { pos }).is_err() {
+                return true;
+            }
+        }
+    }
+
+    // Send walk, nearest-first from the cursor. Already-sent cubes advance
+    // the cursor for free; a missing cube stops the walk (the order stays
+    // strictly nearest-first) after being requested.
+    let mut sends_left = config.send_budget_per_tick;
+    let mut i = player.cursor;
+    while i < desired.len() {
+        let pos = offset_pos(center, desired[i]);
+        if player.sent.contains(&pos) {
+            i += 1;
+            continue;
+        }
+        let Some(cube) = world.get(&pos) else {
+            if pool.in_flight() < config.max_in_flight {
+                pool.request(pos);
+            }
+            break;
+        };
+        if sends_left == 0 {
+            break;
+        }
+        let msg = ServerMsg::CubeData {
+            pos,
+            cube: Box::new(cube.clone()),
+        };
+        if link.send(msg).is_err() {
+            player.cursor = i;
+            return true;
+        }
+        player.sent.insert(pos);
+        sends_left -= 1;
+        i += 1;
+    }
+    player.cursor = i;
+
+    // Request top-up: keep the pool fed ahead of the send cursor without
+    // sending out of order. Runs only while something is missing, so an
+    // idle player never scans.
+    if pool.in_flight() < config.max_in_flight {
+        for &offset in &desired[i..] {
+            let pos = offset_pos(center, offset);
+            if player.sent.contains(&pos) || world.contains_key(&pos) {
+                continue;
+            }
+            pool.request(pos);
+            if pool.in_flight() >= config.max_in_flight {
+                break;
+            }
+        }
+    }
+    false
 }
 
 impl Default for Server {
@@ -309,14 +631,20 @@ impl Default for Server {
 
 #[cfg(test)]
 mod tests {
-    use super::Server;
+    use super::{Server, ServerConfig};
     use jbm_core::link::{ClientLink, in_process_pair};
     use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION, ServerMsg};
+
+    /// Every unit test here asserts exact message sequences, so it runs the
+    /// server with streaming off (no CubeData noise).
+    fn protocol_server() -> Server {
+        Server::with_config(ServerConfig::protocol_only())
+    }
 
     /// A server with one client whose `Hello` is queued but not yet
     /// processed.
     fn pending_hello() -> (Server, ClientLink) {
-        let mut server = Server::new();
+        let mut server = protocol_server();
         let (mut client, server_end) = in_process_pair();
         server.add_connection(server_end);
         client
@@ -358,7 +686,7 @@ mod tests {
 
     #[test]
     fn ids_are_handed_out_in_join_order_starting_at_one() {
-        let mut server = Server::new();
+        let mut server = protocol_server();
         let ids: Vec<u32> = [1, 2, 3]
             .iter()
             .map(|&n| {
@@ -383,7 +711,7 @@ mod tests {
 
     #[test]
     fn wrong_protocol_version_is_rejected_and_dropped() {
-        let mut server = Server::new();
+        let mut server = protocol_server();
         let (mut client, server_end) = in_process_pair();
         server.add_connection(server_end);
         client
@@ -405,7 +733,7 @@ mod tests {
 
     #[test]
     fn non_hello_while_pending_is_disconnected_and_dropped() {
-        let mut server = Server::new();
+        let mut server = protocol_server();
         let (mut client, server_end) = in_process_pair();
         server.add_connection(server_end);
         client.send(ClientMsg::Ping { nonce: 1 }).unwrap();
@@ -534,7 +862,7 @@ mod tests {
 
     #[test]
     fn every_joined_player_receives_a_tick_message_each_tick() {
-        let mut server = Server::new();
+        let mut server = protocol_server();
         let mut clients = Vec::new();
         for n in 0..2 {
             let (mut client, server_end) = in_process_pair();

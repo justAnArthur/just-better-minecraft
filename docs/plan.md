@@ -78,8 +78,8 @@ Blocks are hardcoded in Rust for now.
 | A | [x] 1.1 Cube storage, palette compression, block state registry | `core` | Unit tests + bench for get/set and palette growth |
 | A | [x] 1.2 Window, wgpu setup, fly camera, texture array, debug overlay (FPS, position) | `client` | Screenshot test of an empty sky scene |
 | A | [x] 1.3 20 Hz tick loop, in-process channel, protocol message types | `server`, `core` | Headless test: client and server exchange messages for 100 ticks |
-| B | [ ] 1.4 Greedy mesher on a worker pool, packed 8-byte faces, vertex pulling | `client` | Golden images for sample cubes; meshing bench |
-| B | [ ] 1.5 Simple noise terrain, cube streaming around the player | `server` | Headless test streams cubes in a radius; screenshot of terrain |
+| B | [x] 1.4 Greedy mesher on a worker pool, packed 8-byte faces, vertex pulling | `client` | Golden images for sample cubes; meshing bench |
+| B | [x] 1.5 Simple noise terrain, cube streaming around the player | `server` | Headless test streams cubes in a radius; screenshot of terrain |
 | C | [ ] 1.6 Collision, walk and fly, client prediction with server correction | `client`, `server` | Tests: no falling through floors, prediction converges |
 | C | [ ] 1.7 Raycast, break and place blocks, re-mesh on change | `client`, `server` | Test: edit on server shows on client within one tick |
 | C | [ ] 1.8 Benchmark 16³ vs 32³ cubes (meshing time, memory, draw calls) | bench | Decision recorded in progress.md |
