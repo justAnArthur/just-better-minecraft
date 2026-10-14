@@ -47,6 +47,9 @@ struct App {
     controller: FlyController,
     stats: FrameStats,
     cursor_grabbed: bool,
+    /// Set while the OS reports the window fully hidden; the redraw loop
+    /// pauses until it is visible again.
+    occluded: bool,
     last_frame: Option<Instant>,
 }
 
@@ -63,6 +66,7 @@ impl App {
             controller: FlyController::default(),
             stats: FrameStats::default(),
             cursor_grabbed: false,
+            occluded: false,
             last_frame: None,
         }
     }
@@ -163,18 +167,26 @@ impl App {
             self.camera.pitch.to_degrees()
         ));
 
+        // Every skipped frame still asks for the next one: the first frames
+        // on macOS can come back Occluded before the window is shown, and
+        // returning without a redraw request would stop the loop for good.
         let frame = match w.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 Self::reconfigure(w);
+                w.window.request_redraw();
                 return;
             }
             wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Timeout => {
+                if !self.occluded {
+                    w.window.request_redraw();
+                }
                 return;
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 eprintln!("skipping frame: surface validation error");
+                w.window.request_redraw();
                 return;
             }
         };
@@ -184,7 +196,9 @@ impl App {
         w.renderer
             .render(&w.gpu, &view, w.depth.view(), &self.camera, Some(&overlay));
         w.gpu.queue.present(frame);
-        w.window.request_redraw();
+        if !self.occluded {
+            w.window.request_redraw();
+        }
     }
 }
 
@@ -293,6 +307,14 @@ impl ApplicationHandler for App {
                     && !self.cursor_grabbed
                 {
                     self.cursor_grabbed = grab_cursor(&w.window);
+                }
+            }
+            WindowEvent::Occluded(occluded) => {
+                // Pause the loop while fully hidden (minimized, other
+                // space) instead of spinning on Occluded surfaces.
+                self.occluded = occluded;
+                if !occluded {
+                    w.window.request_redraw();
                 }
             }
             WindowEvent::RedrawRequested => {
