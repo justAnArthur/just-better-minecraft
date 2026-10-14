@@ -20,6 +20,9 @@ jbm-core = { path = "crates/core" }
 jbm-client = { path = "crates/client" }
 jbm-server = { path = "crates/server" }
 criterion = "0.8.2"
+wgpu = "30.0.1"
+pollster = "1.0.1"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 
 [profile.dev.package."*"]
 opt-level = 2

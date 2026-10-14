@@ -9,5 +9,16 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Exposes `jbm_client::testing` (golden-image helpers) to integration tests.
+testing = []
+
 [dependencies]
 jbm-core.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+image.workspace = true
+
+[dev-dependencies]
+# Self dev-dependency so `tests/` can enable the `testing` feature.
+jbm-client = { path = ".", features = ["testing"] }
