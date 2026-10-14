@@ -50,6 +50,7 @@ allowed=(
   "Bash(find:*)" "Bash(grep:*)" "Bash(rg:*)" "Bash(mkdir:*)" "Bash(cp:*)"
   "Bash(mv:*)" "Bash(touch:*)" "Bash(uname:*)" "Bash(sysctl:*)" "Bash(lscpu:*)"
   "Bash(diff:*)" "Bash(file:*)" "Bash(python3:*)"
+  "Bash(JBM_UPDATE_GOLDEN=1 cargo test:*)"
 )
 flags=(--allowedTools "${allowed[@]}")
 [[ "$role" != "implementer" ]] && flags+=(--disallowedTools Edit Write NotebookEdit)
