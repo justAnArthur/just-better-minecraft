@@ -18,6 +18,10 @@ jbm-core.workspace = true
 wgpu.workspace = true
 pollster.workspace = true
 image.workspace = true
+winit.workspace = true
+glam.workspace = true
+bytemuck.workspace = true
+font8x8.workspace = true
 
 [dev-dependencies]
 # Self dev-dependency so `tests/` can enable the `testing` feature.
