@@ -3,8 +3,11 @@
 //! only through [`ServerLink`]s.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use glam::DVec3;
 use jbm_core::block::BlockStateId;
@@ -15,9 +18,10 @@ use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION, PlayerId, ServerMsg};
 use jbm_core::raycast::REACH;
 
 use crate::gen_pool::GenPool;
+use crate::storage::{PlayerRecord, Storage, StorageError};
 use crate::streaming::{Offset, desired_offsets, in_keep, offset_pos};
 use crate::terrain::Generator;
-use crate::tick::{TICKS_PER_SECOND, TickClock};
+use crate::tick::{TICK_PERIOD, TICKS_PER_SECOND, TickClock};
 
 /// Most inbound messages one connection may deliver in a single tick.
 /// Leftovers wait for the next tick, so a flooding client cannot stall the
@@ -44,6 +48,42 @@ type QueuedChange = (BlockPos, BlockStateId, Option<PlayerId>);
 /// fresh install always starts on the same terrain.
 pub const DEFAULT_SEED: u64 = 0x0055_EED1_5EED;
 
+/// How long [`Server::flush`] waits for the save thread before giving up
+/// and logging loudly. Generous: a flush is a commit-to-disk, fsync
+/// included.
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// One snapshot batch handed to the save thread: cube clones with the edit
+/// version they were taken at, and player records, committed together.
+#[derive(Default)]
+struct SaveBatch {
+    cubes: Vec<(CubePos, jbm_core::cube::Cube, u64)>,
+    players: Vec<(String, PlayerRecord)>,
+}
+
+impl SaveBatch {
+    fn is_empty(&self) -> bool {
+        self.cubes.is_empty() && self.players.is_empty()
+    }
+}
+
+/// The save thread's reply to a batch.
+enum SaveAck {
+    /// The batch committed; these cube versions and player records are now
+    /// on disk.
+    Committed(Vec<(CubePos, u64)>, Vec<(String, PlayerRecord)>),
+    /// The batch failed; these cubes stay dirty and retry next interval.
+    Failed(Vec<CubePos>),
+}
+
+/// Per-cube edit bookkeeping (persistence only): the edit version, bumped by
+/// every accepted edit, and the last version known committed to disk.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct EditVersions {
+    version: u64,
+    saved_version: u64,
+}
+
 /// Tuning knobs for a [`Server`]. The crate README documents what each field
 /// costs; the defaults fit one player streaming a view radius of 8 cubes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +106,12 @@ pub struct ServerConfig {
     pub gen_budget_per_tick: usize,
     /// Cap on cubes queued, generating, or generated but not yet collected.
     pub max_in_flight: usize,
+    /// World directory for persistence. `None` (the default) disables
+    /// persistence: edited cubes stay pinned in memory forever, exactly as
+    /// before task 2.3.
+    pub world_dir: Option<PathBuf>,
+    /// How often dirty cubes are snapshotted to the save thread.
+    pub save_interval: Duration,
 }
 
 impl Default for ServerConfig {
@@ -80,6 +126,8 @@ impl Default for ServerConfig {
             gen_threads: parallelism.saturating_sub(2).max(1),
             gen_budget_per_tick: 64,
             max_in_flight: 512,
+            world_dir: None,
+            save_interval: Duration::from_secs(5),
         }
     }
 }
@@ -158,6 +206,21 @@ struct Player {
     /// cube that may still need sending. Reset whenever the center moves,
     /// so an idle player costs O(1) per tick.
     cursor: usize,
+    /// Look direction from the newest accepted input (radians); persisted
+    /// with the player and handed back in the next `Welcome`.
+    yaw: f32,
+    pitch: f32,
+}
+
+impl Player {
+    fn record(&self) -> PlayerRecord {
+        PlayerRecord {
+            position: self.state.position.to_array(),
+            yaw: self.yaw,
+            pitch: self.pitch,
+            flying: self.state.flying,
+        }
+    }
 }
 
 enum ConnectionState {
@@ -210,10 +273,37 @@ pub struct Server {
     /// Total registered states; ids ≥ this are unknown and rejected by
     /// place validation.
     state_count: u32,
-    /// Cubes that hold an accepted edit. Pinned cubes are never evicted,
-    /// so builds survive the editor walking away until persistence lands
-    /// (task 2.3). The set grows without bound until then.
+    /// Cubes that hold an accepted edit. Used only without persistence;
+    /// with a world directory the pin rule is "version > saved_version" on
+    /// [`Server::versions`] instead, and this set stays empty.
     pinned: HashSet<CubePos>,
+    /// Edit bookkeeping per cube, only while persistence is on.
+    versions: HashMap<CubePos, EditVersions>,
+    /// Edit versions handed to the save thread and not yet acknowledged.
+    /// A cube listed here stays pinned until its batch commits.
+    pending_save: HashMap<CubePos, u64>,
+    /// Open world database; `None` when persistence is off.
+    storage: Option<Arc<Storage>>,
+    /// Sends snapshot batches to the save thread.
+    save_tx: Option<Sender<SaveBatch>>,
+    /// Replies from the save thread, drained at the start of phase 5.
+    ack_rx: Receiver<SaveAck>,
+    /// The `jbm-save` thread; `None` when persistence is off.
+    save_thread: Option<JoinHandle<()>>,
+    /// Simulated time accumulated since the last snapshot.
+    time_since_save: Duration,
+    /// Batches the save thread committed (test accessor backing).
+    saved_batches: u64,
+    /// Player records as last committed, by name; a player is re-saved
+    /// only when their record differs.
+    saved_players: HashMap<String, PlayerRecord>,
+    /// Records of players who left since the last snapshot, saved with the
+    /// next batch so a disconnect never loses their last position.
+    departed: Vec<(String, PlayerRecord)>,
+    /// Batches the save thread reported failed (test accessor backing).
+    failed_batches: u64,
+    /// Batches handed to the save thread; each gets exactly one answer.
+    sent_batches: u64,
     /// Block edits handled in phase 1, flushed early in phase 5 before the
     /// streaming pass and the `Tick` message.
     pending_changes: Vec<QueuedChange>,
@@ -238,18 +328,42 @@ impl Server {
         Self::with_config(ServerConfig::default())
     }
 
-    /// A server with an explicit config: terrain seed, streaming shape and
-    /// generation threading.
+    /// A server with an explicit config: terrain seed, streaming shape,
+    /// generation threading and an optional world directory. Panics if the
+    /// world storage cannot open (locked, corrupt, too new); use
+    /// [`Server::try_with_config`] to handle that.
     pub fn with_config(config: ServerConfig) -> Self {
+        Self::try_with_config(config).expect("opening the world's storage")
+    }
+
+    /// [`Server::with_config`] without the panic: storage opens first, so
+    /// the **stored** seed feeds the generator on reopen, and any storage
+    /// error surfaces to the caller.
+    pub fn try_with_config(config: ServerConfig) -> Result<Self, StorageError> {
         let mut registry = jbm_core::block::BlockRegistry::new();
         let blocks = jbm_core::block::builtin::Blocks::register(&mut registry);
-        let generator = Arc::new(Generator::new(config.seed, blocks));
-        let pool = GenPool::new(config.gen_threads, Arc::clone(&generator));
+        let storage = match &config.world_dir {
+            Some(dir) => Some(Arc::new(Storage::open(dir, &registry, config.seed)?)),
+            None => None,
+        };
+        let seed = storage.as_ref().map_or(config.seed, |s| s.seed());
+        let generator = Arc::new(Generator::new(seed, blocks));
+        let pool = GenPool::new(config.gen_threads, Arc::clone(&generator), storage.clone());
         let desired = desired_offsets(config.view_radius, config.vertical_radius);
         let spawn = generator.spawn();
         let solid = SolidTable::new(&registry);
         let state_count = registry.state_count();
-        Self {
+
+        let (save_tx, save_rx) = std::sync::mpsc::channel::<SaveBatch>();
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel::<SaveAck>();
+        let save_thread = storage.clone().map(|storage| {
+            std::thread::Builder::new()
+                .name("jbm-save".to_owned())
+                .spawn(move || save_loop(storage, save_rx, ack_tx))
+                .expect("spawning the jbm-save thread")
+        });
+
+        Ok(Self {
             clock: TickClock::new(),
             tick_number: 0,
             connections: Vec::new(),
@@ -260,12 +374,24 @@ impl Server {
             solid,
             state_count,
             pinned: HashSet::new(),
+            versions: HashMap::new(),
+            pending_save: HashMap::new(),
+            storage,
+            save_tx: Some(save_tx),
+            ack_rx,
+            save_thread,
+            time_since_save: Duration::ZERO,
+            saved_batches: 0,
+            saved_players: HashMap::new(),
+            departed: Vec::new(),
+            failed_batches: 0,
+            sent_batches: 0,
             pending_changes: Vec::new(),
             desired,
             spawn,
             eviction_dirty: true,
             joined_count: 0,
-        }
+        })
     }
 
     /// Register a fresh connection. It stays pending (receiving nothing)
@@ -285,6 +411,11 @@ impl Server {
         self.phase_scheduled_block_ticks();
         self.phase_block_update_queue();
         self.phase_ecs_systems();
+        // Persistence runs at the start of phase 5's section: acknowledgements
+        // from the save thread are applied first, then an expired
+        // save_interval snapshots dirty cubes. The tick thread itself never
+        // compresses, encodes or waits on disk I/O — the save thread does.
+        self.phase_save();
         self.phase_light_and_outgoing();
     }
 
@@ -348,9 +479,53 @@ impl Server {
             .map_or(0, |player| player.sent.len())
     }
 
-    /// Cubes pinned by an accepted edit (never evicted).
+    /// Cubes pinned by an accepted edit (never evicted). Without
+    /// persistence that is the edited set; with a world directory it is
+    /// every cube whose edit version is not yet committed
+    /// (`version > saved_version`), which includes cubes in a save batch
+    /// that has not been acknowledged yet.
     pub fn pinned_count(&self) -> usize {
-        self.pinned.len()
+        match &self.storage {
+            Some(_) => self
+                .versions
+                .values()
+                .filter(|v| v.version > v.saved_version)
+                .count(),
+            None => self.pinned.len(),
+        }
+    }
+
+    /// Cubes with uncommitted edits (same as [`Server::pinned_count`]).
+    pub fn dirty_count(&self) -> usize {
+        self.pinned_count()
+    }
+
+    /// Cubes whose snapshot is with the save thread, unacknowledged.
+    pub fn pending_save_count(&self) -> usize {
+        self.pending_save.len()
+    }
+
+    /// Save batches committed by the save thread so far.
+    pub fn saved_batches(&self) -> u64 {
+        self.saved_batches
+    }
+
+    /// Save batches the save thread reported failed so far (their cubes
+    /// stayed pinned for a retry).
+    pub fn failed_batches(&self) -> u64 {
+        self.failed_batches
+    }
+
+    /// Batches handed to the save thread and not yet answered (committed or
+    /// failed). Tests wait for 0 before holding saves.
+    pub fn unanswered_batches(&self) -> u64 {
+        self.sent_batches - self.saved_batches - self.failed_batches
+    }
+
+    /// The open world storage, when persistence is on. Test and diagnostic
+    /// access (the crash tests read the database through it).
+    pub fn storage(&self) -> Option<&Arc<Storage>> {
+        self.storage.as_ref()
     }
 
     /// The authoritative block at `pos`, or `None` when its cube is not
@@ -363,13 +538,18 @@ impl Server {
     /// Phase 1: apply player inputs and channel messages. Connections are
     /// drained in join order, each connection's messages in arrival order,
     /// at most [`MESSAGES_PER_CONNECTION_PER_TICK`] per connection.
-    fn phase_messages(&mut self) {
+    /// Returns how many messages it handled (shutdown settling loops on it).
+    fn phase_messages(&mut self) -> usize {
+        let mut handled = 0;
         let mut dropped: Vec<usize> = Vec::new();
         for idx in 0..self.connections.len() {
             let mut remove = false;
             for _ in 0..MESSAGES_PER_CONNECTION_PER_TICK {
                 let msg = match self.connections[idx].link.try_recv() {
-                    Ok(Some(msg)) => msg,
+                    Ok(Some(msg)) => {
+                        handled += 1;
+                        msg
+                    }
                     Ok(None) => break,
                     Err(LinkClosed) => {
                         remove = true;
@@ -387,7 +567,33 @@ impl Server {
         }
         // Remove back-to-front so the collected indices stay valid.
         for idx in dropped.into_iter().rev() {
-            self.connections.remove(idx);
+            self.remove_connection(idx);
+        }
+        handled
+    }
+
+    /// Before the shutdown flush: handle every message the players already
+    /// sent (inputs and edits still in the links) and step every queued
+    /// input, so the saved world and positions match what the players last
+    /// saw rather than lagging by a tick or two. Bounded.
+    fn settle_received_input(&mut self) {
+        for _ in 0..64 {
+            let handled = self.phase_messages();
+            let Server {
+                connections,
+                world,
+                solid,
+                ..
+            } = self;
+            let shapes = ServerShapes { world, solid };
+            for conn in connections {
+                if let ConnectionState::Joined(player) = &mut conn.state {
+                    step_inputs(player, &shapes, usize::MAX);
+                }
+            }
+            if handled == 0 {
+                break;
+            }
         }
     }
 
@@ -434,17 +640,33 @@ impl Server {
                 }
                 let player_id = PlayerId(self.next_player_id);
                 self.next_player_id += 1;
-                let spawn = self.spawn;
+                // A returning player starts where they left (persistence);
+                // anyone else, or a corrupt record, gets the world spawn.
+                let saved = match self.storage.as_ref().map(|s| s.load_player(&name)) {
+                    Some(Ok(record)) => record,
+                    Some(Err(error)) => {
+                        eprintln!("jbm: {error}; spawning {name:?} at the world spawn");
+                        None
+                    }
+                    None => None,
+                };
+                let record = saved.unwrap_or(PlayerRecord {
+                    position: self.spawn,
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    flying: false,
+                });
+                let spawn = record.position;
                 conn.state = ConnectionState::Joined(Box::new(Player {
                     id: player_id,
                     name,
                     // The Welcome's spawn is the initial state: velocity 0,
-                    // not on ground, walking.
+                    // not on ground.
                     state: PlayerState {
                         position: DVec3::from(spawn),
                         velocity: DVec3::ZERO,
                         on_ground: false,
-                        flying: false,
+                        flying: record.flying,
                     },
                     input_queue: VecDeque::new(),
                     last_seq: 0,
@@ -453,13 +675,19 @@ impl Server {
                     center: cube_containing(DVec3::from(spawn)),
                     sent: HashSet::new(),
                     cursor: 0,
+                    yaw: record.yaw,
+                    pitch: record.pitch,
                 }));
                 let welcome = ServerMsg::Welcome {
                     player_id,
                     server_tick: self.tick_number,
                     tick_rate: TICKS_PER_SECOND,
-                    // Two blocks over the terrain surface at column (0, 0).
+                    // The saved position, or two blocks over the terrain
+                    // surface at column (0, 0).
                     spawn,
+                    yaw: record.yaw,
+                    pitch: record.pitch,
+                    flying: record.flying,
                 };
                 if conn.link.send(welcome).is_err() {
                     return Outcome::Drop;
@@ -481,11 +709,14 @@ impl Server {
                 let _ = conn.link.send(disconnected);
                 Outcome::Drop
             }
-            (ConnectionState::Joined(player), ClientMsg::PlayerInput { seq, input, .. }) => {
+            (ConnectionState::Joined(player), ClientMsg::PlayerInput { seq, input, pitch }) => {
                 player.input_count += 1;
                 // Old or duplicate seqs are ignored outright; the queue
                 // keeps arrival order, which a sane client makes seq order.
                 if seq > player.last_seq {
+                    // Look is display state, kept only to persist it.
+                    player.yaw = input.yaw;
+                    player.pitch = pitch;
                     player.input_queue.push_back((seq, input));
                     if player.input_queue.len() > INPUT_QUEUE_CAP {
                         player.input_queue.pop_front();
@@ -562,13 +793,21 @@ impl Server {
     }
 
     /// Applies an accepted edit: set the block, pin the cube against
-    /// eviction, and queue the broadcast.
+    /// eviction (bumping its edit version under persistence), and queue the
+    /// broadcast.
     fn apply_edit(&mut self, pos: BlockPos, state: BlockStateId) {
         let (cube_pos, local) = pos.split();
         if let Some(cube) = self.world.get_mut(&cube_pos) {
             cube.set(local, state);
         }
-        self.pinned.insert(cube_pos);
+        match &self.storage {
+            Some(_) => {
+                self.versions.entry(cube_pos).or_default().version += 1;
+            }
+            None => {
+                self.pinned.insert(cube_pos);
+            }
+        }
         self.pending_changes.push((pos, state, None));
     }
 
@@ -607,6 +846,166 @@ impl Server {
     /// per-tick budget. Empty stub until block updates land (Stage 2).
     fn phase_block_update_queue(&mut self) {}
 
+    /// Persistence slice of the tick, run right before phase 5: apply the
+    /// save thread's acknowledgements, then every `save_interval` snapshot
+    /// dirty cubes and hand them off. No-op without a world directory.
+    fn phase_save(&mut self) {
+        if self.storage.is_none() {
+            return;
+        }
+        self.drain_save_acks();
+        self.time_since_save += TICK_PERIOD;
+        if self.time_since_save < self.config.save_interval {
+            return;
+        }
+        self.time_since_save = Duration::ZERO;
+        let mut batch = SaveBatch::default();
+        for (pos, edit) in &self.versions {
+            // Pinned cubes whose current version is not already in flight.
+            if edit.version > edit.saved_version
+                && self.pending_save.get(pos) != Some(&edit.version)
+                && let Some(cube) = self.world.get(pos)
+            {
+                batch.cubes.push((*pos, cube.clone(), edit.version));
+            }
+        }
+        batch.players = self.player_snapshot();
+        self.send_save_batch(batch);
+    }
+
+    /// Records of every joined player plus everyone who left since the last
+    /// snapshot, keeping only those that differ from what is on disk.
+    fn player_snapshot(&mut self) -> Vec<(String, PlayerRecord)> {
+        let mut records: HashMap<String, PlayerRecord> = self.departed.drain(..).collect();
+        for conn in &self.connections {
+            if let Some(player) = conn.joined_player() {
+                records.insert(player.name.clone(), player.record());
+            }
+        }
+        let mut changed: Vec<(String, PlayerRecord)> = records
+            .into_iter()
+            .filter(|(name, record)| self.saved_players.get(name) != Some(record))
+            .collect();
+        changed.sort_by(|a, b| a.0.cmp(&b.0));
+        changed
+    }
+
+    /// Removes a connection, remembering a joined player's record so the
+    /// next save keeps where they left.
+    fn remove_connection(&mut self, idx: usize) {
+        let mut conn = self.connections.remove(idx);
+        if self.storage.is_some()
+            && let ConnectionState::Joined(player) = &mut conn.state
+        {
+            // Inputs that arrived before the disconnect still count: the
+            // player saw them applied, so the saved position includes them.
+            let shapes = ServerShapes {
+                world: &self.world,
+                solid: &self.solid,
+            };
+            step_inputs(player, &shapes, usize::MAX);
+            self.departed.push((player.name.clone(), player.record()));
+        }
+    }
+
+    /// Applies every reply that has arrived from the save thread.
+    fn drain_save_acks(&mut self) {
+        while let Ok(ack) = self.ack_rx.try_recv() {
+            self.apply_save_ack(ack);
+        }
+    }
+
+    fn apply_save_ack(&mut self, ack: SaveAck) {
+        match ack {
+            SaveAck::Committed(acks, players) => {
+                self.saved_batches += 1;
+                self.saved_players.extend(players);
+                for (pos, version) in acks {
+                    let edit = self.versions.entry(pos).or_default();
+                    edit.saved_version = edit.saved_version.max(version);
+                    if self
+                        .pending_save
+                        .get(&pos)
+                        .is_some_and(|&p| p <= edit.saved_version)
+                    {
+                        self.pending_save.remove(&pos);
+                    }
+                }
+            }
+            // A failed batch is logged and retried next interval: the cubes
+            // stay dirty (never evicted), so edits are never dropped
+            // silently.
+            // Players are re-sent next interval: `saved_players` only moves
+            // on a commit, so their records still differ.
+            SaveAck::Failed(positions) => {
+                self.failed_batches += 1;
+                eprintln!(
+                    "jbm: saving a batch of {} cubes failed; retrying next interval",
+                    positions.len()
+                );
+                for pos in positions {
+                    self.pending_save.remove(&pos);
+                }
+            }
+        }
+    }
+
+    /// Hands a snapshot batch to the save thread and marks its versions
+    /// in flight. A dead save thread is logged loudly — those edits are
+    /// only protected by the retry on the next interval.
+    fn send_save_batch(&mut self, batch: SaveBatch) {
+        if batch.is_empty() {
+            return;
+        }
+        for (pos, _, version) in &batch.cubes {
+            self.pending_save.insert(*pos, *version);
+        }
+        match &self.save_tx {
+            Some(tx) if tx.send(batch).is_ok() => self.sent_batches += 1,
+            _ => eprintln!("jbm: the save thread is gone; unsaved edits may be lost"),
+        }
+    }
+
+    /// Sends everything still dirty and blocks until the save thread has
+    /// acknowledged it (or [`FLUSH_TIMEOUT`] passes, which is logged).
+    /// Called by [`ServerHandle::stop`](crate::run::ServerHandle::stop)
+    /// paths and by `Drop`, so every accepted edit is persisted by the time
+    /// the server is gone.
+    pub fn flush(&mut self) {
+        if self.storage.is_none() {
+            return;
+        }
+        self.drain_save_acks();
+        let mut batch = SaveBatch::default();
+        for (pos, edit) in &self.versions {
+            if edit.version > edit.saved_version
+                && let Some(cube) = self.world.get(pos)
+            {
+                batch.cubes.push((*pos, cube.clone(), edit.version));
+            }
+        }
+        batch.players = self.player_snapshot();
+        self.send_save_batch(batch);
+        // The saver answers batches in order, so once every batch sent so
+        // far is answered, this one (which may hold only player records,
+        // with no pending cube to mark it) is too.
+        let deadline = Instant::now() + FLUSH_TIMEOUT;
+        while self.saved_batches + self.failed_batches < self.sent_batches {
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            match self.ack_rx.recv_timeout(timeout) {
+                Ok(ack) => self.apply_save_ack(ack),
+                Err(RecvTimeoutError::Timeout) => {
+                    eprintln!(
+                        "jbm: flush timed out with {} cubes unsaved",
+                        self.pending_save.len()
+                    );
+                    break;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    }
+
     /// Phase 4: run ECS systems — here, player physics. Per player, in
     /// join order, up to [`INPUTS_PER_TICK`] queued inputs are stepped
     /// through the shared [`physics::step`] against a [`BlockShapes`]
@@ -629,21 +1028,7 @@ impl Server {
             let ConnectionState::Joined(player) = &mut conn.state else {
                 continue;
             };
-            let mut processed = 0;
-            while processed < INPUTS_PER_TICK {
-                let Some((seq, input)) = player.input_queue.pop_front() else {
-                    break;
-                };
-                // Defensive: phase 1 already filters, but the cap rules can
-                // leave a stale seq behind after a burst.
-                if seq <= player.last_seq {
-                    continue;
-                }
-                player.state = physics::step(player.state, &input, &shapes);
-                player.last_seq = seq;
-                player.pending_ack = true;
-                processed += 1;
-            }
+            step_inputs(player, &shapes, INPUTS_PER_TICK);
         }
     }
 
@@ -683,7 +1068,7 @@ impl Server {
             }
         }
         for idx in dropped.into_iter().rev() {
-            self.connections.remove(idx);
+            self.remove_connection(idx);
         }
     }
 
@@ -720,7 +1105,7 @@ impl Server {
             }
         }
         for idx in dropped.into_iter().rev() {
-            self.connections.remove(idx);
+            self.remove_connection(idx);
         }
     }
 
@@ -785,14 +1170,19 @@ impl Server {
             }
         }
         for idx in dropped.into_iter().rev() {
-            self.connections.remove(idx);
+            self.remove_connection(idx);
         }
 
         // 3. Eviction: drop world cubes no player's keep set contains,
-        //    keeping every pinned cube. Unpinned regeneration is exact, so
-        //    dropping those is lossless; pinned cubes hold edits that
-        //    would be lost, so they stay until persistence lands (2.3).
-        //    The pinned set grows without bound until then.
+        //    keeping every pinned cube. Unedited cubes regenerate exactly;
+        //    edited cubes under persistence are reloaded from disk once
+        //    their edits are committed (version <= saved_version), so
+        //    dropping those is lossless too. Only cubes with uncommitted
+        //    edits — unsaved, or in a batch the save thread has not
+        //    acknowledged yet — stay pinned forever. Without persistence
+        //    (world_dir: None) every edited cube stays pinned, as before
+        //    2.3. This replaces the 1.7 "pinned cubes grow without bound"
+        //    rule.
         if eviction_dirty {
             let (r, v) = (self.config.view_radius, self.config.vertical_radius);
             let centers: Vec<CubePos> = self
@@ -803,14 +1193,44 @@ impl Server {
             let Server {
                 world,
                 pinned,
+                versions,
+                storage,
                 eviction_dirty,
                 ..
             } = self;
-            world.retain(|pos, _| {
-                pinned.contains(pos) || centers.iter().any(|&c| in_keep(*pos, c, r, v))
-            });
+            let is_pinned = |pos: &CubePos| match storage {
+                Some(_) => versions
+                    .get(pos)
+                    .is_some_and(|edit| edit.version > edit.saved_version),
+                None => pinned.contains(pos),
+            };
+            world
+                .retain(|pos, _| is_pinned(pos) || centers.iter().any(|&c| in_keep(*pos, c, r, v)));
+            // Evicted cubes take their edit bookkeeping with them: their
+            // committed edits are on disk, and a reload starts fresh.
+            versions.retain(|pos, _| world.contains_key(pos));
             *eviction_dirty = false;
         }
+    }
+}
+
+/// Steps up to `max` of `player`'s queued inputs, in seq order, through the
+/// shared physics.
+fn step_inputs(player: &mut Player, shapes: &ServerShapes<'_>, max: usize) {
+    let mut processed = 0;
+    while processed < max {
+        let Some((seq, input)) = player.input_queue.pop_front() else {
+            break;
+        };
+        // Defensive: phase 1 already filters, but the cap rules can leave a
+        // stale seq behind after a burst.
+        if seq <= player.last_seq {
+            continue;
+        }
+        player.state = physics::step(player.state, &input, shapes);
+        player.last_seq = seq;
+        player.pending_ack = true;
+        processed += 1;
     }
 }
 
@@ -926,6 +1346,53 @@ fn stream_player(
 impl Default for Server {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        // Persist every accepted edit, then shut the saver down. A panic
+        // unwinding through here still flushes what it can; a flush failure
+        // is logged by `flush` itself. With persistence on, input already
+        // received is applied first so nothing the player saw is lost.
+        if self.storage.is_some() {
+            self.settle_received_input();
+        }
+        self.flush();
+        self.save_tx = None;
+        if let Some(thread) = self.save_thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The `jbm-save` thread's loop: take a snapshot batch, commit it as one
+/// transaction, reply with acknowledgements. A failed commit is reported,
+/// never swallowed — the tick thread keeps those cubes pinned and retries.
+fn save_loop(storage: Arc<Storage>, batches: Receiver<SaveBatch>, acks: Sender<SaveAck>) {
+    while let Ok(batch) = batches.recv() {
+        let refs: Vec<(CubePos, &jbm_core::cube::Cube)> = batch
+            .cubes
+            .iter()
+            .map(|(pos, cube, _)| (*pos, cube))
+            .collect();
+        let ack = match storage.save_batch_with_players(&refs, &batch.players) {
+            Ok(()) => SaveAck::Committed(
+                batch
+                    .cubes
+                    .iter()
+                    .map(|(pos, _, version)| (*pos, *version))
+                    .collect(),
+                batch.players,
+            ),
+            Err(error) => {
+                eprintln!("jbm: committing a save batch failed: {error}");
+                SaveAck::Failed(refs.into_iter().map(|(pos, _)| pos).collect())
+            }
+        };
+        if acks.send(ack).is_err() {
+            break; // the server is gone
+        }
     }
 }
 

@@ -57,6 +57,14 @@ impl Predictor {
         }
     }
 
+    /// Starts the predicted player flying (or not): a returning player's
+    /// saved state from the `Welcome`.
+    pub fn with_flying(mut self, flying: bool) -> Predictor {
+        self.state.flying = flying;
+        self.prev.flying = flying;
+        self
+    }
+
     /// Steps the prediction one tick under `input` and returns the
     /// `PlayerInput` to send for it.
     pub fn tick(&mut self, input: MoveInput, world: &impl BlockShapes) -> ClientMsg {

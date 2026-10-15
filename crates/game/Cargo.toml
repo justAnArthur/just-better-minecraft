@@ -35,3 +35,9 @@ path = "src/main.rs"
 [[bench]]
 name = "cube_size"
 harness = false
+
+# Task 2.2: one terrain frame through each draw path (MDI / fallback);
+# prints a skip line and passes without a GPU adapter.
+[[bench]]
+name = "terrain_draw"
+harness = false

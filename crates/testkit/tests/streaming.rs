@@ -25,6 +25,8 @@ fn streaming_config(gen_threads: usize) -> ServerConfig {
         gen_threads,
         gen_budget_per_tick: 16,
         max_in_flight: 512,
+        world_dir: None,
+        save_interval: std::time::Duration::from_secs(5),
     }
 }
 

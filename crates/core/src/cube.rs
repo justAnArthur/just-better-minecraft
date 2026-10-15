@@ -10,12 +10,12 @@
 //! Array order is [`LocalPos::index`](crate::coords::LocalPos::index):
 //! x fastest, then z, then y.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
 use std::mem::size_of;
 
 use crate::block::BlockStateId;
-use crate::coords::{CUBE_VOLUME, LocalPos};
+use crate::coords::{CUBE_BITS, CUBE_VOLUME, LocalPos};
 
 /// Palettes at or below this size are searched linearly; larger ones get the
 /// reverse map. Measured by the `cube/palette_growth_4096` bench.
@@ -489,6 +489,202 @@ impl Iterator for CubeIter<'_> {
 
 impl ExactSizeIterator for CubeIter<'_> {}
 
+/// Version of the [`Cube`] serialization format (task 2.3). Bumping it
+/// invalidates every stored cube; a migration path is deliberately out of
+/// scope (the storage layer rejects unknown versions instead).
+pub const CUBE_CODEC_VERSION: u8 = 1;
+
+/// Why [`Cube::decode_with`] rejected a byte string. Decode never panics:
+/// every malformed input maps to one of these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CubeDecodeError {
+    /// Codec version byte is not [`CUBE_CODEC_VERSION`].
+    Version(u8),
+    /// `CUBE_BITS` byte does not match this build, so the cube cannot be
+    /// decoded as a cube of the right size.
+    CubeBits(u8),
+    /// Palette length is 0 or above `CUBE_VOLUME`.
+    PaletteLength(u32),
+    /// The same on-disk state id appears twice in the palette.
+    DuplicateState(u32),
+    /// The `map` callback returned `None` for this on-disk state id.
+    UnmappedState(u32),
+    /// Bits per entry disagree with the palette length.
+    Bits { stored: u8, expected: u8 },
+    /// Byte length disagrees with the header (too short or too long).
+    Length { got: usize, expected: usize },
+    /// A packed index points past the palette.
+    Index { value: u64, palette_len: u16 },
+}
+
+impl std::fmt::Display for CubeDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Version(v) => write!(f, "codec version {v}, expected {CUBE_CODEC_VERSION}"),
+            Self::CubeBits(bits) => write!(f, "cube bits {bits}, expected {CUBE_BITS}"),
+            Self::PaletteLength(len) => write!(f, "palette length {len} outside 1..={CUBE_VOLUME}"),
+            Self::DuplicateState(id) => write!(f, "duplicate palette entry {id}"),
+            Self::UnmappedState(id) => write!(f, "state {id} has no runtime mapping"),
+            Self::Bits { stored, expected } => {
+                write!(f, "bits per entry {stored}, expected {expected}")
+            }
+            Self::Length { got, expected } => {
+                write!(f, "byte length {got}, expected {expected}")
+            }
+            Self::Index { value, palette_len } => {
+                write!(f, "index {value} out of palette of {palette_len}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CubeDecodeError {}
+
+impl Cube {
+    /// Serializes the cube into `out` (little-endian). `map` translates each
+    /// runtime [`BlockStateId`] into the world's on-disk state id; storage
+    /// layers own that translation. See the core README for the format.
+    pub fn encode_with(&self, mut map: impl FnMut(BlockStateId) -> u32, out: &mut Vec<u8>) {
+        out.push(CUBE_CODEC_VERSION);
+        out.push(CUBE_BITS as u8);
+        out.extend_from_slice(&(self.palette.len() as u16).to_le_bytes());
+        for &state in &self.palette {
+            out.extend_from_slice(&map(state).to_le_bytes());
+        }
+        out.push(self.bits as u8);
+        for &word in &self.data {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+    }
+
+    /// Inverse of [`Cube::encode_with`]. `map` translates an on-disk state id
+    /// back to a runtime one and returns `None` for unknown ids. Every header
+    /// field, the palette, the width and each packed index are validated, so
+    /// the result always satisfies `check_invariants` and no input panics.
+    pub fn decode_with(
+        bytes: &[u8],
+        mut map: impl FnMut(u32) -> Option<BlockStateId>,
+    ) -> Result<Self, CubeDecodeError> {
+        let read_u32 = |bytes: &[u8]| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let read_u64 = |bytes: &[u8]| {
+            u64::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ])
+        };
+
+        // Fixed header: version, cube bits, palette length.
+        if bytes.len() < 4 {
+            return Err(CubeDecodeError::Length {
+                got: bytes.len(),
+                expected: 4,
+            });
+        }
+        if bytes[0] != CUBE_CODEC_VERSION {
+            return Err(CubeDecodeError::Version(bytes[0]));
+        }
+        if bytes[1] != CUBE_BITS as u8 {
+            return Err(CubeDecodeError::CubeBits(bytes[1]));
+        }
+        let palette_len = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
+        if palette_len == 0 || palette_len > CUBE_VOLUME {
+            return Err(CubeDecodeError::PaletteLength(palette_len as u32));
+        }
+
+        // Palette, then the width byte.
+        let palette_end = 4 + palette_len * 4;
+        if bytes.len() < palette_end + 1 {
+            return Err(CubeDecodeError::Length {
+                got: bytes.len(),
+                expected: palette_end + 1,
+            });
+        }
+        let mut disk_ids = Vec::with_capacity(palette_len);
+        let mut seen = HashSet::with_capacity(palette_len);
+        for i in 0..palette_len {
+            let id = read_u32(&bytes[4 + i * 4..]);
+            if !seen.insert(id) {
+                return Err(CubeDecodeError::DuplicateState(id));
+            }
+            disk_ids.push(id);
+        }
+        let expected_bits = bits_for(palette_len) as u8;
+        let bits = bytes[palette_end];
+        if bits != expected_bits {
+            return Err(CubeDecodeError::Bits {
+                stored: bits,
+                expected: expected_bits,
+            });
+        }
+
+        // Packed words: exactly word_count(bits) of them (none while uniform).
+        let words_start = palette_end + 1;
+        let word_bytes = if palette_len == 1 {
+            0
+        } else {
+            word_count(bits as u32) * 8
+        };
+        let total = words_start + word_bytes;
+        if bytes.len() != total {
+            return Err(CubeDecodeError::Length {
+                got: bytes.len(),
+                expected: total,
+            });
+        }
+        if palette_len == 1 {
+            // Uniform: no words, and the single entry must be mappable.
+            let state = map(disk_ids[0]).ok_or(CubeDecodeError::UnmappedState(disk_ids[0]))?;
+            return Ok(Self::filled(state));
+        }
+
+        // The stored words use the in-memory layout (same width, entries
+        // never straddle a word), so they become the cube's data directly:
+        // validate every index, clear the padding bits, and keep the words.
+        // Much faster than re-packing through `from_fn` (~200 µs → a few µs
+        // on a surface cube).
+        let bits = u32::from(bits);
+        let epw = entries_per_word(bits);
+        let mask = (1u64 << bits) - 1;
+        let mut data = Vec::with_capacity(word_count(bits));
+        for w in 0..word_count(bits) {
+            let word = read_u64(&bytes[words_start + w * 8..]);
+            let entries = epw.min(CUBE_VOLUME - w * epw);
+            let mut kept = 0u64;
+            for e in 0..entries {
+                let pi = (word >> (e * bits as usize)) & mask;
+                if pi >= palette_len as u64 {
+                    return Err(CubeDecodeError::Index {
+                        value: pi,
+                        palette_len: palette_len as u16,
+                    });
+                }
+                kept |= pi << (e * bits as usize);
+            }
+            data.push(kept);
+        }
+        let runtime: Vec<BlockStateId> = disk_ids
+            .iter()
+            .map(|&id| map(id).ok_or(CubeDecodeError::UnmappedState(id)))
+            .collect::<Result<_, _>>()?;
+        let mut cube = Self {
+            palette: runtime,
+            reverse: ReverseMap::default(),
+            data,
+            bits,
+        };
+        let unique = cube.palette.iter().collect::<HashSet<_>>().len() == palette_len;
+        if !unique {
+            // `map` collided two disk ids onto one runtime state: re-pack so
+            // the palette stays unique.
+            let packed = cube.clone();
+            return Ok(Self::from_fn(|pos| packed.get(pos)));
+        }
+        if cube.palette.len() > LINEAR_SCAN_LIMIT {
+            cube.rebuild_reverse();
+        }
+        Ok(cube)
+    }
+}
+
 #[cfg(test)]
 impl Cube {
     /// Asserts every documented invariant of the storage layout.
@@ -740,5 +936,187 @@ mod tests {
         assert_eq!(cube.bits_per_entry(), 0);
         assert!(cube.heap_bytes() < 64);
         cube.check_invariants();
+    }
+
+    // ------------------------------------------------------------------
+    // Codec (task 2.3)
+
+    /// Identity remap: runtime state ids are used as on-disk ids directly.
+    fn identity(state: BlockStateId) -> u32 {
+        state.0
+    }
+
+    fn round_trip(cube: &Cube) -> Cube {
+        let mut bytes = Vec::new();
+        cube.encode_with(identity, &mut bytes);
+        Cube::decode_with(&bytes, |id| Some(BlockStateId(id))).unwrap()
+    }
+
+    #[test]
+    fn codec_round_trips_uniform_two_state_full_palette_and_random() {
+        // Uniform.
+        let uniform = Cube::filled(BlockStateId(7));
+        assert_eq!(round_trip(&uniform), uniform);
+        // Two states: the minimum packed width.
+        let mut two = Cube::filled(BlockStateId(1));
+        two.set_index(0, BlockStateId(2));
+        assert_eq!(round_trip(&two), two);
+        // Full palette: every cell distinct, maximum width.
+        let full = Cube::from_fn(|pos| BlockStateId(pos.index() as u32));
+        assert_eq!(full.palette().len(), CUBE_VOLUME);
+        assert_eq!(round_trip(&full), full);
+        // Stale palette entry plus a wide random mix.
+        let mut rng = XorShift64(0x9e37_79b9_7f4a_7c15);
+        let mut random = Cube::default();
+        let mut reference = vec![BlockStateId::AIR; CUBE_VOLUME];
+        for cell in &mut reference {
+            let state = BlockStateId((rng.next() % 4096) as u32);
+            *cell = state;
+        }
+        for (i, &state) in reference.iter().enumerate() {
+            random.set_index(i, state);
+        }
+        random.compact();
+        let decoded = round_trip(&random);
+        decoded.check_invariants();
+        assert_eq!(decoded, random);
+        for (i, &expected) in reference.iter().enumerate() {
+            assert_eq!(decoded.get_index(i), expected);
+        }
+    }
+
+    #[test]
+    fn codec_rejects_bad_headers() {
+        let mut bytes = Vec::new();
+        Cube::filled(BlockStateId(1)).encode_with(identity, &mut bytes);
+
+        let bad_version = {
+            let mut b = bytes.clone();
+            b[0] = 2;
+            b
+        };
+        assert_eq!(
+            Cube::decode_with(&bad_version, |id| Some(BlockStateId(id))).unwrap_err(),
+            super::CubeDecodeError::Version(2)
+        );
+
+        let bad_bits = {
+            let mut b = bytes.clone();
+            b[1] = 4;
+            b
+        };
+        assert_eq!(
+            Cube::decode_with(&bad_bits, |id| Some(BlockStateId(id))).unwrap_err(),
+            super::CubeDecodeError::CubeBits(4)
+        );
+
+        // Zero palette length and one above the cube's cells.
+        for len in [0u16, (CUBE_VOLUME + 1) as u16] {
+            let mut b = bytes.clone();
+            b[2..4].copy_from_slice(&len.to_le_bytes());
+            assert!(matches!(
+                Cube::decode_with(&b, |id| Some(BlockStateId(id))),
+                Err(super::CubeDecodeError::PaletteLength(_))
+            ));
+        }
+
+        // Trailing and missing bytes.
+        let mut short = bytes.clone();
+        short.pop();
+        assert!(matches!(
+            Cube::decode_with(&short, |id| Some(BlockStateId(id))),
+            Err(super::CubeDecodeError::Length { .. })
+        ));
+        let mut long = bytes.clone();
+        long.push(0);
+        assert!(matches!(
+            Cube::decode_with(&long, |id| Some(BlockStateId(id))),
+            Err(super::CubeDecodeError::Length { .. })
+        ));
+
+        // Duplicate palette entry: copy the first entry over the second.
+        let mut two = Cube::filled(BlockStateId(1));
+        two.set_index(0, BlockStateId(2));
+        let mut dup = Vec::new();
+        two.encode_with(identity, &mut dup);
+        let head = dup[4..8].to_vec();
+        dup[8..12].copy_from_slice(&head);
+        assert_eq!(
+            Cube::decode_with(&dup, |id| Some(BlockStateId(id))).unwrap_err(),
+            super::CubeDecodeError::DuplicateState(1)
+        );
+
+        // Width inconsistent with the palette length.
+        let mut wide = Vec::new();
+        two.encode_with(identity, &mut wide);
+        wide[12] = 5;
+        assert!(matches!(
+            Cube::decode_with(&wide, |id| Some(BlockStateId(id))),
+            Err(super::CubeDecodeError::Bits {
+                stored: 5,
+                expected: 1
+            })
+        ));
+
+        // An index out of the palette: a three-entry palette packs at 2 bits,
+        // so index 3 (all bits set) is past it.
+        let mut three = Cube::filled(BlockStateId(1));
+        three.set_index(0, BlockStateId(2));
+        three.set_index(1, BlockStateId(3));
+        let mut oob = Vec::new();
+        three.encode_with(identity, &mut oob);
+        let words_start = 4 + 3 * 4 + 1;
+        oob[words_start] = 0xff;
+        assert!(matches!(
+            Cube::decode_with(&oob, |id| Some(BlockStateId(id))),
+            Err(super::CubeDecodeError::Index {
+                value: 3,
+                palette_len: 3
+            })
+        ));
+
+        // A state the map does not know.
+        assert_eq!(
+            Cube::decode_with(&bytes, |id| (id != 1).then_some(BlockStateId(id))).unwrap_err(),
+            super::CubeDecodeError::UnmappedState(1)
+        );
+    }
+
+    #[test]
+    fn codec_decode_never_panics_on_fuzzed_input() {
+        let mut rng = XorShift64(0x0db1_7d3b_8f2a);
+        // 10,000 seeded random byte strings.
+        for _ in 0..10_000 {
+            let len = (rng.next() % 300) as usize;
+            let bytes: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+            let _ = Cube::decode_with(&bytes, |id| Some(BlockStateId(id)));
+        }
+        // Every truncation of valid encodings.
+        let mut uniform = Vec::new();
+        Cube::filled(BlockStateId(1)).encode_with(identity, &mut uniform);
+        let mut two = Vec::new();
+        {
+            let mut cube = Cube::filled(BlockStateId(1));
+            cube.set_index(0, BlockStateId(2));
+            cube.encode_with(identity, &mut two);
+        }
+        let mut full = Vec::new();
+        Cube::from_fn(|pos| BlockStateId(pos.index() as u32)).encode_with(identity, &mut full);
+        for valid in [&uniform, &two, &full] {
+            for cut in 0..valid.len() {
+                let _ = Cube::decode_with(&valid[..cut], |id| Some(BlockStateId(id)));
+            }
+            // The untouched encoding still decodes.
+            Cube::decode_with(valid, |id| Some(BlockStateId(id))).unwrap();
+        }
+        // 1,000 single-byte mutations of valid encodings.
+        for valid in [&uniform, &two] {
+            for _ in 0..500 {
+                let mut mutated = valid.clone();
+                let at = (rng.next() as usize) % mutated.len();
+                mutated[at] ^= (rng.next() % 255) as u8 + 1;
+                let _ = Cube::decode_with(&mutated, |id| Some(BlockStateId(id)));
+            }
+        }
     }
 }

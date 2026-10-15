@@ -16,6 +16,7 @@ use std::thread::{self, JoinHandle};
 
 use jbm_core::coords::CubePos;
 
+use crate::storage::{Storage, StorageError};
 use crate::terrain::Generator;
 
 /// One finished (or exploded) job, as a worker reports it.
@@ -37,6 +38,9 @@ enum JobResult {
 /// promptly even with a deep backlog.
 pub struct GenPool {
     generator: Arc<Generator>,
+    /// When set, positions are loaded from disk first and generated only as
+    /// a fallback (task 2.3).
+    storage: Option<Arc<Storage>>,
     /// `None` in inline mode.
     queue_tx: Option<Sender<CubePos>>,
     shutdown: Arc<AtomicBool>,
@@ -50,11 +54,15 @@ pub struct GenPool {
 
 impl GenPool {
     /// Build a pool with `threads` workers named `jbm-gen-N`, or an inline
-    /// pool when `threads == 0`.
-    pub fn new(threads: usize, generator: Arc<Generator>) -> Self {
+    /// pool when `threads == 0`. With `storage`, every request is
+    /// load-or-generate: a stored cube is read from disk, everything else
+    /// (including a corrupt record, which is logged and left untouched) is
+    /// generated.
+    pub fn new(threads: usize, generator: Arc<Generator>, storage: Option<Arc<Storage>>) -> Self {
         let (results_tx, results_rx) = std::sync::mpsc::channel();
         let mut pool = Self {
             generator,
+            storage,
             queue_tx: None,
             shutdown: Arc::new(AtomicBool::new(false)),
             inline_queue: VecDeque::new(),
@@ -73,11 +81,13 @@ impl GenPool {
                 let worker_queue = Arc::clone(&queue_rx);
                 let worker_results = results_tx.clone();
                 let worker_shutdown = Arc::clone(&pool.shutdown);
+                let worker_storage = pool.storage.clone();
                 let handle = thread::Builder::new()
                     .name(format!("jbm-gen-{id}"))
                     .spawn(move || {
                         worker(
                             worker_generator,
+                            worker_storage,
                             worker_queue,
                             worker_results,
                             worker_shutdown,
@@ -116,7 +126,7 @@ impl GenPool {
     pub fn try_recv(&mut self) -> Option<(CubePos, jbm_core::cube::Cube)> {
         if self.threads.is_empty() {
             let pos = self.inline_queue.pop_front()?;
-            let cube = self.generator.generate(pos);
+            let cube = load_or_generate(self.storage.as_ref(), &self.generator, pos);
             self.in_flight.remove(&pos);
             Some((pos, cube))
         } else {
@@ -156,11 +166,36 @@ impl Drop for GenPool {
     }
 }
 
+/// The pool's load-or-generate step: a stored cube wins, a missing one is
+/// generated, and a corrupt record is logged (with its position) and
+/// regenerated — the record on disk stays untouched unless the cube is
+/// edited and saved again.
+fn load_or_generate(
+    storage: Option<&Arc<Storage>>,
+    generator: &Generator,
+    pos: CubePos,
+) -> jbm_core::cube::Cube {
+    if let Some(storage) = storage {
+        match storage.load(pos) {
+            Ok(Some(cube)) => return cube,
+            Ok(None) => {}
+            Err(StorageError::Corrupt { pos, reason }) => {
+                eprintln!("jbm: corrupt record at {pos:?} ({reason}); regenerating");
+            }
+            Err(error) => {
+                eprintln!("jbm: loading cube {pos:?} failed ({error}); regenerating");
+            }
+        }
+    }
+    generator.generate(pos)
+}
+
 /// One worker's loop: take a position, generate, report. A panic inside
 /// generation is caught and forwarded as [`JobResult::Panicked`] so it can
 /// surface on the tick thread; the worker then carries on with the next job.
 fn worker(
     generator: Arc<Generator>,
+    storage: Option<Arc<Storage>>,
     queue: Arc<Mutex<Receiver<CubePos>>>,
     results: Sender<JobResult>,
     shutdown: Arc<AtomicBool>,
@@ -175,7 +210,9 @@ fn worker(
         if shutdown.load(Ordering::Acquire) {
             break;
         }
-        match panic::catch_unwind(AssertUnwindSafe(|| generator.generate(pos))) {
+        match panic::catch_unwind(AssertUnwindSafe(|| {
+            load_or_generate(storage.as_ref(), &generator, pos)
+        })) {
             Ok(cube) => {
                 // The pool outlives its workers, so this cannot fail.
                 let _ = results.send(JobResult::Done(pos, cube));
@@ -205,7 +242,7 @@ mod tests {
     #[test]
     fn inline_mode_generates_on_the_calling_thread_in_request_order() {
         let terrain = generator();
-        let mut pool = GenPool::new(0, terrain);
+        let mut pool = GenPool::new(0, terrain, None);
         let wanted = [
             CubePos { x: 0, y: 2, z: 0 },
             CubePos { x: 1, y: 2, z: 0 },
@@ -231,7 +268,7 @@ mod tests {
     #[test]
     fn threaded_pool_returns_generated_cubes() {
         let terrain = generator();
-        let mut pool = GenPool::new(2, Arc::clone(&terrain));
+        let mut pool = GenPool::new(2, Arc::clone(&terrain), None);
         let wanted: Vec<CubePos> = (0..8).map(|i| CubePos { x: i, y: 2, z: -i }).collect();
         for pos in &wanted {
             pool.request(*pos);
@@ -253,7 +290,7 @@ mod tests {
         let terrain = generator();
         let start = Instant::now();
         {
-            let mut pool = GenPool::new(2, terrain);
+            let mut pool = GenPool::new(2, terrain, None);
             // Far more queued jobs than could be processed quickly.
             for i in 0..4096 {
                 pool.request(CubePos { x: i, y: 2, z: 0 });

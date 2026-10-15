@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "nodes": {
+    "mask": {
+      "type": "noise2",
+      "salt": "0x0D1B54A32D168ED5",
+      "x_scale": 0.0009,
+      "z_scale": 0.0009
+    },
+    "hilliness": {
+      "type": "clamp",
+      "input": {
+        "type": "add",
+        "a": 0.5,
+        "b": { "type": "mul", "a": { "ref": "mask" }, "b": 1.4 }
+      },
+      "min": 0,
+      "max": 1
+    },
+    "rolling": {
+      "type": "fbm2",
+      "salt": "0x0000000000000000",
+      "scale": 0.006,
+      "octaves": 5
+    },
+    "amplified": { "type": "mul", "a": 40, "b": { "ref": "hilliness" } },
+    "deviation": {
+      "type": "clamp",
+      "input": { "type": "mul", "a": { "ref": "amplified" }, "b": { "ref": "rolling" } },
+      "min": -28,
+      "max": 28
+    },
+    "surface": {
+      "type": "add",
+      "a": 64,
+      "b": { "type": "floor", "a": { "type": "add", "a": { "ref": "deviation" }, "b": 0.5 } }
+    }
+  },
+  "outputs": {
+    "final_density": { "type": "sub", "a": { "ref": "surface" }, "b": { "type": "y" } }
+  }
+}

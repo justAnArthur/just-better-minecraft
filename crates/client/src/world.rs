@@ -474,6 +474,9 @@ mod tests {
                 server_tick: 0,
                 tick_rate: 20,
                 spawn: [0.0, 64.0, 0.0],
+                yaw: 0.0,
+                pitch: 0.0,
+                flying: false,
             }),
             WorldChange::None
         );
@@ -504,8 +507,9 @@ mod tests {
         });
         let solid = |x: i64, y: i64, z: i64| world.solid(BlockPos { x, y, z });
         assert_eq!(solid(3, 2, 7), Some(true), "stone inside the floor cube");
-        assert_eq!(solid(0, 32, 0), Some(false), "air in the cube above");
-        assert_eq!(solid(0, 64, 0), None, "an unloaded cube is None");
+        let size = i64::from(CUBE_SIZE);
+        assert_eq!(solid(0, size, 0), Some(false), "air in the cube above");
+        assert_eq!(solid(0, 2 * size, 0), None, "an unloaded cube is None");
     }
 
     /// Loads a 3x3x3 grid of cubes, clears the dirty set and returns the

@@ -2,7 +2,7 @@
 
 ## Next up
 
-Stage 2 · Far view, wave A: 2.1 declarative worldgen (density graph), 2.2 GPU buffer suballocator + multi-draw indirect, 2.3 redb persistence. Specs not written yet. Start with `/clear`.
+Stage 2 · Far view, wave B: 2.4 LOD pyramid (downsampling rule, edit propagation up the levels), 2.5 GPU frustum and Hi-Z occlusion culling in compute. Specs not written yet. Wave A is on branch stage-2/wave-a (PR pending play-test). Start with `/clear`.
 
 ## Benchmarks
 
@@ -24,8 +24,16 @@ Stage 2 · Far view, wave A: 2.1 declarative worldgen (density graph), 2.2 GPU b
 | worldgen/heightmap_32x32 | 20.22 µs | Apple M5 Pro (bench-2, idle) | 2026-10-15 |
 | worldgen/surface_cube | 92.40 µs | Apple M5 Pro (bench-2, idle) | 2026-10-15 |
 | worldgen/air_cube | 146.92 ns | Apple M5 Pro (bench-2, idle) | 2026-10-15 |
+| worldgen/surface_cube (graph) | 173.8 µs vs reference 135.2 µs (1.29×) | Apple M5 Pro (2.1 reviewer, parallel builds) | 2026-10-15 |
+| worldgen/sample_grid/{1..32} | ≈310 µs | Apple M5 Pro (2.1 implementer, parallel builds) | 2026-10-15 |
+| storage/encode_surface_cube | 9.37 µs | Apple M5 Pro (orchestrator, light load) | 2026-10-15 |
+| storage/decode_surface_cube | 30.15 µs | Apple M5 Pro (orchestrator, light load) | 2026-10-15 |
+| storage/save_batch_64 | 4.00 ms | Apple M5 Pro (orchestrator, light load) | 2026-10-15 |
+| storage/load_cube | 23.83 µs | Apple M5 Pro (orchestrator, light load) | 2026-10-15 |
+| suballoc/churn_10k | ≈308 µs | Apple M5 Pro (2.2 implementer) | 2026-10-15 |
+| terrain_draw/mdi, /fallback | ≈370 µs, ≈329 µs | Apple M5 Pro (2.2 implementer) | 2026-10-15 |
 
-Baselines are bench worker runs on an otherwise idle machine. Run-to-run noise on this Mac is ±10–15%; treat smaller deltas as noise. `iter()` is ~3× faster than per-block `get`, so the mesher should iterate. Compare only runs made without parallel builds (the implementer's 3.67 µs ran alongside other builds; ignore it).
+Baselines are bench worker runs on an otherwise idle machine. Run-to-run noise on this Mac is ±10–15%; treat smaller deltas as noise. `iter()` is ~3× faster than per-block `get`, so the mesher should iterate. Compare only runs made without parallel builds (the implementer's 3.67 µs ran alongside other builds; ignore it). The wave A worldgen rows ran during three parallel worker builds: the graph/reference ratio is meaningful, the absolute numbers are not (idle baseline surface_cube was 92 µs). Re-run worldgen idle before 2.7.
 
 ## Decisions
 
@@ -55,13 +63,20 @@ Baselines are bench worker runs on an otherwise idle machine. Run-to-run noise o
 
   16³ wins only single-edit latency and storage of mostly-uniform space. A 236 µs re-mesh, even ×8 for a corner edit, is far inside a frame on the worker pool. Every per-cube cost scales 8× at 16³: messages, map entries, draws, and later LOD nodes and redb keys. The `cube16` feature stays for re-measuring, but CI does not build it, so expect it to rot.
 
+- 2026-10-15: Terrain is data: a JSON density graph (`crates/server/assets/worldgen/overworld.json`) compiled to a flat register program with constant folding, xz-only instructions run once per column, interval bounds for fast paths and a per-column "band" solidity cache. Solid means density ≥ 0; grass/dirt/sand come from a code surface stage (depth below air). It reproduces the 1.5 terrain bit for bit; the old code stays as `worldgen::reference` for the equivalence tests until a later stage deletes it.
+- 2026-10-15: Terrain draws from shared 32 MiB face pages with a first-fit suballocator and one `multi_draw_indirect` per page; one indirect command per visible cube and face direction, back-facing directions skipped (a ≥1-block margin keeps f32 rounding safe). Fallback (`JBM_NO_MDI=1`, or no INDIRECT_EXECUTION / INDIRECT_FIRST_INSTANCE) issues the same commands as direct draws; images are pixel-identical. Region draw calls 24 → 1.
+- 2026-10-15: Worlds persist in `saves/default/world.redb` (`JBM_WORLD_DIR`, `JBM_NO_SAVE=1`). Only edited cubes are stored (zstd'd palette + words, on-disk id table for remapping); unedited cubes regenerate. A `jbm-save` thread commits one transaction per batch every 5 s and on drop; cubes stay pinned until their latest edit version is committed, then evict normally. The gen pool is load-or-generate. Players (by name) are saved with each batch and on disconnect, and rejoin at their saved position, look and flight (protocol v5 `Welcome { spawn, yaw, pitch, flying }`).
+
 ## Known issues
 
 - client/render/texture_array.rs: mip box filter applies the sRGB curve to alpha too. Fix in 1.4 before translucent textures (filter alpha linearly).
 - client/render/overlay.rs: `layout` and `glyph_count` duplicate the char filter (keep in sync or return both counts); `FrameStats` grows unbounded on repeated zero-dt frames (unreachable in app); `render` trusts `set_viewport`.
 - server/run.rs: stop/drop can wait up to one tick (≤50 ms) while the thread sleeps. Fine until shutdown latency matters.
 - Windowed app path has no automated test (workers' sandbox can't open a window). The orchestrator launches `cargo run -p jbm-game` before merging any wave that touches `client/src/app.rs`; this caught a redraw loop that stalled on macOS.
-- Edited cubes are pinned in server memory and never evicted, so they grow without bound until persistence (2.3).
+- Without a world dir (`world_dir: None`, all tests by default) edited cubes stay pinned forever, as before 2.3. With persistence they unpin once saved.
+- server: `Drop for Server` joins `jbm-save` after `flush`'s 30 s timeout, so a hung commit can still block shutdown. Bound the join if it ever matters.
+- client: face pages are never freed or compacted; fragmentation grows with churn until a compaction task (2.6 or later).
+- `worldgen::reference` (the 1.5 noise code) is kept only for equivalence tests; delete it once LOD sampling (2.7) has its own coverage.
 - Golden tolerance (0.5% of pixels differing) is larger than thin features such as the target outline (~40–140 px). Tests for thin features must also assert directly: `edit_screenshot` renders with and without the outline and requires a difference.
 - `Renderer::render` takes one optional argument per pass (8 args, clippy allowed with a reason). Bundle them into a frame struct when the next pass lands.
 - Reviewers passed 1.4 with three visible bugs (one-block face offset for +X/−Z, stale mesh race, magenta grass side). The orchestrator must keep inspecting goldens zoomed in, and golden cameras must be close enough to show per-block detail.
@@ -96,3 +111,11 @@ Baselines are bench worker runs on an otherwise idle machine. Run-to-run noise o
   - released held edit buttons on focus loss and Esc;
   - fixed clippy errors and wrote the READMEs.
 - Stage 1 gate passed: the user played the wave C build (walk, fly, break, place). Movement stuttered at 20 Hz because every server ack reset the render interpolation; fixed in fix/interp-snap (agreeing acks leave it alone, corrections shift both endpoints). The user confirmed it is smooth.
+
+### 2026-10-15
+- Stage 2 wave A specs written (docs/tasks/2.1–2.3). All three GLM implementers ran in parallel on branch stage-2/wave-a; no Z.ai limit hit. Reviewers: MERGE ×3.
+- 2.2 merged: paged face buffers + suballocator, multi-draw indirect with per-direction commands and back-face direction skipping, direct-draw fallback, path-equality and slot-reuse GPU tests, `terrain_draw` bench. Orchestrator also fixed a client test that failed under `cube16` (literal 32).
+- 2.1 merged: density graph format + compiler + evaluator, shipped overworld graph, exact equivalence with the 1.5 code (3 seeds, 512² + far columns), `sample_grid` at LOD steps, goldens untouched. The worker caught a spec error (`y − 70` is solid above 70 under "≥ 0 is solid"). Orchestrator fixed `surface_height` scanning the shipped graph's range instead of the graph's own band, with a test.
+- 2.3 merged: redb storage + cube codec in core + background saver + load-or-generate, kill-during-save tests (storage-level atomicity over 10 SIGKILL rounds, server-level prefix property). Orchestrator: decode builds the cube from the stored words instead of re-packing (load 211 → 24 µs), bulk zstd frames, typed corrupt-meta error, fixed the load bench (it measured a uniform cube), resolved merge conflicts with 2.1/2.2, and made the held-save tests deterministic after they flaked under the parallel workspace run (one attempted fix hung the test binary; now a `release_one_save` hook, a `failed_batches` counter and a release guard).
+- Play-test of wave A: no holes, edits survive restart and flying away and back. Position and look were not kept (player data was out of 2.3's scope); the orchestrator added player records (`players` table, protocol v5 `Welcome` with look and flight, departures captured on disconnect) with storage and end-to-end tests, plus a regression test for an edit restored from disk surviving eviction with threaded generation.
+
