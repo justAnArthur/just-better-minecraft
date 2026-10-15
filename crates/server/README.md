@@ -110,23 +110,111 @@ breaks the determinism rule — don't.
 
 ## Generation pool (`gen_pool`)
 
-`GenPool::new(threads, Arc<Generator>)` — named workers `jbm-gen-N`, or
-inline mode with `threads == 0` (requests queue; `try_recv` generates on
-the calling thread — the deterministic mode tests and benches use).
+`GenPool::new(threads, Arc<Generator>, Option<Arc<Storage>>)` — named
+workers `jbm-gen-N`, or inline mode with `threads == 0` (requests queue;
+`try_recv` generates on the calling thread — the deterministic mode tests
+and benches use).
 
 - `request(pos)` / `try_recv() -> Option<(CubePos, Cube)>`. Requests are
   deduplicated while in flight (queued, generating, or done-but-uncollected).
+- **Load-or-generate** (task 2.3): when a `Storage` is attached, every
+  request reads the cube from disk first and generates only when it was
+  never saved. A `Corrupt` record is logged with its position and
+  regenerated; the record on disk stays untouched unless the cube is edited
+  and saved again.
 - **Shutdown:** dropping the pool flags shutdown, closes the queue and
   joins every thread; queued-but-unstarted jobs are discarded, so drop
   returns promptly and never detaches.
 - A panic inside generation is caught and forwarded; `try_recv` resumes it
   on the tick thread so it never silently vanishes with a worker.
 
+## Persistence (`storage`, task 2.3)
+
+A world is one directory holding one `redb` database, `world.redb`.
+`Storage::open(dir, &BlockRegistry, seed)` creates the directory and
+database when missing, and is `Send + Sync` (shared as `Arc<Storage>`:
+loads run on the generation threads, writes on the saver thread). A second
+open of the same file fails with the typed `StorageError::Locked` — it
+never corrupts the database or waits.
+
+**Tables** (one transaction per write):
+
+| table | key → value |
+| --- | --- |
+| `meta` | `&str → &[u8]`: `format_version` (`u32` = 1) and `seed` (`u64`) |
+| `block_states` | on-disk `u32` → canonical `namespace:path[prop=value,…]` (properties in declaration order) |
+| `cubes` | 13-byte position key → `[record schema u8 = 1][zstd level-3 frame of the cube codec bytes]` |
+
+The **cube key** is `[kind: u8][x][y][z]`, each coordinate an i32
+big-endian with the sign bit flipped, so keys sort by coordinate value.
+`kind = 0` is a LOD0 cube; 1..=255 are reserved for LOD cubes (task 2.7).
+
+**State remapping:** runtime `BlockStateId`s are re-assigned every start;
+on-disk ids are stable. On open, both remap tables are built in one
+transaction: stored names the registry maps are reused, states missing
+from the table are appended with fresh ids, and a stored name the registry
+lacks fails open with `StorageError::UnknownBlockState` (unknown-block
+placeholders come later). A database written by a newer format version
+fails with `StorageError::VersionTooNew`.
+
+**Seed:** on reopen the stored seed wins over the configured one (mismatch
+logged once); `Storage::seed()` returns it so `Server::try_with_config`
+builds the generator from it.
+
+**API:** `load(pos)` (missing → `None`, damaged record → `Corrupt`),
+`save_batch(&[(CubePos, &Cube)])` — one transaction committed with redb's
+immediate durability, so when it returns the batch is on disk — plus
+`cube_count()` and the diagnostic/test hooks `meta`, `cube_positions` and
+`save_batch_with_meta` (the crash test stamps `last_batch` atomically with
+its cubes).
+
+### Dirty tracking and pinning
+
+Each world cube carries an **edit version** (`u64`), bumped by every
+accepted edit, and a **saved version** — the last version known committed
+to disk. With persistence on, a cube is **pinned while
+`version > saved_version`**: that covers both never-saved edits and cubes
+in a save batch the saver has not acknowledged yet. Without persistence
+(`world_dir: None`) the pin is the edited set, exactly as before 2.3, and
+pinned cubes still grow without bound.
+
+**Eviction** replaces the 1.7 rule: a cube is dropped when no player's
+keep set contains it *unless it is pinned*. Unedited cubes regenerate
+exactly; edited cubes reload from disk once their edits are committed —
+both lossless. Only uncommitted edits pin a cube forever.
+
+### The `jbm-save` thread and its guarantees
+
+One background thread owns the write side. Every `save_interval` the tick
+thread takes a **snapshot** — a clone of each pinned cube whose current
+version has not already been sent — and hands it off as one batch; the
+saver encodes, compresses and commits one transaction per batch, then
+replies with `(pos, version)` acknowledgements. The tick thread applies
+acks at the start of phase 5: `saved_version = max(saved_version, acked)`,
+so an edit made after a snapshot keeps the cube pinned until the next
+batch. The tick thread never compresses, encodes or waits on disk I/O
+during normal ticks.
+
+**Failure modes:** a failed commit is logged and its cubes stay pinned and
+retry next interval — edits are never dropped silently. A dead saver
+thread is logged loudly. `Server::flush()` sends everything still dirty
+and blocks for its ack (bounded by 30 s, logged on timeout); `Drop for
+Server` flushes, closes the channel and joins the saver, so
+`ServerHandle::stop` and dropping a handle persist all edits.
+
+**Test hooks** (on `Storage`): `hold_saves`/`release_saves` block the
+saver mid-batch to make "edit during save" deterministic;
+`fail_next_save` injects one synthetic commit failure. Test accessors on
+`Server`: `dirty_count()`, `pending_save_count()`, `saved_batches()`,
+`storage()`.
+
 ## Server (`server`)
 
-`Server::new()` (default config), `Server::with_config(ServerConfig)`,
-`add_connection(ServerLink)`, `tick()` runs exactly one tick, `update(elapsed)
--> u32` feeds the clock and runs every due tick. Read access for tests:
+`Server::new()` (default config), `Server::with_config(ServerConfig)`
+(panics if the world storage cannot open; `Server::try_with_config` returns
+the `StorageError` instead, and opens storage *first* so the stored seed
+feeds the generator), `add_connection(ServerLink)`, `tick()` runs exactly
+one tick, `update(elapsed) -> u32` feeds the clock and runs every due tick. Read access for tests:
 `tick_count()`, `dropped_ticks()`, `players()`, `world_cube_count()`,
 `in_flight()`, `sent_count(PlayerId)`.
 
@@ -142,6 +230,8 @@ the calling thread — the deterministic mode tests and benches use).
 | `gen_threads: usize` | `available_parallelism() - 2`, min 1 | 0 = inline mode |
 | `gen_budget_per_tick: usize` | 64 | inline generation per tick |
 | `max_in_flight: usize` | 512 | queued + generating + uncollected |
+| `world_dir: Option<PathBuf>` | `None` | persistence; `None` = today's behavior |
+| `save_interval: Duration` | 5 s | snapshot cadence for the save thread |
 
 `ServerConfig::protocol_only()` turns streaming off with no generation
 threads — what exact-message-sequence tests and benches use.
@@ -217,11 +307,10 @@ offset list, so nothing is scanned. Unload scans and world eviction run
 only when something changed (a player moved or left, results arrived).
 
 **Eviction:** cubes are dropped from server memory when no player's keep
-set contains them, except pinned (edited) cubes, which are never evicted.
-Unedited cubes regenerate exactly, so dropping them is lossless. Pinned
-cubes grow without bound until persistence lands in 2.3. Generation
-results never overwrite a cube already in the world (`entry().or_insert`),
-so an edit cannot be clobbered by a late generation result.
+set contains them, except pinned cubes (see "Dirty tracking and pinning"
+under Persistence). Generation results never overwrite a cube already in
+the world (`entry().or_insert`), so an edit cannot be clobbered by a late
+generation result.
 
 ## Block edits (task 1.7)
 
@@ -257,8 +346,9 @@ arrive via `ServerHandle::connect(&self, ServerLink)`. `ServerHandle::stop(self)
 -> Server` sets a stop flag, joins the thread and returns the `Server` for
 inspection; a thread panic propagates through `stop` instead of being
 swallowed. Dropping a handle also stops and joins the thread — it never
-detaches. (Dropping the `Server` also drops its `GenPool`, which joins the
-generation threads.)
+detaches. (Dropping the `Server` also runs `flush()`, persisting every
+accepted edit, then drops its `GenPool`, which joins the generation
+threads, and the `jbm-save` thread.)
 
 **Threading model:** one server thread owns the `Server`; tests talk to
 it only through links (or by `stop()` returning the `Server`). The tick
@@ -302,6 +392,16 @@ Current cases:
 - `worldgen/sample_grid/{1,2,4,8,32}` — one 32³ density grid near the
   surface per LOD step; step 32 spans 1,024 blocks (every column a cache
   miss, the worst case).
+- `storage/encode_surface_cube` ≈ 9 µs — codec plus zstd level 3 (bulk
+  frames, which record their content size).
+- `storage/decode_surface_cube` ≈ 30 µs — exact-size zstd decompress plus
+  codec validation.
+- `storage/save_batch_64` ≈ 4.0 ms — one committed 64-cube transaction,
+  fsync included.
+- `storage/load_cube` ≈ 24 µs — a hot read plus decode of a mixed cube. On this machine a
+  surface cube's record is 199 bytes against 8.2 kB of heap storage (air
+  and uniform-stone records are 18 bytes), and one flush-sized commit of
+  1,000 cubes takes ≈ 24 ms.
 
 **Invariants**
 

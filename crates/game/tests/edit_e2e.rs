@@ -23,6 +23,8 @@ fn config() -> ServerConfig {
         gen_threads: 0,
         gen_budget_per_tick: 64,
         max_in_flight: 512,
+        world_dir: None,
+        save_interval: std::time::Duration::from_secs(5),
     }
 }
 

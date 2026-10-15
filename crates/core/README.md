@@ -91,6 +91,33 @@ unit tests pass at either size. Limits:
   `< palette.len()`) are asserted by `#[cfg(test)] Cube::check_invariants`,
   which tests call after operations.
 
+#### Cube codec (task 2.3)
+
+`Cube::encode_with(map, out)` / `Cube::decode_with(bytes, map)` serialize a
+cube for the world database; `map` translates between runtime
+`BlockStateId`s and the world's stable on-disk state ids (the storage layer
+owns that table). Little-endian throughout:
+
+| field | type | notes |
+| --- | --- | --- |
+| codec version | `u8` | `CUBE_CODEC_VERSION = 1` |
+| cube bits | `u8` | `CUBE_BITS`, so a 16³ cube is never decoded as 32³ |
+| palette length | `u16` | then that many `u32` on-disk state ids |
+| bits per entry | `u8` | `bits_for(palette_len)`; `0` while uniform |
+| packed words | `u64 …` | `word_count(bits)` words, **none** while uniform |
+
+Decode validates everything before building: version, cube bits, palette
+length in `1..=CUBE_VOLUME`, palette entries unique and mappable, width
+consistent with the palette length, exact byte length, and every packed
+index below the palette length. The result always satisfies
+`check_invariants`, decode never panics on any input (fuzzed in tests with
+random bytes, every truncation, and single-byte mutations), and errors are
+the typed `CubeDecodeError`. The stored words use the in-memory packing,
+so decode validates them and keeps them as the cube's data (re-packing via
+`from_fn` only if `map` collides two disk ids): ≈ 30 µs per surface cube at
+32³ including zstd (`storage/decode_surface_cube`); encode is ≈ 9 µs. Round trips are exact for uniform, two-state, full-palette and
+random cubes.
+
 ### `physics` — the one shared player step (task 1.6)
 
 Units are blocks and seconds, f64. The step is fixed:

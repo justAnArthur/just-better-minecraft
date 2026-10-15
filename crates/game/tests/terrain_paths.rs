@@ -47,6 +47,7 @@ fn server_config() -> ServerConfig {
         gen_threads: 0,
         gen_budget_per_tick: 64,
         max_in_flight: 512,
+        ..ServerConfig::default()
     }
 }
 

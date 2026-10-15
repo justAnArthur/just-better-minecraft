@@ -50,6 +50,8 @@ fn streamed_terrain_matches_golden() {
         gen_threads: 0,
         gen_budget_per_tick: 64,
         max_in_flight: 512,
+        world_dir: None,
+        save_interval: std::time::Duration::from_secs(5),
     });
     let mut client = server.connect("viewer");
     let mut world = ClientWorld::new();

@@ -5,6 +5,7 @@
 pub mod gen_pool;
 pub mod run;
 pub mod server;
+pub mod storage;
 mod streaming;
 pub mod terrain;
 pub mod tick;
@@ -13,5 +14,6 @@ pub mod worldgen;
 pub use gen_pool::GenPool;
 pub use run::ServerHandle;
 pub use server::{DEFAULT_SEED, PlayerView, Server, ServerConfig};
+pub use storage::{Storage, StorageError};
 pub use terrain::Generator;
 pub use tick::TickClock;

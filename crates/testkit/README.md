@@ -58,6 +58,38 @@ Other crates add `jbm-testkit` as a dev-dependency only. Prefer `step`
 when a test cares about exact tick numbers, `run_for` when it cares about
 durations; both are deterministic.
 
+**One caveat for persistence tests (task 2.3):** a HeadlessServer's ticks
+run in microseconds while the `jbm-save` thread commits on real disk. A
+test waiting for a batch's acknowledgement must sleep in real time between
+steps (see `wait_until` in `tests/persistence.rs`) — simulated time alone
+can outrun the commit by orders of magnitude.
+
+## Persistence tests
+
+`tests/persistence.rs` (task 2.3): edits survive a drop-and-restart (the
+edited cube streams back in from disk), an edited cube is unpinned and
+evicted once its batch commits (then reloads with the edit on return), an
+edit made while a batch is held mid-save (`Storage::hold_saves`) keeps the
+cube pinned until the *second* batch commits, and a failed save
+(`Storage::fail_next_save`) keeps cubes pinned and retries next interval.
+Each uses a temp world dir, inline generation and a one-tick save interval.
+
+`tests/kill_during_save.rs` proves crash atomicity by re-executing its own
+binary as a child (`--exact kill_child_* --nocapture`, gated by
+`JBM_KILL_SAVE_CHILD`) and SIGKILLing it mid-save (unix only):
+
+- **Storage level:** the child rewrites the same 64 pattern cubes and
+  stamps `last_batch = k` in one transaction, forever. The parent kills it
+  after a seeded 20–400 ms, ten rounds on the same directory, and checks
+  the database reopens (no stuck lock), all 64 cubes decode, every cube
+  shows the same `k`, and `k == last_batch` — no torn batch.
+- **Server level:** the child runs a real server (50 ms save interval)
+  with one client placing glass blocks along a sequence derived from the
+  deterministic terrain (every target provably air and in reach, so every
+  placement is accepted). The parent kills it, reopens the world, and
+  checks every stored cube loads and the placed blocks are a prefix of
+  the sequence.
+
 **Invariants**
 
 - Never a runtime dependency of any shipping crate; other crates pull it
