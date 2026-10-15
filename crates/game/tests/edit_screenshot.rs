@@ -54,6 +54,7 @@ fn edited_spawn_scene_matches_golden() {
         max_in_flight: 512,
         world_dir: None,
         save_interval: std::time::Duration::from_secs(5),
+        lod_levels: 4,
     });
     let mut registry = BlockRegistry::new();
     let blocks = builtin::Blocks::register(&mut registry);

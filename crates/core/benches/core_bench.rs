@@ -9,8 +9,9 @@ use std::hint::black_box;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use glam::DVec3;
 use jbm_core::block::BlockStateId;
-use jbm_core::coords::{BlockPos, CUBE_VOLUME};
+use jbm_core::coords::{BlockPos, CUBE_SIZE, CUBE_VOLUME, LocalPos};
 use jbm_core::cube::Cube;
+use jbm_core::lod::{CellBox, downsample_octant, downsample_region};
 use jbm_core::physics::{self, BlockShapes, MoveInput, PlayerState};
 use jbm_core::raycast::{REACH, raycast};
 
@@ -192,5 +193,96 @@ fn bench_raycast(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench, bench_cube, bench_physics, bench_raycast);
+/// A cube shaped like a generated surface cube: layered ground with a
+/// surface band, air above, and a 1-thick wall crossing it. Asserted mixed
+/// by the benches that use it.
+fn lod_surface_cube() -> Cube {
+    let size = CUBE_SIZE as usize;
+    let cube = Cube::from_fn(|p| {
+        let (x, y, z) = (p.x as usize, p.y as usize, p.z as usize);
+        let surface = size / 2 + (x + z) % 3 - 1;
+        if y == surface {
+            BlockStateId(3) // grass
+        } else if y + 4 > surface {
+            BlockStateId(2) // dirt
+        } else if y < surface {
+            BlockStateId(1) // stone
+        } else if x == size / 2 && z < size / 2 {
+            BlockStateId(4) // a wall poking above the surface
+        } else {
+            BlockStateId::AIR
+        }
+    });
+    assert!(cube.uniform().is_none(), "the surface case must be mixed");
+    cube
+}
+
+fn bench_lod(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lod");
+
+    group.bench_function("downsample_octant/surface", |b| {
+        let child = lod_surface_cube();
+        b.iter_batched(
+            || Cube::filled(BlockStateId::AIR),
+            |mut parent| {
+                black_box(downsample_octant(&child, &mut parent, 0));
+                parent
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    group.bench_function("downsample_octant/uniform", |b| {
+        let child = Cube::filled(BlockStateId(1));
+        b.iter_batched(
+            || Cube::filled(BlockStateId::AIR),
+            |mut parent| {
+                black_box(downsample_octant(&child, &mut parent, 0));
+                parent
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    group.bench_function("edit_cell", |b| {
+        // One `downsample_region` call on one changed cell, against a
+        // parent that already holds the child's downsample — the per-edit
+        // cost at one level, `Cube::compact` included. The edit is chosen
+        // so the parent cell really changes (a no-op edit would skip the
+        // write and the compact).
+        let child = lod_surface_cube();
+        let mut base = Cube::filled(BlockStateId::AIR);
+        downsample_octant(&child, &mut base, 0);
+        let (edited, local) = (0..CUBE_VOLUME)
+            .find_map(|i| {
+                let local = LocalPos::from_index(i);
+                let mut edited = child.clone();
+                edited.set(local, BlockStateId(7));
+                let mut parent = base.clone();
+                downsample_region(&edited, &mut parent, 0, CellBox::single(local))
+                    .map(|_| (edited, local))
+            })
+            .expect("some single edit changes the parent");
+        b.iter_batched(
+            || base.clone(),
+            |mut parent| {
+                let changed = downsample_region(&edited, &mut parent, 0, CellBox::single(local));
+                assert!(changed.is_some());
+                parent
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench,
+    bench_cube,
+    bench_physics,
+    bench_raycast,
+    bench_lod
+);
 criterion_main!(benches);

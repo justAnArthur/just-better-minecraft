@@ -76,6 +76,7 @@ Baselines are bench worker runs on an otherwise idle machine. Run-to-run noise o
 - Without a world dir (`world_dir: None`, all tests by default) edited cubes stay pinned forever, as before 2.3. With persistence they unpin once saved.
 - server: `Drop for Server` joins `jbm-save` after `flush`'s 30 s timeout, so a hung commit can still block shutdown. Bound the join if it ever matters.
 - client: face pages are never freed or compacted; fragmentation grows with churn until a compaction task (2.6 or later).
+- LOD pyramid has no eviction until 2.6 (rings) and 2.7 (stored LOD); it grows with the explored area.
 - `worldgen::reference` (the 1.5 noise code) is kept only for equivalence tests; delete it once LOD sampling (2.7) has its own coverage.
 - Golden tolerance (0.5% of pixels differing) is larger than thin features such as the target outline (~40–140 px). Tests for thin features must also assert directly: `edit_screenshot` renders with and without the outline and requires a difference.
 - `Renderer::render` takes one optional argument per pass (8 args, clippy allowed with a reason). Bundle them into a frame struct when the next pass lands.
