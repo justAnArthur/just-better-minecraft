@@ -29,7 +29,7 @@ use crate::mesh::pool::MeshPool;
 use crate::predict::Predictor;
 use crate::render::chunks::TerrainPass;
 use crate::render::overlay::{FrameStats, OverlayText};
-use crate::render::renderer::{DepthTarget, Renderer};
+use crate::render::renderer::{DepthTarget, FrameInputs, Renderer};
 use crate::render::texture_array::BlockTextures;
 use crate::world::ClientWorld;
 
@@ -260,7 +260,7 @@ impl App {
                     | ServerMsg::UnloadCube { .. }
                     | ServerMsg::BlockChange { .. } => {
                         if let crate::world::WorldChange::Unloaded(pos) = self.world.apply(&msg) {
-                            w.terrain.remove(pos);
+                            w.terrain.remove(&w.gpu, pos);
                         }
                     }
                     ServerMsg::Tick { .. } | ServerMsg::Pong { .. } => {}
@@ -484,11 +484,16 @@ impl App {
             terrain_stats.pages,
             terrain_stats.commands,
             terrain_stats.draw_calls,
-            if w.terrain.uses_mdi() {
-                "MDI"
-            } else {
-                "FALLBACK"
-            }
+            w.terrain.path_name()
+        ));
+        // The cull counters are read back through a 3-deep ring, so this
+        // line is one or two frames late.
+        let cull = w.terrain.cull_stats();
+        overlay.push(format!(
+            "CULL DRAWN {} FRUSTUM {} OCCLUDED {}",
+            cull.drawn(),
+            cull.frustum_culled,
+            cull.occluded
         ));
 
         // Every skipped frame still asks for the next one: the first frames
@@ -519,12 +524,14 @@ impl App {
             .create_view(&wgpu::TextureViewDescriptor::default());
         w.renderer.render(
             &w.gpu,
-            &view,
-            w.depth.view(),
-            &self.camera,
-            Some(&overlay),
-            Some(&mut w.terrain),
-            target.map(|hit| hit.block),
+            FrameInputs {
+                target: &view,
+                depth: &w.depth,
+                camera: &self.camera,
+                terrain: Some(&mut w.terrain),
+                outline: target.map(|hit| hit.block),
+                overlay: Some(&overlay),
+            },
         );
         w.gpu.queue.present(frame);
         if !self.occluded {

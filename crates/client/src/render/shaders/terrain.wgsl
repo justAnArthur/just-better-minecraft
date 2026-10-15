@@ -8,18 +8,24 @@
 // Bind groups:
 //   0: shared frame uniforms (same layout as sky.wgsl)
 //   1: the face page's storage buffer (array<vec2u>, one vec2 per face)
-//   2: shared terrain resources: origins, textures, sampler
+//   2: shared terrain resources: cube meta, the terrain-only uniform,
+//      textures, sampler
 //
 // Each draw covers one cube and one face direction: vertex_count faces * 6
 // vertices, one instance, with first_vertex = (page range start + direction
-// range start) * 6 and first_instance = the cube's slot in the origins
-// buffer. vertex_index includes first_vertex — WebGPU sets vertexIndex to
-// firstVertex + i for a non-indexed draw (WGSL @builtin(vertex_index)),
-// and wgpu passes the draw range start straight through — so
-// faces[vertex / 6] indexes page-local faces. instance_index likewise
-// includes first_instance, selecting the cube's origin. Origins are
-// camera-relative (world cube corner - camera position, computed in f64 on
-// the CPU), so no absolute world coordinate ever reaches f32.
+// range start) * 6 and first_instance = the cube's slot in the persistent
+// cube_meta buffer (on every path; the GPU cull writes the commands with
+// the same slot). vertex_index includes first_vertex — WebGPU sets
+// vertexIndex to firstVertex + i for a non-indexed draw (WGSL
+// @builtin(vertex_index)), and wgpu passes the draw range start straight
+// through — so faces[vertex / 6] indexes page-local faces. instance_index
+// likewise includes first_instance, selecting the cube's meta entry.
+//
+// The vertex shader computes the camera-relative origin itself (see
+// cube_origin below): the integer cube-grid part is exact in f32 and the
+// only rounding is the final subtract of the camera fraction, so CPU and
+// GPU cull on the same numbers and no absolute world coordinate ever
+// reaches f32.
 
 struct FrameUniforms {
     view_proj: mat4x4f,
@@ -32,11 +38,38 @@ struct FrameUniforms {
     viewport: vec4f,
 };
 
+// Mirrored by `CubeMeta` in render/chunks.rs (80 bytes, 16-aligned; layout
+// test there). Written once per upload/re-mesh, never per frame.
+struct CubeMeta {
+    pos_page: vec4i,        // xyz = cube coordinates, w = page index
+    start_flags: vec4u,     // x = face range start in the page, y = flags
+    dirs: array<vec4u, 3>,  // six per-direction (offset, count) pairs
+};
+
+// Mirrored by `TerrainUniforms` in render/chunks.rs (32 bytes). Terrain
+// only: sky, outline and overlay share just FrameUniforms.
+struct TerrainUniforms {
+    camera_cube: vec4i, // xyz = floor(camera / CUBE_SIZE)
+    camera_frac: vec4f, // xyz = camera - camera_cube * CUBE_SIZE (f32); w = CUBE_SIZE
+};
+
 @group(0) @binding(0) var<uniform> u: FrameUniforms;
 @group(1) @binding(0) var<storage, read> faces: array<vec2u>;
-@group(2) @binding(0) var<storage, read> origins: array<vec4f>;
-@group(2) @binding(1) var block_textures: texture_2d_array<f32>;
-@group(2) @binding(2) var block_sampler: sampler;
+@group(2) @binding(0) var<storage, read> cube_meta: array<CubeMeta>;
+@group(2) @binding(1) var<uniform> terrain: TerrainUniforms;
+@group(2) @binding(2) var block_textures: texture_2d_array<f32>;
+@group(2) @binding(3) var block_sampler: sampler;
+
+// The one origin formula, shared by this shader, cull.wgsl and
+// `cube_origin` in render/chunks.rs: origin = (pos - camera_cube) *
+// CUBE_SIZE - camera_frac (CUBE_SIZE rides in camera_frac.w, so the
+// shader is cube-size agnostic). The multiply is exact (small integers),
+// so the only rounding is the final f32 subtract — one rounding total,
+// and the CPU path computes the very same value.
+fn cube_origin(pos: vec3i) -> vec3f {
+    let int_part = vec3f(pos - terrain.camera_cube.xyz) * terrain.camera_frac.w;
+    return int_part - terrain.camera_frac.xyz;
+}
 
 // Per-direction frames, identical to the table in mesh/face.rs:
 // direction -> (normal, u axis, v axis), with cross(u, v) = normal.
@@ -79,9 +112,10 @@ struct VsOut {
 @vertex
 fn vs_main(
     @builtin(vertex_index) vertex: u32,
-    @builtin(instance_index) origin_index: u32,
+    @builtin(instance_index) slot: u32,
 ) -> VsOut {
     let face = faces[vertex / 6u];
+    let m = cube_meta[slot];
 
     // Word 0: x | y<<5 | z<<10 | (width-1)<<15 | (height-1)<<20 | dir<<25.
     let bx = f32(face.x & 31u);
@@ -113,8 +147,8 @@ fn vs_main(
         );
         corner_ao = array<u32, 6>(ao1, ao2, ao3, ao1, ao3, ao0);
     }
-    let slot = vertex % 6u;
-    let c = corners[slot];
+    let corner_index = vertex % 6u;
+    let c = corners[corner_index];
 
     let n = normals()[direction];
     let ua = u_axes()[direction];
@@ -127,7 +161,7 @@ fn vs_main(
     let block = vec3i(i32(bx), i32(by), i32(bz)) + max(n, vec3i(0))
         + max(-ua, vec3i(0)) + max(-va, vec3i(0));
     let offset = ua * i32(c.x * width) + va * i32(c.y * height);
-    let relative = origins[origin_index].xyz + vec3f(block + offset);
+    let relative = cube_origin(m.pos_page.xyz) + vec3f(block + offset);
 
     // v is world-up on side faces and texture v grows downward, so the
     // image's top row lands at the block's top.
@@ -138,7 +172,7 @@ fn vs_main(
     out.pos = u.view_proj * vec4f(relative, 1.0);
     out.uv = uv;
     out.layer = layer;
-    out.shade = face_shade()[direction] * ao_factor[corner_ao[slot]];
+    out.shade = face_shade()[direction] * ao_factor[corner_ao[corner_index]];
     return out;
 }
 

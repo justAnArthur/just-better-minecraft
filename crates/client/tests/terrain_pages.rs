@@ -9,9 +9,11 @@ use glam::DVec3;
 use jbm_client::camera::Camera;
 use jbm_client::mesh::appearance::{BlockAppearance, builtin_textures};
 use jbm_client::mesh::greedy::{self, MeshInput};
-use jbm_client::render::chunks::{TerrainPass, worst_case_faces};
+use jbm_client::render::chunks::TerrainPass;
+use jbm_client::render::chunks::TerrainPath;
+use jbm_client::render::chunks::worst_case_faces;
 use jbm_client::render::offscreen::OffscreenTarget;
-use jbm_client::render::renderer::{DepthTarget, Renderer};
+use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
 use jbm_client::render::texture_array::BlockTextures;
 use jbm_client::testing::screenshot::gpu_or_skip;
 use jbm_core::block::{BlockRegistry, BlockStateId, builtin};
@@ -60,6 +62,7 @@ fn render_passes_identically(
     churned: &mut TerrainPass,
     fresh_meshes: &[(CubePos, greedy::MeshOutput)],
     camera: &Camera,
+    path: jbm_client::render::chunks::TerrainPath,
 ) {
     let target = OffscreenTarget::new(&gpu.device, 256, 256);
     let depth = DepthTarget::new(&gpu.device, 256, 256);
@@ -68,8 +71,29 @@ fn render_passes_identically(
     let (layers, _) = builtin_textures();
     let textures = BlockTextures::new(gpu, &layers).expect("texture array");
 
+    churned.set_force_cpu_cull(path == TerrainPath::CpuCull);
+    churned.set_force_fallback(path == TerrainPath::Fallback);
+    // Without MDI both force flags collapse to the fallback path; the
+    // comparison is still valid there.
+    assert!(
+        churned.path() == path
+            || (path == TerrainPath::CpuCull && churned.path() == TerrainPath::Fallback),
+        "the pass must use the requested path, got {}",
+        churned.path_name()
+    );
+
     let view = target.create_view();
-    renderer.render(gpu, &view, depth.view(), camera, None, Some(churned), None);
+    renderer.render(
+        gpu,
+        FrameInputs {
+            target: &view,
+            depth: &depth,
+            camera,
+            terrain: Some(churned),
+            outline: None,
+            overlay: None,
+        },
+    );
     let churned_image = target.read_rgba(gpu);
 
     let mut fresh = TerrainPass::with_page_faces(
@@ -79,17 +103,21 @@ fn render_passes_identically(
         &textures,
         tiny_page_faces(),
     );
+    fresh.set_force_cpu_cull(path == TerrainPath::CpuCull);
+    fresh.set_force_fallback(path == TerrainPath::Fallback);
     for (pos, mesh) in fresh_meshes {
         fresh.upload(gpu, *pos, mesh);
     }
     renderer.render(
         gpu,
-        &view,
-        depth.view(),
-        camera,
-        None,
-        Some(&mut fresh),
-        None,
+        FrameInputs {
+            target: &view,
+            depth: &depth,
+            camera,
+            terrain: Some(&mut fresh),
+            outline: None,
+            overlay: None,
+        },
     );
     let fresh_image = target.read_rgba(gpu);
 
@@ -175,7 +203,7 @@ fn slot_reuse_after_churn_renders_like_a_fresh_pass() {
     }
     // Remove a quarter of the cubes.
     for &pos in positions.iter().skip(150) {
-        terrain.remove(pos);
+        terrain.remove(&gpu, pos);
         meshes.remove(&pos);
     }
     terrain.check_page_invariants();
@@ -196,5 +224,28 @@ fn slot_reuse_after_churn_renders_like_a_fresh_pass() {
 
     let mut fresh_meshes: Vec<(CubePos, greedy::MeshOutput)> = meshes.into_iter().collect();
     fresh_meshes.sort_unstable_by_key(|(pos, _)| *pos);
-    render_passes_identically(&gpu, &mut terrain, &fresh_meshes, &camera);
+    // The churned pass renders identically to a fresh pass on cpu-cull and,
+    // when the adapter allows it, on gpu-cull too (task 2.5: meta slots and
+    // region bounds survive the churn; the two-phase state is real because
+    // the same pass object renders the frame).
+    render_passes_identically(
+        &gpu,
+        &mut terrain,
+        &fresh_meshes,
+        &camera,
+        TerrainPath::CpuCull,
+    );
+    if terrain.gpu_cull_available() {
+        render_passes_identically(
+            &gpu,
+            &mut terrain,
+            &fresh_meshes,
+            &camera,
+            TerrainPath::GpuCull,
+        );
+    } else {
+        println!("skipping gpu-cull churn comparison: adapter lacks the GPU cull path");
+    }
+    // The direct-draw fallback shares the cpu-cull commands, so it needs no
+    // separate churn run.
 }

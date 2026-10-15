@@ -45,15 +45,20 @@ pub struct FrameUniforms {
 }
 
 /// A depth attachment matching [`DEPTH_FORMAT`], recreated on resize.
+/// `TEXTURE_BINDING` lets the Hi-Z fill pass (task 2.5) sample it.
 pub struct DepthTarget {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     width: u32,
     height: u32,
+    /// Bumped on every recreation, so the terrain pass can rebuild its
+    /// Hi-Z fill bind group even when the size did not change.
+    generation: u32,
 }
 
 impl DepthTarget {
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> DepthTarget {
+        static NEXT_GENERATION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("jbm depth target"),
             size: wgpu::Extent3d {
@@ -65,7 +70,7 @@ impl DepthTarget {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -74,6 +79,10 @@ impl DepthTarget {
             view,
             width,
             height,
+            // Globally unique, so two different targets of the same size
+            // never match (the Hi-Z fill bind group must follow the exact
+            // texture, not just its size).
+            generation: NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -93,9 +102,27 @@ impl DepthTarget {
         (self.width, self.height)
     }
 
+    /// Size and recreation generation: the key the terrain pass matches
+    /// its Hi-Z pyramid against.
+    pub fn description(&self) -> (u32, u32, u32) {
+        (self.width, self.height, self.generation)
+    }
+
     pub fn format(&self) -> wgpu::TextureFormat {
         self.texture.format()
     }
+}
+
+/// The inputs of one frame, bundled (task 2.5): the render target and its
+/// depth attachment, the camera, and one optional input per pass — the
+/// terrain pass, the target outline and the debug overlay.
+pub struct FrameInputs<'a> {
+    pub target: &'a wgpu::TextureView,
+    pub depth: &'a DepthTarget,
+    pub camera: &'a Camera,
+    pub terrain: Option<&'a mut TerrainPass>,
+    pub outline: Option<BlockPos>,
+    pub overlay: Option<&'a OverlayText>,
 }
 
 /// Owns the pipelines and buffers needed to draw a frame (sky + terrain +
@@ -125,8 +152,10 @@ impl Renderer {
         let uniform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("jbm frame uniform layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
+                // COMPUTE too: the terrain cull pass (task 2.5) reads
+                // view_proj on the GPU.
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -234,18 +263,8 @@ impl Renderer {
     /// Draws one frame: the sky pass (which also clears depth to 0.0),
     /// then the terrain pass, then the target outline (`outline`, task
     /// 1.7), then the debug overlay — crosshair included — on top.
-    #[allow(clippy::too_many_arguments)] // one optional input per pass; bundle into a frame struct when the next pass lands
-    pub fn render(
-        &mut self,
-        gpu: &Gpu,
-        target: &wgpu::TextureView,
-        depth: &wgpu::TextureView,
-        camera: &Camera,
-        overlay: Option<&OverlayText>,
-        terrain: Option<&mut TerrainPass>,
-        outline: Option<BlockPos>,
-    ) {
-        let uniforms = self.build_uniforms(camera);
+    pub fn render(&mut self, gpu: &Gpu, frame: FrameInputs<'_>) {
+        let uniforms = self.build_uniforms(frame.camera);
         gpu.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
@@ -261,7 +280,7 @@ impl Renderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("jbm sky pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target,
+                    view: frame.target,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -270,7 +289,7 @@ impl Renderer {
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: depth,
+                    view: frame.depth.view(),
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(0.0),
                         store: wgpu::StoreOp::Store,
@@ -286,34 +305,34 @@ impl Renderer {
             pass.draw(0..3, 0..1);
         }
 
-        if let Some(terrain) = terrain {
+        if let Some(terrain) = frame.terrain {
             terrain.draw(
                 gpu,
                 &mut encoder,
-                target,
-                depth,
-                camera,
+                frame.target,
+                frame.depth,
+                frame.camera,
                 &self.uniform_bind_group,
             );
         }
 
-        if let Some(block) = outline {
+        if let Some(block) = frame.outline {
             self.outline.draw(
                 gpu,
                 &mut encoder,
-                target,
-                depth,
+                frame.target,
+                frame.depth.view(),
                 &self.uniform_bind_group,
-                camera,
+                frame.camera,
                 block,
             );
         }
 
-        if let Some(text) = overlay {
+        if let Some(text) = frame.overlay {
             self.overlay.draw(
                 gpu,
                 &mut encoder,
-                target,
+                frame.target,
                 &self.uniform_bind_group,
                 self.viewport,
                 text,

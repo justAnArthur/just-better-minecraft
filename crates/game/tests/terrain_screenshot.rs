@@ -9,7 +9,7 @@ use jbm_client::mesh::appearance::{BlockAppearance, builtin_textures};
 use jbm_client::mesh::greedy;
 use jbm_client::render::chunks::TerrainPass;
 use jbm_client::render::offscreen::OffscreenTarget;
-use jbm_client::render::renderer::{DepthTarget, Renderer};
+use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
 use jbm_client::render::texture_array::BlockTextures;
 use jbm_client::testing::screenshot::{assert_matches_golden, gpu_or_skip};
 use jbm_client::world::ClientWorld;
@@ -99,12 +99,14 @@ fn streamed_terrain_matches_golden() {
     );
     renderer.render(
         &gpu,
-        &target.create_view(),
-        depth.view(),
-        &camera,
-        None,
-        Some(&mut terrain),
-        None,
+        FrameInputs {
+            target: &target.create_view(),
+            depth: &depth,
+            camera: &camera,
+            terrain: Some(&mut terrain),
+            outline: None,
+            overlay: None,
+        },
     );
     assert_matches_golden("terrain_spawn", &target.read_rgba(&gpu));
 }

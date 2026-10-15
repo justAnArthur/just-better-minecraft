@@ -6,6 +6,7 @@
 //! around the region are built the same way, so border faces are realistic.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 use jbm_client::mesh::appearance::BlockAppearance;
@@ -109,6 +110,72 @@ impl Region {
             let h = generator.surface_height(block.x, block.z);
             state_at(&blocks, h, block.y)
         })
+    }
+
+    /// The closed 8x5x8 air room about 20 blocks under the surface at the
+    /// region center (task 2.5 cave scenes): interior block bounds.
+    // Task 2.5 cave scenes only; the cube_size bench does not use them.
+    #[allow(dead_code)]
+    pub fn cave_room(&self) -> (Range<i64>, Range<i64>, Range<i64>) {
+        let ceiling = self.generator.surface_height(64, 64) - 20;
+        (60..68, ceiling - 5..ceiling, 60..68)
+    }
+
+    /// Carves the room into the region and its shell, rebuilding every
+    /// cube that overlaps it. Panics unless the one-block shell around the
+    /// interior is solid stone afterwards (the room is closed).
+    // Task 2.5 cave scenes only; the cube_size bench does not use them.
+    #[allow(dead_code)]
+    pub fn carve_cave(&mut self) {
+        let room = self.cave_room();
+        let (rx, ry, rz) = &room;
+        let size = i64::from(CUBE_SIZE);
+        let first = [
+            rx.start / size - 1,
+            ry.start / size - 1,
+            rz.start / size - 1,
+        ];
+        let last = [rx.end / size + 1, ry.end / size + 1, rz.end / size + 1];
+        for y in first[1]..=last[1] {
+            for z in first[2]..=last[2] {
+                for x in first[0]..=last[0] {
+                    let pos = CubePos {
+                        x: x as i32,
+                        y: y as i32,
+                        z: z as i32,
+                    };
+                    let generator = &self.generator;
+                    let blocks = self.blocks;
+                    let cube = Cube::from_fn(|local| {
+                        let block = pos.block(local);
+                        if rx.contains(&block.x) && ry.contains(&block.y) && rz.contains(&block.z) {
+                            BlockStateId::AIR
+                        } else {
+                            let h = generator.surface_height(block.x, block.z);
+                            state_at(&blocks, h, block.y)
+                        }
+                    });
+                    self.cubes.insert(pos, Arc::new(cube));
+                }
+            }
+        }
+        // The room is closed: every shell block around the interior is
+        // solid (stone at that depth), and the interior is air.
+        for y in ry.start - 1..=ry.end {
+            for z in rz.start - 1..=rz.end {
+                for x in rx.start - 1..=rx.end {
+                    let inside = rx.contains(&x) && ry.contains(&y) && rz.contains(&z);
+                    let pos = BlockPos { x, y, z };
+                    let (cube_pos, local) = pos.split();
+                    let state = self.cubes[&cube_pos].get(local);
+                    if inside {
+                        assert_eq!(state, BlockStateId::AIR, "room block {pos:?}");
+                    } else {
+                        assert_ne!(state, BlockStateId::AIR, "room shell {pos:?} leaks");
+                    }
+                }
+            }
+        }
     }
 
     /// The mesh input (center + 26 neighbors) for a region cube. Every

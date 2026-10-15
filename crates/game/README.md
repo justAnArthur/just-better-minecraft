@@ -53,22 +53,30 @@ layering — no server `generate` involved:
   neighbor dirtying);
 - `build_region` — building the region's cubes with `Cube::from_fn`.
 
-**Terrain draw benchmark (task 2.2):** `benches/terrain_draw.rs` (group
-`terrain_draw`, same region, GPU required) records and submits one
-offscreen frame followed by a device poll wait, through each draw path:
-`mdi` (multi-draw indirect; skipped with a printed line when the adapter
-lacks it) and `fallback` (the forced direct-draw loop). Without a GPU
-adapter the bench prints a skip line and passes, so the CI bench smoke
-run stays green.
+**Terrain draw benchmark (tasks 2.2 + 2.5):** `benches/terrain_draw.rs`
+(group `terrain_draw`, same region, GPU required) records and submits one
+offscreen frame followed by a device poll wait, through each draw path,
+after 3 warm-up frames so the two-phase occlusion state is steady:
+`gpu_cull` (compute frustum + Hi-Z culling, two-phase MDI; skipped with a
+printed line when the adapter lacks it), `mdi` (2.2's CPU-culled
+multi-draw indirect), `fallback` (the forced direct-draw loop),
+`cave/cpu_cull` and `cave/gpu_cull` — a camera inside a closed 8×5×8 room
+carved ~20 blocks under the surface (`Region::carve_cave` in
+`benches/common/mod.rs` asserts in setup that the camera sits in air and
+the room is closed), where the occlusion culling earns its keep. Without
+a GPU adapter the bench prints a skip line and passes, so the CI bench
+smoke run stays green.
 
 `examples/cube_size_metrics.rs` prints the matching metrics table (cube
 count, uniform cubes, the old one-draw-per-non-empty-cube number, faces,
 mesh bytes, cube storage + a documented HashMap overhead estimate,
 streaming-granularity message count) plus, when an adapter exists, a GPU
-section per draw path: `draws / commands`, faces drawn after direction
-skipping (next to the region's total), pages / page bytes, and the mean
-frame time over 50 frames. Both run at 32³ and, with `--features cube16`,
-at 16³:
+section per path **and scene** (surface view and the cave room): the cull
+counters (`drawn / frustum-culled / occluded`, `candidates / commands /
+faces`), the encoded indirect command-region slots including the
+zero-count tails (gpu-cull, both phases), draw calls / pages, and the
+mean frame time over 50 frames after a 3-frame warm-up. Both run at 32³
+and, with `--features cube16`, at 16³:
 
 ```bash
 cargo bench -p jbm-game --bench cube_size [--features cube16]
@@ -76,13 +84,24 @@ cargo bench -p jbm-game --bench terrain_draw
 cargo run -p jbm-game --release --example cube_size_metrics [--features cube16]
 ```
 
-**Draw-path tests (task 2.2):** `tests/terrain_paths.rs` renders the
-streamed `terrain_spawn` and `edit_spawn` scenes through the MDI path and
-the forced fallback and requires **pixel-identical** images (exact, not
-the golden tolerance; without adapter MDI it checks the fallback against
-the golden instead), and asserts the terrain stats on `terrain_spawn`
-(draw calls ≤ pages on MDI, one to six commands per drawn cube, faces
-below the drawn cubes' total — directions really are skipped).
+**Draw-path tests (tasks 2.2 + 2.5):** `tests/terrain_paths.rs` renders
+the streamed `terrain_spawn` and `edit_spawn` scenes through the gpu-cull,
+cpu-cull and fallback paths and requires **pixel-identical** images
+(exact, not the golden tolerance; without adapter MDI it checks the
+fallback against the golden instead), and asserts the terrain stats on
+`terrain_spawn` (draw calls ≤ 2·pages on MDI, one to six commands per
+drawn cube, faces below the drawn cubes' total — directions really are
+skipped). Task 2.5 adds: a 60-frame moving camera (turning on the spot,
+flying down into a carved closed room, looking around inside, rising
+back out) that must render gpu-cull ≡ cpu-cull **at every frame** with
+the same pass object (two-phase state is real) and with `occluded > 0`
+on some frames — the anti-popping test; a cave test (camera in the
+closed room, 3 frames, ≥80% of frustum-passing cubes occlusion-culled,
+image equal to cpu-cull); an open-surface test (`occluded` stays small,
+image equal to cpu-cull); and an odd-resize test (333×217 keeps the
+paths identical). All print their cull counts. The room is carved by
+applying `BlockChange` messages through the client world — the same edit
+path real block edits take.
 
 **Invariants**
 

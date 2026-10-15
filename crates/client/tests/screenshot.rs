@@ -5,7 +5,7 @@ use glam::DVec3;
 use jbm_client::camera::Camera;
 use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::overlay::OverlayText;
-use jbm_client::render::renderer::{DepthTarget, Renderer};
+use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
 use jbm_client::render::triangle;
 use jbm_client::testing::screenshot::{assert_matches_golden, gpu_or_skip};
 
@@ -26,12 +26,14 @@ fn render_and_compare(name: &str, camera: &Camera, overlay: Option<OverlayText>)
     renderer.set_viewport(256, 256);
     renderer.render(
         &gpu,
-        &target.create_view(),
-        depth.view(),
-        camera,
-        overlay.as_ref(),
-        None,
-        None,
+        FrameInputs {
+            target: &target.create_view(),
+            depth: &depth,
+            camera,
+            terrain: None,
+            outline: None,
+            overlay: overlay.as_ref(),
+        },
     );
     let image = target.read_rgba(&gpu);
     assert_matches_golden(name, &image);
@@ -148,12 +150,14 @@ fn render_scene(golden_name: &str, scene: &[(CubePos, Cube)], camera: &Camera) {
 
     renderer.render(
         &gpu,
-        &target.create_view(),
-        depth.view(),
-        camera,
-        None,
-        Some(&mut terrain),
-        None,
+        FrameInputs {
+            target: &target.create_view(),
+            depth: &depth,
+            camera,
+            terrain: Some(&mut terrain),
+            outline: None,
+            overlay: None,
+        },
     );
     let image = target.read_rgba(&gpu);
     assert_matches_golden(golden_name, &image);
