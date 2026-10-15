@@ -1,0 +1,99 @@
+# Builds the jbm release binaries for a jbm@<version> tag and attaches them
+# to the GitHub release (notes come from release-on-tag.yml). bump-version.yml
+# dispatches this workflow when it pushes the tag; a direct tag push or a
+# manual run with a tag input works too. No secrets needed: the default
+# GITHUB_TOKEN is enough to upload release assets.
+
+name: Release binaries
+
+on:
+  push:
+    tags: ["jbm@*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build, e.g. jbm@0.1.0"
+        type: string
+        required: true
+  workflow_call:
+    inputs:
+      tag:
+        description: "Tag to build, e.g. jbm@0.1.0"
+        type: string
+        required: true
+
+# One build set per tag; never cancel an in-progress upload halfway.
+concurrency:
+  group: release-binaries-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+run-name: binaries for ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  resolve:
+    name: resolve tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Resolve tag and version
+        id: resolve
+        # passed through env, never interpolated into the script
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          VERSION="${TAG##*@}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+      - name: Read toolchain channel from rust-toolchain.toml
+        id: toolchain
+        run: |
+          echo "channel=$(sed -n 's/^channel *= *"\(.*\)"$/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release --locked -p jbm-game
+      - name: Package archive and checksum
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          DIR="jbm-${VERSION}-${TARGET}"
+          mkdir "${DIR}"
+          cp target/release/jbm README.md LICENSE-MIT LICENSE-APACHE "${DIR}/"
+          tar -czf "${DIR}.tar.gz" "${DIR}"
+          case "$(uname)" in
+            Darwin) shasum -a 256 "${DIR}.tar.gz" > "${DIR}.tar.gz.sha256" ;;
+            Linux) sha256sum "${DIR}.tar.gz" > "${DIR}.tar.gz.sha256" ;;
+          esac
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          files: |
+            jbm-${{ needs.resolve.outputs.version }}-${{ matrix.target }}.tar.gz
+            jbm-${{ needs.resolve.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
+          prerelease: ${{ contains(needs.resolve.outputs.version, '-') }}

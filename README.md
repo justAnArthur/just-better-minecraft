@@ -26,3 +26,9 @@ Mesa's lavapipe software Vulkan driver and sets `JBM_REQUIRE_GPU=1` so
 screenshot tests must run; on macOS the variable stays unset and those
 tests skip when no usable GPU is present. Failed test runs upload
 `target/screenshots/` as an artifact.
+
+Merges to `main` also drive the release workflows: commits with a crate
+scope bump the workspace version (`feat` gives minor, other types give
+patch, `!` gives major; unscoped commits release nothing), which tags
+`jbm@<version>` and publishes a GitHub release carrying Linux x86_64 and
+macOS arm64 binaries of `jbm`.

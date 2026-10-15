@@ -1,0 +1,83 @@
+# release-on-tag.yml
+# ---
+# creates a github release with auto-generated release notes when a
+# version tag is pushed.
+#
+# copy this file into your repo's `.github/workflows/` and adjust
+# the `push.tags` pattern to match your tagging convention.
+#
+# can also be called as a reusable workflow:
+#
+#   jobs:
+#     release:
+#       uses: justAnArthur/just-github-actions-n-workflows/.github/workflows/release-on-tag.yml@743c6d8226fa652aeec8dc842aeac1cc423f9696
+#       with:
+#         tag: ${{ github.ref_name }}
+#
+# required secrets:
+#   (none — uses the auto-provided GITHUB_TOKEN)
+# ---
+
+# toolkit-ref: @justanarthur/just-github-actions-n-workflows@1.0.3
+name: release-on-tag
+run-name: "release — ${{ inputs.tag || github.ref_name }}"
+
+on:
+  push:
+    tags: [ "**@*" ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'tag to release (e.g. "my-package@1.2.3")'
+        type: string
+        required: true
+  workflow_call:
+    inputs:
+      tag:
+        description: 'tag to release (e.g. "my-package@1.2.3")'
+        type: string
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve tag metadata
+        id: meta
+        uses: justAnArthur/just-github-actions-n-workflows/actions/resolve-tag-meta@743c6d8226fa652aeec8dc842aeac1cc423f9696
+        with:
+          tag: ${{ inputs.tag || github.ref_name }}
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Fetch all tags
+        uses: justAnArthur/just-github-actions-n-workflows/actions/fetch-tags@743c6d8226fa652aeec8dc842aeac1cc423f9696
+
+      - name: Generate release notes
+        id: release_notes
+        uses: justAnArthur/just-github-actions-n-workflows/actions/generate-release-notes@743c6d8226fa652aeec8dc842aeac1cc423f9696
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          root_dir: ${{ github.workspace }}
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
+          prerelease: ${{ steps.meta.outputs.is_prerelease == 'true' }}
+          body: |
+            ## Release Notes
+
+            ${{ steps.release_notes.outputs.release_notes }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
