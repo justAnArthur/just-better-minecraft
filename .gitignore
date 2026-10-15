@@ -3,3 +3,4 @@
 *.actual.png
 *.diff.png
 .DS_Store
+/saves

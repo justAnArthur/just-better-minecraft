@@ -14,6 +14,15 @@ detached; stopping it propagates a server panic rather than swallowing it.
 
 `Server::new()` streams generated terrain around the player (task 1.5).
 
+**World persistence (task 2.3):** the server saves into `saves/default`
+under the current directory. `JBM_WORLD_DIR=<path>` overrides the
+directory, and `JBM_NO_SAVE=1` disables persistence entirely (nothing is
+written; edits last only for the session). A storage error — the world is
+locked by another process, or was written by a newer format — prints one
+line to stderr and exits with status 1 instead of panicking. Quitting the
+window stops the server thread, which flushes every accepted edit to disk
+before the process exits; `/saves` is git-ignored.
+
 **End-to-end screenshot:** `tests/terrain_screenshot.rs` is the one test
 that crosses both halves. A `HeadlessServer` (inline generation, R = 3,
 V = 2) streams to a `TestClient`; every message goes into a real
