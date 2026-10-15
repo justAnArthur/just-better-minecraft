@@ -116,6 +116,18 @@ pub struct ServerConfig {
     /// Top LOD level the server keeps (4 keeps LOD1–LOD4). `0` disables
     /// the pyramid entirely: no allocation, no work per cube or edit.
     pub lod_levels: u8,
+    /// Horizontal radius of every LOD ring, in cubes of that ring's level
+    /// (task 2.6). Each level streams a full disk; the client draws the
+    /// finest ready level per octant.
+    pub lod_view_radius: u32,
+    /// Vertical radius of every LOD ring, in cubes of that ring's level.
+    pub lod_vertical_radius: u32,
+    /// Most `LodCubeData` messages sent to one player per tick, re-sends
+    /// of changed cubes included.
+    pub lod_send_budget_per_tick: usize,
+    /// Cap on LOD cubes requested from the pyramid but not yet ready
+    /// ([`LodPyramid::in_flight`]).
+    pub lod_max_in_flight: usize,
 }
 
 impl Default for ServerConfig {
@@ -133,6 +145,10 @@ impl Default for ServerConfig {
             world_dir: None,
             save_interval: Duration::from_secs(5),
             lod_levels: 4,
+            lod_view_radius: 8,
+            lod_vertical_radius: 3,
+            lod_send_budget_per_tick: 32,
+            lod_max_in_flight: 256,
         }
     }
 }
@@ -1204,6 +1220,10 @@ impl Server {
                 }
             }
         }
+
+        // Background LOD work (2.7) lands after LOD0 ingest and before
+        // streaming reads the pyramid.
+        lod.poll();
 
         // A join or disconnect changes who keeps which cubes.
         let joined_now = self

@@ -14,7 +14,7 @@
 //! with the explored area until 2.6 (clipmap rings) and 2.7 (stored LOD)
 //! give it bounds.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
 
 use jbm_core::block::BlockStateId;
@@ -62,6 +62,9 @@ impl LodChanges {
 pub struct LodPyramid {
     /// `levels[l - 1]` holds level `l`; empty while disabled.
     levels: Vec<HashMap<CubePos, LodCube>>,
+    /// Cubes whose content changed since the last
+    /// [`LodPyramid::take_changed`]; streaming re-sends them.
+    changed: HashSet<(u8, CubePos)>,
 }
 
 /// Downsampling state carried up the levels during one operation: the
@@ -77,6 +80,7 @@ impl LodPyramid {
     pub fn new(max_levels: u8) -> Self {
         Self {
             levels: vec![HashMap::new(); max_levels as usize],
+            changed: HashSet::new(),
         }
     }
 
@@ -124,6 +128,7 @@ impl LodPyramid {
             };
             if changed.is_some() {
                 changes.cubes.push((level, pos));
+                self.changed.insert((level, pos));
             }
             lod_cube.known |= 1 << octant;
             cursor = Cursor {
@@ -174,6 +179,7 @@ impl LodPyramid {
             };
             if changed.is_some() {
                 changes.cubes.push((level, parent_pos));
+                self.changed.insert((level, parent_pos));
             }
             match changed {
                 None => break,
@@ -227,6 +233,51 @@ impl LodPyramid {
             }
         }
         pyramid
+    }
+
+    // ---- Streaming interface (tasks 2.6 and 2.7) ----
+    //
+    // 2.6 streams through exactly these four calls and `take_changed`;
+    // 2.7 replaces their bodies (worldgen fill, storage) without changing
+    // the signatures or the contract below.
+
+    /// The cube at `(level, pos)` if it is ready to stream: its content is
+    /// final enough to show. Until 2.7 this is any cube the pyramid holds
+    /// (unknown octants read as air); from 2.7 on, only cubes whose every
+    /// octant holds real or worldgen-filled data. A ready cube can still
+    /// change later (an edit, a LOD0 cube replacing a worldgen guess):
+    /// such changes are reported by [`LodPyramid::take_changed`].
+    pub fn ready(&self, level: u8, pos: CubePos) -> Option<&Cube> {
+        self.get(level, pos).map(|lc| &lc.cube)
+    }
+
+    /// Ask for `(level, pos)` to become ready. Deduplicated while in
+    /// flight; a no-op for a cube already ready or a level outside
+    /// `1..=max_levels`. Until 2.7 this does nothing.
+    pub fn request(&mut self, level: u8, pos: CubePos) {
+        let _ = (level, pos);
+    }
+
+    /// Requests not yet ready. The caller caps its requests with this
+    /// (`ServerConfig::lod_max_in_flight`). Always 0 until 2.7.
+    pub fn in_flight(&self) -> usize {
+        0
+    }
+
+    /// Collect finished background work (2.7: worldgen samples, storage
+    /// loads) into the pyramid. Called once per tick by the server, after
+    /// LOD0 results are collected and before streaming. Cubes it makes
+    /// ready or changes are reported by `take_changed`. A no-op until 2.7.
+    pub fn poll(&mut self) {}
+
+    /// Every cube whose content changed since the last call, sorted by
+    /// `(level, x, y, z)` and deduplicated. Streaming re-sends these to
+    /// players who already have them; cubes nobody has are simply dropped
+    /// from the set.
+    pub fn take_changed(&mut self) -> Vec<(u8, CubePos)> {
+        let mut changed: Vec<(u8, CubePos)> = self.changed.drain().collect();
+        changed.sort_by_key(|&(level, pos)| (level, pos.x, pos.y, pos.z));
+        changed
     }
 
     /// The level-`level` cube at `pos`, if the pyramid holds one. Levels

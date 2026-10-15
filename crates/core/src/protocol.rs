@@ -17,7 +17,7 @@ use crate::physics::{MoveInput, PlayerState};
 
 /// Version of the client/server protocol. A `Hello` carrying any other
 /// version is rejected.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Identifies a joined player inside one server. Ids start at 1 and count up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -93,4 +93,17 @@ pub enum ServerMsg {
     /// rejected edit sent to its sender only. Sent in phase 5 before the
     /// streaming pass and the `Tick`, so edits land within one tick.
     BlockChange { pos: BlockPos, state: BlockStateId },
+    /// A LOD cube (task 2.6) the player should now have: newly in one of
+    /// their LOD rings, or changed (a re-send replaces the client's copy
+    /// wholesale). `level` is 1-based; a level-`n` cube at `pos` covers
+    /// blocks `pos * CUBE_SIZE * 2^n` onwards, each cell `2^n` blocks per
+    /// side. Uniform cubes are sent too, as for `CubeData`.
+    LodCubeData {
+        level: u8,
+        pos: CubePos,
+        cube: Box<Cube>,
+    },
+    /// The LOD cube left the player's rings; the client drops it and its
+    /// mesh.
+    UnloadLodCube { level: u8, pos: CubePos },
 }

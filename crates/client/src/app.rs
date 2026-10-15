@@ -263,6 +263,8 @@ impl App {
                             w.terrain.remove(&w.gpu, pos);
                         }
                     }
+                    // LOD rings are ignored until task 2.6 renders them.
+                    ServerMsg::LodCubeData { .. } | ServerMsg::UnloadLodCube { .. } => {}
                     ServerMsg::Tick { .. } | ServerMsg::Pong { .. } => {}
                 },
                 Ok(None) => return,

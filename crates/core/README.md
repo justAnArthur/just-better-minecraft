@@ -254,7 +254,7 @@ through); per-state outline shapes are later.
 ## Protocol and links
 
 `protocol` holds the message enums the client and server exchange
-(`PROTOCOL_VERSION = 5`): `ClientMsg` (`Hello`, `PlayerInput { seq,
+(`PROTOCOL_VERSION = 6`): `ClientMsg` (`Hello`, `PlayerInput { seq,
 input, pitch }`, `BreakBlock { pos }`, `PlaceBlock { pos, state }`,
 `Ping`, `Disconnect`) and `ServerMsg` (`Welcome` with
 the spawn feet position, look `yaw`/`pitch` and `flying` — the initial
@@ -262,7 +262,9 @@ state: velocity 0, not on ground; a returning player gets their saved
 position and look, v5 — `PlayerState { ack_seq, state }` sent before `Tick` in ticks
 where the server processed at least one input, `Rejected`, `Tick`,
 `Pong`, `Disconnected`, `CubeData { pos, cube }`, `UnloadCube { pos }`,
-`BlockChange { pos, state }` — the authoritative state of one block).
+`BlockChange { pos, state }` — the authoritative state of one block,
+`LodCubeData { level, pos, cube }` and `UnloadLodCube { level, pos }` —
+LOD ring cubes, v6).
 `PlayerInput.seq` starts at 1 and increments per client tick; the server
 ignores seqs ≤ the last processed one. Pitch is display-only; physics
 ignores it. Messages are plain owned data — no `Arc`, no references, no
