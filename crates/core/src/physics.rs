@@ -925,4 +925,76 @@ mod tests {
             }
         }
     }
+
+    /// Wall contacts land exactly on the face, never an ulp inside it (an
+    /// ulp inside would put the wall column in the box's static span and
+    /// snag the next fall), at small and large coordinates: fly into walls
+    /// at random positions and yaws, then drop and land on the floor.
+    #[test]
+    fn wall_contacts_never_stick() {
+        struct Room(i64);
+        impl BlockShapes for Room {
+            // Floor below y = 0; walls at x >= 5, x <= -6, z >= 7, z <= -8,
+            // all shifted by the offset on X and Z.
+            fn solid(&self, p: BlockPos) -> Option<bool> {
+                let (x, z) = (p.x - self.0, p.z - self.0);
+                Some(p.y < 0 || x >= 5 || x <= -6 || z >= 7 || z <= -8)
+            }
+        }
+        for offset in [0_i64, 1_000, 123_457, -9_876_543, 10_000_000] {
+            let o = offset as f64;
+            let mut seed: u64 = 12345;
+            let mut rnd = || {
+                seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (seed >> 11) as f64 / (1u64 << 53) as f64
+            };
+            for _ in 0..5000 {
+                let mut state = PlayerState {
+                    position: DVec3::new(
+                        o - 4.7 + rnd() * 9.4,
+                        3.0 + rnd() * 5.0,
+                        o - 6.7 + rnd() * 13.4,
+                    ),
+                    velocity: DVec3::ZERO,
+                    on_ground: false,
+                    flying: true,
+                };
+                let yaw = (rnd() * std::f64::consts::TAU) as f32;
+                let fly = MoveInput {
+                    forward: 1,
+                    sprint: true,
+                    yaw,
+                    ..MoveInput::IDLE
+                };
+                for _ in 0..20 {
+                    state = step(state, &fly, &Room(offset));
+                }
+                let b = state.aabb();
+                assert!(
+                    b.max.x <= o + 5.0
+                        && b.min.x >= o - 5.0
+                        && b.max.z <= o + 7.0
+                        && b.min.z >= o - 7.0,
+                    "box past a wall: {b:?}"
+                );
+                let land = MoveInput {
+                    fly_toggle: true,
+                    yaw,
+                    ..MoveInput::IDLE
+                };
+                state = step(state, &land, &Room(offset));
+                let idle = MoveInput {
+                    yaw,
+                    ..MoveInput::IDLE
+                };
+                for _ in 0..60 {
+                    state = step(state, &idle, &Room(offset));
+                }
+                assert_eq!(state.position.y, 0.0, "stuck on a wall at {state:?}");
+                assert!(state.on_ground);
+            }
+        }
+    }
 }
