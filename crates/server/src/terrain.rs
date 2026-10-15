@@ -67,8 +67,6 @@ fn surface_block(solid: bool, d: u8, y: i64, blocks: &Blocks) -> BlockStateId {
     }
 }
 
-/// How many `(cx, cz)` column stages the generator may cache. Bounded, so
-/// memory stays flat whatever order requests arrive in.
 /// How many `(cx, cz)` columns the generator may cache. Bounded, so memory
 /// stays flat whatever order requests arrive in.
 const COLUMN_CACHE_CAPACITY: usize = 64;
@@ -124,10 +122,12 @@ impl Generator {
     }
 
     /// Surface height (block y of the grass/sand layer) at world column
-    /// `(x, z)`: the highest solid y within `[MIN_HEIGHT, MAX_HEIGHT]`,
-    /// found from the column's xz stage plus a scan over y. Always within
-    /// bounds for the shipped graph; a custom graph solid nowhere in the
-    /// range yields `MIN_HEIGHT - 1`.
+    /// `(x, z)`: the highest solid y, found from the column's xz stage plus
+    /// a scan over y. Banded graphs (the shipped one included) scan their
+    /// own provable band, so the answer is exact; for the shipped graph it
+    /// is always within [`MIN_HEIGHT`, `MAX_HEIGHT`]. Unbanded graphs scan
+    /// `[MIN_HEIGHT, MAX_HEIGHT]` only, and yield `MIN_HEIGHT - 1` when
+    /// nothing in that range is solid.
     pub fn surface_height(&self, x: i64, z: i64) -> i64 {
         let graph = self.graph.as_ref();
         match graph.band() {
@@ -135,15 +135,15 @@ impl Generator {
                 let mut regs = vec![0.0; graph.register_count()];
                 let mut bits = vec![0u64; band.rows().div_ceil(64)];
                 self.eval_band_bits(graph, band, x, z, &mut regs, &mut bits);
-                for y in (MIN_HEIGHT..=MAX_HEIGHT).rev() {
-                    if y <= band.low() {
-                        return y;
-                    }
-                    if y < band.high() && bit_at(&bits, (y - band.low() - 1) as usize) {
+                // Rows at or above `high` are provably air and rows at or
+                // below `low` provably solid, so the graph's own band bounds
+                // the scan (not the shipped graph's height constants).
+                for y in (band.low() + 1..band.high()).rev() {
+                    if bit_at(&bits, (y - band.low() - 1) as usize) {
                         return y;
                     }
                 }
-                MIN_HEIGHT - 1
+                band.low()
             }
             None => {
                 let mut regs = vec![0.0; graph.register_count()];

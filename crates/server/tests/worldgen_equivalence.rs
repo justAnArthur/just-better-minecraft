@@ -183,6 +183,23 @@ fn a_flat_graph_makes_a_flat_world_with_the_right_layering() {
     assert_eq!(block_at(&terrain, 10, 66, -10), blocks.stone);
 }
 
+#[test]
+fn surface_height_follows_the_graph_band_outside_the_shipped_range() {
+    // Flat worlds far above and below the shipped graph's [36, 92]: a banded
+    // graph's surface comes from its own band, not MIN/MAX_HEIGHT.
+    for level in [150.0, 10.0, -300.0] {
+        let terrain = generator_for(
+            3,
+            final_node(Node::Sub {
+                a: NodeValue::Const(level),
+                b: y_node(),
+            }),
+            BTreeMap::new(),
+        );
+        assert_eq!(terrain.surface_height(5, -5), level as i64, "level {level}");
+    }
+}
+
 fn y_node() -> NodeValue {
     NodeValue::Inline(Box::new(Node::Y))
 }
