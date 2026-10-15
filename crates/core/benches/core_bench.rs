@@ -73,9 +73,11 @@ fn bench_cube(c: &mut Criterion) {
     });
 
     group.bench_function("palette_growth_4096", |b| {
+        // 4096 at 32³; an eighth of the cube at smaller sizes.
+        let distinct = (CUBE_VOLUME / 8).min(4096);
         b.iter(|| {
             let mut cube = Cube::default();
-            for i in 0..4096 {
+            for i in 0..distinct {
                 cube.set_index(i, BlockStateId(i as u32 + 1));
             }
             cube
@@ -88,11 +90,13 @@ fn bench_cube(c: &mut Criterion) {
     });
 
     group.bench_function("compact_4096_to_16", |b| {
+        // 4096 distinct states (an eighth of the cube at smaller sizes),
+        // then only 16 states left in use.
+        let distinct = (CUBE_VOLUME / 8).min(4096);
         b.iter_batched(
             || {
                 let mut cube = Cube::default();
-                // Grow the palette to 4097 entries, then use only 16 states.
-                for i in 0..4096 {
+                for i in 0..distinct {
                     cube.set_index(i, BlockStateId(i as u32 + 1));
                 }
                 for i in 0..CUBE_VOLUME {

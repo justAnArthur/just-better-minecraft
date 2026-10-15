@@ -836,11 +836,13 @@ dependencies = [
 name = "jbm-game"
 version = "0.0.0"
 dependencies = [
+ "criterion",
  "glam",
  "jbm-client",
  "jbm-core",
  "jbm-server",
  "jbm-testkit",
+ "wgpu",
 ]
 
 [[package]]

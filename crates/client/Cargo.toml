@@ -12,6 +12,9 @@ workspace = true
 [features]
 # Exposes `jbm_client::testing` (golden-image helpers) to integration tests.
 testing = []
+# 16³ cubes instead of 32³ (task 1.8 benchmark feature); see jbm-core's
+# README for what is and is not supported under it.
+cube16 = ["jbm-core/cube16"]
 
 [dependencies]
 jbm-core.workspace = true

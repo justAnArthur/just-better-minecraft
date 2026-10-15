@@ -1,15 +1,23 @@
-//! Coordinate types for the unbounded grid of 32³ cubes.
+//! Coordinate types for the unbounded grid of cubes.
 //!
-//! The world spans about ±68 billion blocks per axis: cube coordinates are
-//! `i32` and block coordinates `i64`, because `i32::MIN * 32` overflows `i32`.
-//! Conversions use floor arithmetic, so block -1 lives in cube -1 at local 31.
+//! Cubes are `CUBE_SIZE³` (32³, or 16³ under the `cube16` feature; see the
+//! crate README). The world spans about ±68 billion blocks per axis: cube
+//! coordinates are `i32` and block coordinates `i64`, because
+//! `i32::MIN * CUBE_SIZE` overflows `i32`. Conversions use floor arithmetic,
+//! so block -1 lives in cube -1 at local `CUBE_SIZE - 1`.
 
-/// Side length of a cube, in blocks.
-pub const CUBE_SIZE: i32 = 32;
 /// Bits of local coordinate per axis (`log2(CUBE_SIZE)`).
+#[cfg(not(feature = "cube16"))]
 pub const CUBE_BITS: u32 = 5;
+/// Bits of local coordinate per axis (`log2(CUBE_SIZE)`).
+#[cfg(feature = "cube16")]
+pub const CUBE_BITS: u32 = 4;
+/// Side length of a cube, in blocks.
+pub const CUBE_SIZE: i32 = 1 << CUBE_BITS;
+/// Mask of the local coordinate bits on a block coordinate.
+pub const CUBE_MASK: i64 = CUBE_SIZE as i64 - 1;
 /// Number of blocks in a cube (`CUBE_SIZE³`).
-pub const CUBE_VOLUME: usize = 32768;
+pub const CUBE_VOLUME: usize = 1 << (CUBE_BITS * 3);
 
 /// Which cube a block is in. Ordered by `(x, y, z)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -27,7 +35,7 @@ pub struct BlockPos {
     pub z: i64,
 }
 
-/// A block inside a cube; each axis is `0..32` (fields are `u8`).
+/// A block inside a cube; each axis is `0..CUBE_SIZE` (fields are `u8`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LocalPos {
     pub x: u8,
@@ -48,7 +56,7 @@ impl CubePos {
 
 impl BlockPos {
     /// Splits into the containing cube and the block's position inside it.
-    /// Floor division: -1 splits to cube -1, local 31.
+    /// Floor division: -1 splits to cube -1, local `CUBE_SIZE - 1`.
     pub fn split(self) -> (CubePos, LocalPos) {
         (
             CubePos {
@@ -57,16 +65,16 @@ impl BlockPos {
                 z: (self.z >> CUBE_BITS) as i32,
             },
             LocalPos {
-                x: (self.x & 31) as u8,
-                y: (self.y & 31) as u8,
-                z: (self.z & 31) as u8,
+                x: (self.x & CUBE_MASK) as u8,
+                y: (self.y & CUBE_MASK) as u8,
+                z: (self.z & CUBE_MASK) as u8,
             },
         )
     }
 }
 
 impl LocalPos {
-    /// Returns the position if every axis is in `0..32`.
+    /// Returns the position if every axis is in `0..CUBE_SIZE`.
     pub fn new(x: u8, y: u8, z: u8) -> Option<Self> {
         if x < CUBE_SIZE as u8 && y < CUBE_SIZE as u8 && z < CUBE_SIZE as u8 {
             Some(Self { x, y, z })
@@ -79,12 +87,12 @@ impl LocalPos {
     pub fn new_unchecked(x: u8, y: u8, z: u8) -> Self {
         debug_assert!(
             x < CUBE_SIZE as u8 && y < CUBE_SIZE as u8 && z < CUBE_SIZE as u8,
-            "local coordinate out of 0..32"
+            "local coordinate out of 0..CUBE_SIZE"
         );
         Self { x, y, z }
     }
 
-    /// Linear index into cube arrays: `(y * 32 + z) * 32 + x`.
+    /// Linear index into cube arrays: `(y * CUBE_SIZE + z) * CUBE_SIZE + x`.
     /// x is fastest, then z, then y.
     pub fn index(self) -> usize {
         (self.y as usize * CUBE_SIZE as usize + self.z as usize) * CUBE_SIZE as usize
@@ -95,8 +103,8 @@ impl LocalPos {
     pub fn from_index(index: usize) -> Self {
         debug_assert!(index < CUBE_VOLUME, "index out of cube");
         Self {
-            x: (index & 31) as u8,
-            z: ((index >> CUBE_BITS) & 31) as u8,
+            x: (index & CUBE_MASK as usize) as u8,
+            z: ((index >> CUBE_BITS) & CUBE_MASK as usize) as u8,
             y: (index >> (CUBE_BITS * 2)) as u8,
         }
     }
@@ -130,11 +138,15 @@ mod tests {
         let locals = [
             LocalPos { x: 0, y: 0, z: 0 },
             LocalPos {
-                x: 31,
-                y: 31,
-                z: 31,
+                x: (CUBE_SIZE - 1) as u8,
+                y: (CUBE_SIZE - 1) as u8,
+                z: (CUBE_SIZE - 1) as u8,
             },
-            LocalPos { x: 17, y: 4, z: 9 },
+            LocalPos {
+                x: (CUBE_SIZE / 2 + 1) as u8,
+                y: 4,
+                z: 9,
+            },
         ];
         for cube in cubes {
             for local in locals {
@@ -148,8 +160,8 @@ mod tests {
     fn negative_one_splits_to_cube_minus_one() {
         let pos = BlockPos {
             x: -1,
-            y: -33,
-            z: -32,
+            y: -(CUBE_SIZE as i64 + 1),
+            z: -i64::from(CUBE_SIZE),
         };
         let (cube, local) = pos.split();
         assert_eq!(
@@ -160,24 +172,35 @@ mod tests {
                     y: -2,
                     z: -1
                 },
-                LocalPos { x: 31, y: 31, z: 0 }
+                LocalPos {
+                    x: (CUBE_SIZE - 1) as u8,
+                    y: (CUBE_SIZE - 1) as u8,
+                    z: 0
+                }
             )
         );
     }
 
     #[test]
     fn extreme_block_positions() {
-        // i32::MIN * 32 overflows i32; the i64 math must survive it.
+        // i32::MIN * CUBE_SIZE overflows i32; the i64 math must survive it.
         let min = BlockPos {
-            x: i64::from(i32::MIN) * 32,
-            y: i64::from(i32::MIN) * 32 + 31,
-            z: i64::from(i32::MAX) * 32,
+            x: i64::from(i32::MIN) * i64::from(CUBE_SIZE),
+            y: i64::from(i32::MIN) * i64::from(CUBE_SIZE) + CUBE_MASK,
+            z: i64::from(i32::MAX) * i64::from(CUBE_SIZE),
         };
         let (cube, local) = min.split();
         assert_eq!(cube.x, i32::MIN);
         assert_eq!(cube.y, i32::MIN);
         assert_eq!(cube.z, i32::MAX);
-        assert_eq!(local, LocalPos { x: 0, y: 31, z: 0 });
+        assert_eq!(
+            local,
+            LocalPos {
+                x: 0,
+                y: (CUBE_SIZE - 1) as u8,
+                z: 0
+            }
+        );
     }
 
     #[test]
@@ -186,7 +209,8 @@ mod tests {
             let pos = LocalPos::from_index(i);
             assert_eq!(pos.index(), i);
             assert_eq!(
-                (pos.y as usize * 32 + pos.z as usize) * 32 + pos.x as usize,
+                (pos.y as usize * CUBE_SIZE as usize + pos.z as usize) * CUBE_SIZE as usize
+                    + pos.x as usize,
                 i
             );
         }
@@ -194,17 +218,19 @@ mod tests {
 
     #[test]
     fn local_new_validates() {
+        let last = (CUBE_SIZE - 1) as u8;
+        let size = CUBE_SIZE as u8;
         assert_eq!(LocalPos::new(0, 0, 0), Some(LocalPos { x: 0, y: 0, z: 0 }));
         assert_eq!(
-            LocalPos::new(31, 31, 31),
+            LocalPos::new(last, last, last),
             Some(LocalPos {
-                x: 31,
-                y: 31,
-                z: 31
+                x: last,
+                y: last,
+                z: last
             })
         );
-        assert_eq!(LocalPos::new(32, 0, 0), None);
-        assert_eq!(LocalPos::new(0, 32, 0), None);
+        assert_eq!(LocalPos::new(size, 0, 0), None);
+        assert_eq!(LocalPos::new(0, size, 0), None);
         assert_eq!(LocalPos::new(0, 0, 255), None);
     }
 }

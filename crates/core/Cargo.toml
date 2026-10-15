@@ -9,6 +9,11 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# 16³ cubes instead of 32³ (task 1.8 benchmark feature). Compile-time only;
+# see the README for what is and is not supported under it.
+cube16 = []
+
 [dependencies]
 
 [dev-dependencies]
