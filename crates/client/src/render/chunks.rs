@@ -709,6 +709,28 @@ pub enum TerrainPath {
     Fallback,
 }
 
+/// The path-selection rule, pure so it can be unit-tested exhaustively:
+/// no MDI (or a forced fallback) means direct draws; otherwise cpu-cull is
+/// the default and gpu-cull needs a gpu-capable adapter **and** an explicit
+/// preference (`JBM_GPU_CULL=1` / `set_prefer_gpu_cull`) — on Metal it
+/// measured slower than cpu-cull in every scene (README, "Three paths").
+/// The force flags win over the preference.
+fn select_path(
+    mdi: bool,
+    gpu_capable: bool,
+    prefer_gpu: bool,
+    force_cpu: bool,
+    force_fallback: bool,
+) -> TerrainPath {
+    if !mdi || force_fallback {
+        TerrainPath::Fallback
+    } else if force_cpu || !gpu_capable || !prefer_gpu {
+        TerrainPath::CpuCull
+    } else {
+        TerrainPath::GpuCull
+    }
+}
+
 /// Draws the terrain: one pipeline, one shared bind group, one page bind
 /// group per page and one `multi_draw_indirect` (or a loop of direct draws)
 /// per page.
@@ -759,9 +781,11 @@ pub struct TerrainPass {
     /// `Features::INDIRECT_FIRST_INSTANCE`, and `JBM_NO_MDI` is unset.
     mdi: bool,
     /// Whether the gpu-cull path is usable: MDI plus
-    /// `DownlevelFlags::COMPUTE_SHADERS` and R32Float storage textures,
-    /// with `JBM_NO_GPU_CULL` unset.
+    /// `DownlevelFlags::COMPUTE_SHADERS` and R32Float storage textures.
     gpu_capable: bool,
+    /// Whether gpu-cull is preferred over the cpu-cull default
+    /// (`JBM_GPU_CULL=1` at construction, or `set_prefer_gpu_cull`).
+    prefer_gpu_cull: bool,
     /// Forced cpu-cull for tests and benches (`set_force_cpu_cull`).
     force_cpu_cull: bool,
     /// Forced fallback for tests and benches (`set_force_fallback`).
@@ -784,6 +808,9 @@ impl TerrainPass {
         let page_faces = DEFAULT_PAGE_FACES.min(max_faces).max(worst_case_faces());
         let pass = Self::build(gpu, color_format, uniform_layout, textures, page_faces);
         println!("terrain draw path: {}", pass.path_name());
+        if pass.gpu_capable && !pass.prefer_gpu_cull {
+            println!("gpu-cull available (JBM_GPU_CULL=1)");
+        }
         pass
     }
 
@@ -1139,8 +1166,11 @@ impl TerrainPass {
             && r32f_storage
             && downlevel
                 .flags
-                .contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)
-            && !std::env::var_os("JBM_NO_GPU_CULL").is_some_and(|v| v == "1");
+                .contains(wgpu::DownlevelFlags::COMPUTE_SHADERS);
+        // gpu-cull is opt-in: on Metal it measured slower than cpu-cull in
+        // every scene (see the README), so cpu-cull is the default until the
+        // 2.6 re-measure.
+        let prefer_gpu_cull = std::env::var_os("JBM_GPU_CULL").is_some_and(|v| v == "1");
 
         let cull_bind_group = Self::make_cull_bind_group(
             device,
@@ -1186,6 +1216,7 @@ impl TerrainPass {
             last_cull: CullStats::default(),
             mdi,
             gpu_capable,
+            prefer_gpu_cull,
             force_cpu_cull: false,
             force_fallback: false,
             stats: TerrainStats::default(),
@@ -1502,13 +1533,13 @@ impl TerrainPass {
     }
 
     fn active_path(&self) -> TerrainPath {
-        if !self.mdi || self.force_fallback {
-            TerrainPath::Fallback
-        } else if self.force_cpu_cull || !self.gpu_capable {
-            TerrainPath::CpuCull
-        } else {
-            TerrainPath::GpuCull
-        }
+        select_path(
+            self.mdi,
+            self.gpu_capable,
+            self.prefer_gpu_cull,
+            self.force_cpu_cull,
+            self.force_fallback,
+        )
     }
 
     /// Forces the cpu-cull path (or restores the automatic choice), for
@@ -1516,6 +1547,13 @@ impl TerrainPass {
     /// lacks MDI.
     pub fn set_force_cpu_cull(&mut self, force: bool) {
         self.force_cpu_cull = force;
+    }
+
+    /// Prefers the gpu-cull path over the cpu-cull default (or restores
+    /// the default), mirroring `JBM_GPU_CULL=1` for tests, benches and
+    /// the metrics example. Ignored when the adapter is not gpu-capable.
+    pub fn set_prefer_gpu_cull(&mut self, prefer: bool) {
+        self.prefer_gpu_cull = prefer;
     }
 
     /// Forces the direct-draw fallback path (or restores the automatic
@@ -2063,6 +2101,44 @@ mod tests {
 
     fn camera() -> Camera {
         Camera::new(DVec3::ZERO, 70.0_f32.to_radians(), 1.0)
+    }
+
+    #[test]
+    fn path_selection_rules() {
+        use TerrainPath::{CpuCull, Fallback, GpuCull};
+        // Exhaustive over the five booleans, with the expected path derived
+        // from the documented rule, not from select_path itself: no MDI (or
+        // a forced fallback) is the fallback; otherwise cpu-cull unless the
+        // adapter is gpu-capable, gpu-cull is preferred and nothing forces
+        // another path.
+        for mdi in [false, true] {
+            for gpu_capable in [false, true] {
+                for prefer_gpu in [false, true] {
+                    for force_cpu in [false, true] {
+                        for force_fallback in [false, true] {
+                            let expected = if !mdi || force_fallback {
+                                Fallback
+                            } else if gpu_capable && prefer_gpu && !force_cpu {
+                                GpuCull
+                            } else {
+                                CpuCull
+                            };
+                            assert_eq!(
+                                select_path(
+                                    mdi,
+                                    gpu_capable,
+                                    prefer_gpu,
+                                    force_cpu,
+                                    force_fallback
+                                ),
+                                expected,
+                                "({mdi}, {gpu_capable}, {prefer_gpu}, {force_cpu}, {force_fallback})",
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

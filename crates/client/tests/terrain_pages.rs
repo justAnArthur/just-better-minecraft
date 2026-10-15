@@ -71,6 +71,7 @@ fn render_passes_identically(
     let (layers, _) = builtin_textures();
     let textures = BlockTextures::new(gpu, &layers).expect("texture array");
 
+    churned.set_prefer_gpu_cull(path == TerrainPath::GpuCull);
     churned.set_force_cpu_cull(path == TerrainPath::CpuCull);
     churned.set_force_fallback(path == TerrainPath::Fallback);
     // Without MDI both force flags collapse to the fallback path; the
@@ -103,6 +104,7 @@ fn render_passes_identically(
         &textures,
         tiny_page_faces(),
     );
+    fresh.set_prefer_gpu_cull(path == TerrainPath::GpuCull);
     fresh.set_force_cpu_cull(path == TerrainPath::CpuCull);
     fresh.set_force_fallback(path == TerrainPath::Fallback);
     for (pos, mesh) in fresh_meshes {

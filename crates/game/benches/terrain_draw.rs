@@ -22,7 +22,7 @@ use glam::DVec3;
 use jbm_client::camera::Camera;
 use jbm_client::gpu::Gpu;
 use jbm_client::mesh::greedy;
-use jbm_client::render::chunks::TerrainPass;
+use jbm_client::render::chunks::{TerrainPass, TerrainPath};
 use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
 use jbm_client::render::texture_array::BlockTextures;
@@ -194,10 +194,14 @@ fn bench(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("terrain_draw");
 
-    // The default path first: compute frustum + Hi-Z culling, two MDI
-    // phases. gpu_cull_available covers MDI + compute + R32Float storage.
+    // gpu-cull first: compute frustum + Hi-Z culling, two MDI phases. It is
+    // opt-in in the game (JBM_GPU_CULL=1; slower than cpu-cull on Metal),
+    // so select it explicitly. gpu_cull_available covers MDI + compute +
+    // R32Float storage.
     let mut gpu_pass = make_pass(&frames.gpu, &surface.meshes);
     if gpu_pass.gpu_cull_available() {
+        gpu_pass.set_prefer_gpu_cull(true);
+        assert_eq!(gpu_pass.path(), TerrainPath::GpuCull);
         frames.bench(&mut group, "gpu_cull", &mut gpu_pass, &surface.camera);
     } else {
         println!("skipping terrain_draw/gpu_cull: adapter lacks the GPU cull path");
@@ -220,6 +224,8 @@ fn bench(c: &mut Criterion) {
 
     let mut cave_gpu = make_pass(&frames.gpu, &cave.meshes);
     if cave_gpu.gpu_cull_available() {
+        cave_gpu.set_prefer_gpu_cull(true);
+        assert_eq!(cave_gpu.path(), TerrainPath::GpuCull);
         frames.bench(&mut group, "cave/gpu_cull", &mut cave_gpu, &cave.camera);
     } else {
         println!("skipping terrain_draw/cave/gpu_cull: adapter lacks the GPU cull path");

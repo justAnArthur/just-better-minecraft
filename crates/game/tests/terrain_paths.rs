@@ -232,6 +232,8 @@ fn render_all_paths(
     }
 
     // Three frames so the two-phase state settles, then compare per path.
+    // gpu-cull is opt-in since it stopped being the default: prefer it
+    // explicitly and assert it really is active when the adapter allows it.
     let mut reference: Option<(TerrainPath, RgbaImage)> = None;
     let mut compared = 0;
     for path in [
@@ -239,11 +241,21 @@ fn render_all_paths(
         TerrainPath::CpuCull,
         TerrainPath::Fallback,
     ] {
+        terrain.set_prefer_gpu_cull(path == TerrainPath::GpuCull);
         terrain.set_force_cpu_cull(path == TerrainPath::CpuCull);
         terrain.set_force_fallback(path == TerrainPath::Fallback);
         let active = terrain.path();
-        if path == TerrainPath::GpuCull && active != TerrainPath::GpuCull {
-            println!("path equality: adapter lacks gpu-cull, comparing the paths that exist");
+        // A path the adapter (or JBM_NO_MDI=1) rules out collapses to the
+        // next one down; every available path must really be active.
+        let available = match path {
+            TerrainPath::GpuCull => terrain.gpu_cull_available(),
+            TerrainPath::CpuCull => terrain.uses_mdi(),
+            TerrainPath::Fallback => true,
+        };
+        if available {
+            assert_eq!(active, path, "the requested path must be active");
+        } else {
+            println!("path equality: {path:?} unavailable here, rendering {active:?} instead");
         }
         for _ in 0..3 {
             render_frame(gpu, &mut renderer, &target, &depth, &mut terrain, camera);
@@ -408,6 +420,9 @@ fn nothing_pops_in_across_a_moving_camera() {
         println!("skipping: adapter lacks the gpu-cull path");
         return;
     }
+    // Opt into gpu-cull (no longer the default) and prove it is active.
+    terrain.set_prefer_gpu_cull(true);
+    assert_eq!(terrain.path(), TerrainPath::GpuCull);
 
     let (_, room_eye) = room_camera();
     let mut frames_with_occlusion = 0;
@@ -465,6 +480,9 @@ fn cave_culling_hides_the_buried_world() {
         println!("skipping: adapter lacks the gpu-cull path");
         return;
     }
+    // Opt into gpu-cull (no longer the default) and prove it is active.
+    terrain.set_prefer_gpu_cull(true);
+    assert_eq!(terrain.path(), TerrainPath::GpuCull);
 
     // The camera stands in the closed room looking horizontally; three
     // frames so occlusion is in its steady state.
@@ -526,6 +544,9 @@ fn open_surface_view_stays_uncullled() {
         println!("skipping: adapter lacks the gpu-cull path");
         return;
     }
+    // Opt into gpu-cull (no longer the default) and prove it is active.
+    terrain.set_prefer_gpu_cull(true);
+    assert_eq!(terrain.path(), TerrainPath::GpuCull);
 
     // The terrain_spawn camera on the surface; two warm-up frames so the
     // occlusion state is steady.
@@ -585,6 +606,13 @@ fn odd_resize_keeps_the_paths_identical() {
     for (pos, mesh) in &meshes {
         terrain.upload(&gpu, *pos, mesh);
     }
+    if !terrain.gpu_cull_available() {
+        println!("skipping: adapter lacks the gpu-cull path");
+        return;
+    }
+    // Opt into gpu-cull (no longer the default) and prove it is active.
+    terrain.set_prefer_gpu_cull(true);
+    assert_eq!(terrain.path(), TerrainPath::GpuCull);
 
     let camera = looking_at(
         spawn + DVec3::new(-24.0, 20.0, -24.0),

@@ -294,9 +294,14 @@ fn main() {
         wait: std::time::Duration::ZERO,
     };
 
-    // Surface view, every path that exists.
+    // Surface view, every path that exists. gpu-cull is opt-in in the game
+    // (JBM_GPU_CULL=1; it lost to cpu-cull on Metal), so select it
+    // explicitly like a JBM_GPU_CULL=1 run would.
     if terrain.gpu_cull_available() {
+        terrain.set_prefer_gpu_cull(true);
+        assert_eq!(terrain.path(), TerrainPath::GpuCull);
         measure_path("surface", &mut frames, &mut terrain, &surface_camera);
+        terrain.set_prefer_gpu_cull(false);
     } else {
         row("surface gpu-cull", "unavailable on this adapter");
     }
@@ -321,7 +326,10 @@ fn main() {
     measure_path("cave", &mut frames, &mut cave_pass, &cave_camera);
     if cave_pass.gpu_cull_available() {
         cave_pass.set_force_cpu_cull(false);
+        cave_pass.set_prefer_gpu_cull(true);
+        assert_eq!(cave_pass.path(), TerrainPath::GpuCull);
         measure_path("cave", &mut frames, &mut cave_pass, &cave_camera);
+        cave_pass.set_prefer_gpu_cull(false);
     } else {
         row("cave gpu-cull", "unavailable on this adapter");
     }

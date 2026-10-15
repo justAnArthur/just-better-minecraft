@@ -232,13 +232,38 @@ just `FrameUniforms`), and the CPU paths use the same Rust function
 
 | Path | When | Culling | Draw |
 |---|---|---|---|
-| `gpu-cull` | MDI available **and** `DownlevelFlags::COMPUTE_SHADERS` + R32Float storage textures, `JBM_NO_GPU_CULL` unset | compute: frustum, Hi-Z, directions | `multi_draw_indirect` per page, two phases |
-| `cpu-cull` | `JBM_NO_GPU_CULL=1`, or `set_force_cpu_cull(true)` | 2.2's CPU frustum + directions over the same meta slots | `multi_draw_indirect` per page |
+| `cpu-cull` (default) | MDI available | 2.2's CPU frustum + directions over the same meta slots | `multi_draw_indirect` per page |
+| `gpu-cull` (opt-in) | MDI **and** `DownlevelFlags::COMPUTE_SHADERS` + R32Float storage textures, **and** `JBM_GPU_CULL=1` or `set_prefer_gpu_cull(true)` | compute: frustum, Hi-Z, directions | `multi_draw_indirect` per page, two phases |
 | `fallback` | no MDI, or `JBM_NO_MDI=1`, or `set_force_fallback(true)` | as `cpu-cull` | direct draws |
 
-The path is chosen once at construction and logged once;
-`set_force_cpu_cull` / `set_force_fallback` exist for tests and benches.
-`path()` / `path_name()` report the choice.
+The path is chosen once at construction (`select_path`, a pure,
+exhaustively tested function) and logged once; a gpu-capable adapter
+also logs "gpu-cull available (JBM_GPU_CULL=1)". `set_prefer_gpu_cull`,
+`set_force_cpu_cull` and `set_force_fallback` exist for tests and
+benches; the force flags win over the preference. `path()` /
+`path_name()` report the choice.
+
+**Why gpu-cull is opt-in.** On the only hardware measured so far (Apple
+Silicon, Metal) it is slower than cpu-cull in every scene, caves
+included. Game-sized region (`JBM_REGION_SIDE=544`: 867 cubes, 430
+meshes, 1280×720), frame mean including the GPU wait:
+
+| Scene | gpu-cull | cpu-cull | gpu-cull commands / encoded slots | cpu-cull commands |
+|---|---|---|---|---|
+| surface | 0.80–1.07 ms | 0.43–0.61 ms | 928 / 1856 | 928 |
+| cave (closed room) | 0.41–0.71 ms | 0.27–0.46 ms | 15 / 640 | 320 |
+
+Where the time goes: on Metal `multi_draw_indirect` is a CPU loop of
+one indirect draw per command and `draw_indirect_count` is missing, so
+every region slot is encoded even when the GPU wrote a zero-count draw
+(the CPU frustum bound keeps that to 2× the cpu-cull count, one region
+per phase); the per-frame Hi-Z rebuild at 1280×720 costs about 0.18 ms;
+the second render pass and the cull dispatches are the rest. In these
+scenes the faces saved by occlusion cost less to raster than that.
+cpu-cull stays the default until gpu-cull wins a measurement. Levers,
+in order: re-measure with the LOD rings of 2.6 (far more geometry);
+start the pyramid at half resolution, reducing straight from the depth
+target; `multi_draw_indirect_count` on Vulkan/DX12.
 
 **gpu-cull, per frame** (the CPU's only per-cube work is sizing the
 command regions — see "Per-page regions and zero tails" below):

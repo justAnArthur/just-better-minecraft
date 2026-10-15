@@ -71,6 +71,11 @@ the room is closed), where the occlusion culling earns its keep. Without
 a GPU adapter the bench prints a skip line and passes, so the CI bench
 smoke run stays green.
 
+The benches and the metrics example select every path explicitly, so
+they measure gpu-cull even though the game defaults to cpu-cull. To
+play on gpu-cull, run `JBM_GPU_CULL=1 cargo run -p jbm-game --release`
+(the overlay names the active path).
+
 `examples/cube_size_metrics.rs` prints the matching metrics table (cube
 count, uniform cubes, the old one-draw-per-non-empty-cube number, faces,
 mesh bytes, cube storage + a documented HashMap overhead estimate,
