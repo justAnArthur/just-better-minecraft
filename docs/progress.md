@@ -2,7 +2,7 @@
 
 ## Next up
 
-Stage 2 · Far view, wave B: 2.4 LOD pyramid (downsampling rule, edit propagation up the levels), 2.5 GPU frustum and Hi-Z occlusion culling in compute. Specs not written yet. Wave A is on branch stage-2/wave-a (PR pending play-test). Start with `/clear`.
+Stage 2 · Far view, wave B: 2.4 LOD pyramid (downsampling rule, edit propagation up the levels), 2.5 GPU frustum and Hi-Z occlusion culling in compute. Specs not written yet. Wave A merged (PR #9). Start with `/clear`.
 
 ## Benchmarks
 

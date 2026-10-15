@@ -17,7 +17,7 @@ orchestrator writes docs/tasks/<id>.md
   -> glm-worker reviewer, fresh context (brief: docs/briefs/reviewer.md) -> verdict
        fix  -> new implementer with the findings
        merge -> orchestrator checks screenshots / risky diffs, merges, updates progress.md
-after each wave: /compact     after each stage gate: /clear
+after each wave: compact prompt -> /compact     after each stage gate: compact prompt -> /clear
 ```
 
 Tasks in the same wave run in parallel, each implementer in its own git worktree. Only reports of 200 words or less come back to the orchestrator.
@@ -51,6 +51,7 @@ The orchestrator still checks itself before merging: screenshot tests (it reads 
 ## Context rules
 
 - `/compact` after every wave, `/clear` after every stage. You type both; the orchestrator says when.
+- **Compact prompt:** when a wave or a stage is merged, and before the next one starts, the orchestrator ends its report with a ready-to-paste `/compact <instructions>` block. The block keeps only what the next wave needs: its tasks and "done when" rows, the workflow and review lessons, the current state (what is merged, which PR or branch is open), and the key facts the next specs depend on. You paste it, then say "start wave …".
 - Subagent reports are capped at 200 words. Anything longer goes into a file.
 - The orchestrator never reads whole source files; it reads crate READMEs or asks `Explore`.
 - Build and test output is filtered (`cargo test 2>&1 | tail -30`).
