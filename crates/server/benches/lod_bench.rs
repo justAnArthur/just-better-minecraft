@@ -130,7 +130,9 @@ fn bench(c: &mut Criterion) {
         // picked so that LOD1 really changes; a no-op edit would stop at
         // the first level and measure nothing.
         let cube = generator.generate(pos);
-        let base = {
+        // The pyramid owns worker plumbing and is not `Clone`; a bare one
+        // is rebuilt per batch in the untimed setup instead.
+        let base = || {
             let mut pyramid = LodPyramid::new(4);
             pyramid.insert_lod0(pos, &cube);
             pyramid
@@ -141,14 +143,14 @@ fn bench(c: &mut Criterion) {
             .find_map(|local| {
                 let mut edited = cube.clone();
                 edited.set(local, jbm_core::block::BlockStateId::AIR);
-                let mut pyramid = base.clone();
+                let mut pyramid = base();
                 (!pyramid.edit_lod0(pos.block(local), &edited).is_empty())
                     .then_some((edited, local))
             })
             .expect("some single break changes LOD1");
         let block = pos.block(local);
         b.iter_batched(
-            || base.clone(),
+            base,
             |mut pyramid| {
                 black_box(pyramid.edit_lod0(block, &edited));
                 pyramid

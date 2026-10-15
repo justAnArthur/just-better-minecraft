@@ -309,6 +309,43 @@ pub fn downsample_octant(child: &Cube, parent: &mut Cube, octant: u8) -> Option<
     }
 }
 
+/// Copies one octant's cells from `src` to `parent` (same octant of both),
+/// returning the box of `parent` cells that actually changed, or `None`.
+/// This is the tick-thread half of the precomputed-octan ingest (task 2.7):
+/// a generation worker downsamples a LOD0 cube into a scratch cube's octant
+/// off-thread ([`downsample_octant`]), and the tick thread installs it with
+/// this copy — no downsampling on the tick thread.
+pub fn copy_octant(src: &Cube, parent: &mut Cube, octant: u8) -> Option<CellBox> {
+    let half = CUBE_SIZE as usize / 2;
+    let [ox, oy, oz] = octant_offset(octant).map(|v| v as usize * half);
+    let mut changed: Option<CellBox> = None;
+    // A uniform source fills its octant with one state, the same shortcut
+    // `downsample_octant` takes for uniform children.
+    let uniform = src.uniform();
+    for y in oy..oy + half {
+        for z in oz..oz + half {
+            for x in ox..ox + half {
+                let pos = LocalPos::new_unchecked(x as u8, y as u8, z as u8);
+                let state = match uniform {
+                    Some(state) => state,
+                    None => src.get(pos),
+                };
+                if parent.set(pos, state) != state {
+                    let cell = CellBox::single(pos);
+                    changed = Some(match changed {
+                        None => cell,
+                        Some(boxed) => boxed.union(cell),
+                    });
+                }
+            }
+        }
+    }
+    if changed.is_some() {
+        parent.compact();
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -770,5 +807,56 @@ mod tests {
         );
         assert_eq!(parent.uniform(), Some(AIR));
         parent.check_invariants();
+    }
+
+    #[test]
+    fn copy_octant_installs_a_precomputed_octant() {
+        // A mixed child downsamples into a scratch cube's octant off-thread;
+        // copy_octant installs it into the real parent, changed cells only.
+        let child = Cube::from_fn(|p| {
+            let y = p.y as usize;
+            if y < 8 {
+                if y == 7 { GRASS } else { DIRT }
+            } else {
+                AIR
+            }
+        });
+        let (scratch, _) = {
+            let mut scratch = Cube::filled(AIR);
+            let changed = downsample_octant(&child, &mut scratch, 3);
+            (scratch, changed)
+        };
+        let mut parent = Cube::filled(AIR);
+        let changed = copy_octant(&scratch, &mut parent, 3).expect("air gains content");
+        let half = CUBE_SIZE as usize / 2;
+        let [ox, oy, oz] = octant_offset(3).map(|v| v as usize * half);
+        assert_eq!(changed.min, [ox as u8, oy as u8, oz as u8]);
+        // The child is filled below y = 8, so only the octant's bottom
+        // four parent rows gain content; the air above does not change.
+        assert_eq!(
+            changed.max,
+            [(ox + half) as u8, (oy + 4) as u8, (oz + half) as u8]
+        );
+        // Outside the octant stays air; inside equals the scratch octant.
+        for y in 0..CUBE_SIZE as usize {
+            for z in 0..CUBE_SIZE as usize {
+                for x in 0..CUBE_SIZE as usize {
+                    let pos = LocalPos::new_unchecked(x as u8, y as u8, z as u8);
+                    let inside = (ox..ox + half).contains(&x)
+                        && (oy..oy + half).contains(&y)
+                        && (oz..oz + half).contains(&z);
+                    assert_eq!(parent.get(pos), if inside { scratch.get(pos) } else { AIR });
+                }
+            }
+        }
+        // Re-copying the same octant reports no change.
+        assert_eq!(copy_octant(&scratch, &mut parent, 3), None);
+        parent.check_invariants();
+
+        // A uniform source fills its octant in bulk.
+        let stone_src = Cube::filled(STONE);
+        let mut air_parent = Cube::filled(AIR);
+        assert!(copy_octant(&stone_src, &mut air_parent, 0).is_some());
+        assert!(copy_octant(&stone_src, &mut Cube::filled(STONE), 0).is_none());
     }
 }

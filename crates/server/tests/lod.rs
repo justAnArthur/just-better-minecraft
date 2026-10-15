@@ -3,12 +3,14 @@
 //! equality, and the ingest/eviction rules.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
 
 use jbm_core::block::{BlockRegistry, BlockStateId, builtin::Blocks};
 use jbm_core::coords::{BlockPos, CUBE_SIZE, CubePos, LocalPos};
 use jbm_core::cube::Cube;
 use jbm_core::link::{ClientLink, in_process_pair};
-use jbm_core::lod::parent;
+use jbm_core::lod::{octant_offset, parent};
 use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION, ServerMsg};
 use jbm_server::lod::LodPyramid;
 use jbm_server::terrain::Generator;
@@ -117,7 +119,13 @@ fn surface_y(server: &Server) -> i64 {
     y
 }
 
-fn assert_pyramids_equal(incremental: &LodPyramid, rebuilt: &LodPyramid, what: &str) {
+/// The incremental-vs-reference property: every cube the incremental
+/// pyramid holds **ready** must equal the reference (which only ever holds
+/// ready cubes), cell for cell and `known` for `known`. Mid-stream the
+/// incremental may additionally hold pending cubes whose fills have not
+/// run; `full` (the final check, after everything was requested and
+/// drained) also demands the cube sets match exactly.
+fn assert_pyramids_equal(incremental: &LodPyramid, rebuilt: &LodPyramid, full: bool, what: &str) {
     assert_eq!(
         incremental.max_levels(),
         rebuilt.max_levels(),
@@ -126,19 +134,40 @@ fn assert_pyramids_equal(incremental: &LodPyramid, rebuilt: &LodPyramid, what: &
     for level in 1..=incremental.max_levels() {
         let a: HashMap<CubePos, (u8, Cube)> = incremental
             .iter(level)
+            .filter(|(_, lc)| lc.ready())
             .map(|(&pos, lc)| (pos, (lc.known, lc.cube.clone())))
             .collect();
         let b: HashMap<CubePos, (u8, Cube)> = rebuilt
             .iter(level)
             .map(|(&pos, lc)| (pos, (lc.known, lc.cube.clone())))
             .collect();
-        assert_eq!(a.len(), b.len(), "{what}: level {level} cube counts differ");
+        if full {
+            assert_eq!(
+                a.len(),
+                b.len(),
+                "{what}: level {level} ready cube counts differ (only-in-incremental: {:?}, only-in-rebuild: {:?})",
+                a.keys().filter(|k| !b.contains_key(*k)).collect::<Vec<_>>(),
+                b.keys().filter(|k| !a.contains_key(*k)).collect::<Vec<_>>()
+            );
+        }
         for (pos, (known, cube)) in &a {
             let other = b
                 .get(pos)
                 .unwrap_or_else(|| panic!("{what}: level {level} misses {pos:?}"));
             assert_eq!(known, &other.0, "{what}: level {level} {pos:?} known mask");
-            assert_eq!(cube, &other.1, "{what}: level {level} {pos:?} content");
+            if cube != &other.1 {
+                for index in 0..jbm_core::coords::CUBE_VOLUME {
+                    let local = LocalPos::from_index(index);
+                    if cube.get(local) != other.1.get(local) {
+                        panic!(
+                            "{what}: level {level} {pos:?} cell {local:?}: \
+                             incremental {:?} rebuild {:?} (known {known:08b})",
+                            cube.get(local),
+                            other.1.get(local)
+                        );
+                    }
+                }
+            }
         }
     }
 }
@@ -146,20 +175,52 @@ fn assert_pyramids_equal(incremental: &LodPyramid, rebuilt: &LodPyramid, what: &
 // ---------------------------------------------------------------------
 // Thin features
 
+/// Inserts every LOD0 cube of the box `min..=max` (per axis), each built
+/// by `cube_at`, so the whole chain above is fully real and ready without
+/// any fill — the synthetic-world setup the thin-feature tests use.
+fn insert_footprint(
+    pyramid: &mut LodPyramid,
+    min: CubePos,
+    max: CubePos,
+    cube_at: impl Fn(CubePos) -> Cube,
+) {
+    for x in min.x..=max.x {
+        for y in min.y..=max.y {
+            for z in min.z..=max.z {
+                let pos = CubePos { x, y, z };
+                let cube = cube_at(pos);
+                pyramid.insert_lod0(pos, &cube);
+            }
+        }
+    }
+}
+
 #[test]
 fn one_block_wall_survives_lod1_and_lod2_at_both_parities() {
     let planks = blocks().oak_planks;
     for wall_x in [7u8, 8u8] {
         let mut pyramid = LodPyramid::new(4);
-        // A wall 1 block thick, 32 long and 16 tall, otherwise air.
-        let cube = lod0_cube(|x, _y, _z| {
-            if x == wall_x {
-                planks
-            } else {
-                BlockStateId::AIR
-            }
-        });
-        pyramid.insert_lod0(CubePos { x: 0, y: 0, z: 0 }, &cube);
+        // A wall 1 block thick, 32 long and 16 tall inside cube (0, 0, 0),
+        // otherwise air. The parent's whole 2×2×2 footprint of LOD0 cubes
+        // is inserted so the chain is fully real (no fills: synthetic air).
+        insert_footprint(
+            &mut pyramid,
+            CubePos { x: 0, y: 0, z: 0 },
+            CubePos { x: 1, y: 1, z: 1 },
+            |pos| {
+                if pos == (CubePos { x: 0, y: 0, z: 0 }) {
+                    lod0_cube(|x, _y, _z| {
+                        if x == wall_x {
+                            planks
+                        } else {
+                            BlockStateId::AIR
+                        }
+                    })
+                } else {
+                    Cube::filled(BlockStateId::AIR)
+                }
+            },
+        );
 
         // LOD1: a filled column at the wall's cell x for every covered y
         // and z (8 and 16 of them), with air on both sides.
@@ -208,15 +269,26 @@ fn one_block_wall_survives_lod1_and_lod2_at_both_parities() {
 fn tree_trunk_survives_lod1_and_lod2_and_keeps_log() {
     let log = blocks().oak_log;
     let mut pyramid = LodPyramid::new(4);
-    // A 1×1 trunk, 8 tall, surrounded by air.
-    let cube = lod0_cube(|x, y, z| {
-        if (x, z) == (7, 7) && y < 8 {
-            log
-        } else {
-            BlockStateId::AIR
-        }
-    });
-    pyramid.insert_lod0(CubePos { x: 0, y: 0, z: 0 }, &cube);
+    // A 1×1 trunk, 8 tall, surrounded by air, with the parent's full
+    // footprint inserted so the chain is fully real.
+    insert_footprint(
+        &mut pyramid,
+        CubePos { x: 0, y: 0, z: 0 },
+        CubePos { x: 1, y: 1, z: 1 },
+        |pos| {
+            if pos == (CubePos { x: 0, y: 0, z: 0 }) {
+                lod0_cube(|x, y, z| {
+                    if (x, z) == (7, 7) && y < 8 {
+                        log
+                    } else {
+                        BlockStateId::AIR
+                    }
+                })
+            } else {
+                Cube::filled(BlockStateId::AIR)
+            }
+        },
+    );
 
     for level in [1u8, 2u8] {
         let (pos, _) = lod_cell(level, 7, 7, 7);
@@ -256,32 +328,29 @@ fn a_single_floating_block_vanishes_at_lod1() {
 fn walls_straddling_cube_borders_survive() {
     // Walls at world x = -1 (local 31 of cube -1) and x = 0 (local 0 of
     // cube 0), each spanning z = -16..16, so they cross the x = 0 and
-    // z = 0 cube borders.
+    // z = 0 cube borders. The whole LOD0 footprint of the two level-2
+    // cubes involved is inserted, so the chain is fully real.
     let planks = blocks().oak_planks;
     let mut pyramid = LodPyramid::new(2);
-    for (cube_x, wall_x) in [(-1i32, 31u8), (0, 0u8)] {
-        for cube_z in [-1i32, 0] {
-            let cube = lod0_cube(|x, _y, z| {
-                // Cube -1 covers world z -32..0: its z >= 16 half is world
-                // z -16..0. Cube 0 covers 0..32: its z < 16 half is 0..16.
-                // Together the wall spans world z -16..16.
-                let in_wall_z = if cube_z == -1 { z >= 16 } else { z < 16 };
-                if x == wall_x && in_wall_z {
+    insert_footprint(
+        &mut pyramid,
+        CubePos { x: -4, y: 0, z: -4 },
+        CubePos { x: 3, y: 3, z: 3 },
+        |pos| {
+            let base_x = i64::from(pos.x) * i64::from(CUBE_SIZE);
+            let base_z = i64::from(pos.z) * i64::from(CUBE_SIZE);
+            let wall_x = if pos.x < 0 { 31u8 } else { 0u8 };
+            let in_wall_z = if pos.z < 0 { 16u8..32 } else { 0u8..16 };
+            let _ = (base_x, base_z);
+            lod0_cube(move |x, _y, z| {
+                if x == wall_x && in_wall_z.contains(&z) {
                     planks
                 } else {
                     BlockStateId::AIR
                 }
-            });
-            pyramid.insert_lod0(
-                CubePos {
-                    x: cube_x,
-                    y: 0,
-                    z: cube_z,
-                },
-                &cube,
-            );
-        }
-    }
+            })
+        },
+    );
     for level in [1u8, 2u8] {
         // The wall at world x = 0 lands in the non-negative level cubes at
         // cell x 0; the wall at x = -1 in the negative ones, at cell x
@@ -304,20 +373,31 @@ fn walls_straddling_cube_borders_survive() {
 // Known masks, re-insertion
 
 #[test]
-fn inserting_a_cube_marks_its_whole_ancestor_chain_known() {
+fn inserting_a_cube_marks_its_whole_ancestor_chain() {
     let stone = blocks().stone;
     let mut pyramid = LodPyramid::new(4);
     let pos = CubePos { x: 1, y: 2, z: 3 };
     pyramid.insert_lod0(pos, &Cube::filled(stone));
 
+    // Level 1 holds the real octant at once; level 2 holds it pending —
+    // real by definition, computed only once its child is ready. The walk
+    // stops there: nothing above is touched until the deferral completes
+    // (which never happens in a bare pyramid: nothing fills).
     let mut child = pos;
-    for level in 1..=4u8 {
+    for level in 1..=2u8 {
         let (ancestor, octant) = parent(child);
         let lod = pyramid.get(level, ancestor).expect("chain cube exists");
-        assert_eq!(lod.known, 1 << octant, "level {level} known mask");
+        if level == 1 {
+            assert_eq!(lod.known, 1 << octant, "level 1 known mask");
+            assert_eq!(lod.pending, 0);
+        } else {
+            assert_eq!(lod.pending, 1 << octant, "level 2 pending mask");
+            assert_eq!(lod.known, 0, "level 2 is not real yet");
+        }
+        assert!(!lod.ready(), "level {level} is not ready without fills");
         child = ancestor;
     }
-    assert_eq!(pyramid.total_cubes(), 4);
+    assert_eq!(pyramid.total_cubes(), 2, "levels 3 and 4 are not touched");
 
     // Negative coordinates: parent and octant math through div_euclid.
     let neg = CubePos {
@@ -376,10 +456,12 @@ fn pyramid_accessors_report_levels_and_sizes() {
     assert_eq!(pyramid.heap_bytes(), 0, "nothing allocated while empty");
 
     pyramid.insert_lod0(CubePos { x: 0, y: 0, z: 0 }, &Cube::filled(stone));
-    for level in 1..=3u8 {
-        assert_eq!(pyramid.len(level), 1, "one chain cube at level {level}");
-    }
-    assert_eq!(pyramid.total_cubes(), 3);
+    // The deferral walk reaches level 2 (pending) and stops: one cube at
+    // each of levels 1 and 2, none above.
+    assert_eq!(pyramid.len(1), 1);
+    assert_eq!(pyramid.len(2), 1, "one pending cube at level 2");
+    assert_eq!(pyramid.len(3), 0, "the walk stops at the deferral");
+    assert_eq!(pyramid.total_cubes(), 2);
     assert!(pyramid.heap_bytes() > 0);
 }
 
@@ -407,13 +489,29 @@ fn early_stop_an_edit_inside_solid_stone_reports_no_changes() {
 }
 
 #[test]
-fn incremental_edits_equal_rebuild_exactly() {
-    // Seeded from JBM_LOD_TEST_SEED (hex) so acceptance runs can vary it;
-    // fixed by default so the suite is deterministic.
+fn incremental_equals_rebuild_under_random_interleavings() {
+    // The content-model property (2.7): after any order of inserts, edits,
+    // requests, fills and polls, every cube equals the reference — cell for
+    // cell and `known` for `known` — once the pipeline drains. Seeded from
+    // JBM_LOD_TEST_SEED (hex) so acceptance runs can vary it; fixed by
+    // default so the suite is deterministic.
     let seed = std::env::var("JBM_LOD_TEST_SEED")
         .ok()
         .and_then(|s| u64::from_str_radix(&s, 16).ok())
         .unwrap_or(0x10D5_EED1);
+    run_property_ops(seed, 2_000);
+}
+
+#[test]
+fn content_model_property_holds_for_ten_seeds() {
+    // The acceptance run of the property above: ten different seeds, a
+    // shorter stream each.
+    for seed in [0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA] {
+        run_property_ops(seed | 0x5EED_0000, 500);
+    }
+}
+
+fn run_property_ops(seed: u64, ops: u64) {
     let mut rng = XorShift64(seed | 1);
 
     let block_set = blocks();
@@ -443,26 +541,123 @@ fn incremental_edits_equal_rebuild_exactly() {
         .map(|&pos| (pos, generator.generate(pos)))
         .collect();
 
-    let mut pyramid = LodPyramid::new(4);
+    // The boxes the reference fills: the ancestors' bounding box per level.
+    // Requests stay inside them, so the incremental cube set is comparable.
+    let mut boxes: HashMap<u8, (CubePos, CubePos)> = HashMap::new();
+    {
+        let parents: Vec<CubePos> = region.iter().map(|&pos| parent(pos).0).collect();
+        let mut lo = parents[0];
+        let mut hi = parents[0];
+        for &p in &parents {
+            lo = CubePos {
+                x: lo.x.min(p.x),
+                y: lo.y.min(p.y),
+                z: lo.z.min(p.z),
+            };
+            hi = CubePos {
+                x: hi.x.max(p.x),
+                y: hi.y.max(p.y),
+                z: hi.z.max(p.z),
+            };
+        }
+        for level in 1..=4u8 {
+            boxes.insert(level, (lo, hi));
+            lo = parent(lo).0;
+            hi = parent(hi).0;
+        }
+    }
+    let random_in_box = |level: u8, rng: &mut XorShift64| -> CubePos {
+        let &(lo, hi) = &boxes[&level];
+        CubePos {
+            x: lo.x + rng.below((hi.x - lo.x + 1) as u64) as i32,
+            y: lo.y + rng.below((hi.y - lo.y + 1) as u64) as i32,
+            z: lo.z + rng.below((hi.z - lo.z + 1) as u64) as i32,
+        }
+    };
+
+    // Inline pipeline with a small budget, so fills interleave with the
+    // operations instead of draining at once.
+    let mut pyramid = LodPyramid::with_workers(
+        4,
+        std::sync::Arc::new(Generator::new(DEFAULT_SEED, blocks())),
+        None,
+        0,
+        7,
+    );
+    // The model is a function of the LOD0 cubes *ever seen*, so the whole
+    // region is inserted up front; the op stream re-inserts (as streaming
+    // would), edits and requests on top.
     for &pos in &region {
         pyramid.insert_lod0(pos, &lod0[&pos]);
     }
 
-    for edit in 0..2_000u64 {
-        let pos = region[rng.below(region.len() as u64) as usize];
-        let local = LocalPos::new_unchecked(
-            rng.below(CUBE_SIZE as u64) as u8,
-            rng.below(CUBE_SIZE as u64) as u8,
-            rng.below(CUBE_SIZE as u64) as u8,
-        );
-        let state = states[rng.below(states.len() as u64) as usize];
-        let cube = lod0.get_mut(&pos).expect("region cube");
-        cube.set(local, state);
-        pyramid.edit_lod0(pos.block(local), cube);
-
-        if edit % 100 == 99 {
-            let rebuilt = LodPyramid::rebuild(4, region.iter().map(|&pos| (pos, &lod0[&pos])));
-            assert_pyramids_equal(&pyramid, &rebuilt, "after edit {edit}");
+    for op in 0..ops {
+        match rng.below(100) {
+            0..=39 => {
+                // An edit through the 2.4 generator.
+                let pos = region[rng.below(region.len() as u64) as usize];
+                let local = LocalPos::new_unchecked(
+                    rng.below(CUBE_SIZE as u64) as u8,
+                    rng.below(CUBE_SIZE as u64) as u8,
+                    rng.below(CUBE_SIZE as u64) as u8,
+                );
+                let state = states[rng.below(states.len() as u64) as usize];
+                let cube = lod0.get_mut(&pos).expect("region cube");
+                cube.set(local, state);
+                pyramid.edit_lod0(pos.block(local), cube);
+            }
+            40..=59 => {
+                // A (re-)insert of a region cube, as streaming would.
+                let pos = region[rng.below(region.len() as u64) as usize];
+                pyramid.insert_lod0(pos, &lod0[&pos]);
+            }
+            _ => {
+                // A request at a random level inside the fill boxes.
+                let level = 1 + rng.below(4) as u8;
+                pyramid.request(level, random_in_box(level, &mut rng));
+                pyramid.poll();
+            }
+        }
+        if op % 100 == 99 {
+            // Drain the pipeline completely: every cube the chain needs is
+            // ready, and every ready cube equals the reference.
+            let mut spins = 0;
+            while pyramid.in_flight() > 0 {
+                pyramid.poll();
+                spins += 1;
+                assert!(
+                    spins < 10_000,
+                    "drain stuck with {} jobs",
+                    pyramid.in_flight()
+                );
+            }
+            let rebuilt = LodPyramid::rebuild(
+                4,
+                &Generator::new(DEFAULT_SEED, blocks()),
+                region.iter().map(|&pos| (pos, &lod0[&pos])),
+            );
+            let final_check = op == ops - 1;
+            if final_check {
+                // Ask for every fill-box cube, so the ready sets are
+                // comparable cube for cube.
+                for level in 1..=4u8 {
+                    let &(lo, hi) = &boxes[&level];
+                    for x in lo.x..=hi.x {
+                        for y in lo.y..=hi.y {
+                            for z in lo.z..=hi.z {
+                                pyramid.request(level, CubePos { x, y, z });
+                            }
+                        }
+                    }
+                }
+                let mut spins = 0;
+                while pyramid.in_flight() > 0 {
+                    pyramid.poll();
+                    spins += 1;
+                    assert!(spins < 10_000, "final drain stuck");
+                }
+            }
+            assert_pyramids_equal(&pyramid, &rebuilt, final_check, "after op {op}");
         }
     }
 }
@@ -812,4 +1007,996 @@ fn eviction_and_regeneration_leave_the_pyramid_unchanged() {
     }
     assert!(server.world_cube_count() > 1, "terrain regenerated");
     assert_eq!(snapshot(&server), before);
+}
+
+// ---------------------------------------------------------------------
+// Worldgen LOD sampling (task 2.7)
+
+/// The exact level-`level` downsample at `pos`: generated LOD0 cubes,
+/// downsampled octant by octant all the way up. Level 0 is `generate`.
+fn exact_cube(generator: &Generator, level: u8, pos: CubePos) -> Cube {
+    if level == 0 {
+        return generator.generate(pos);
+    }
+    let mut cube = Cube::filled(BlockStateId::AIR);
+    for octant in 0..8u8 {
+        let [dx, dy, dz] = octant_offset(octant).map(i32::from);
+        let child = CubePos {
+            x: pos.x * 2 + dx,
+            y: pos.y * 2 + dy,
+            z: pos.z * 2 + dz,
+        };
+        let child_cube = exact_cube(generator, level - 1, child);
+        jbm_core::lod::downsample_octant(&child_cube, &mut cube, octant);
+    }
+    cube
+}
+
+/// Seeded level-`level` positions whose column intersects the surface,
+/// spread over ±2048 blocks so no single plateau dominates the accuracy
+/// numbers (mixed cubes, the sampling path's real case).
+fn surface_positions(
+    generator: &Generator,
+    level: u8,
+    count: u64,
+    rng: &mut XorShift64,
+) -> Vec<CubePos> {
+    let shift = 5 + level as i64;
+    let mut positions = Vec::new();
+    let mut attempts = 0;
+    while positions.len() < count as usize {
+        attempts += 1;
+        assert!(attempts < 2_000, "no surface positions found");
+        let x = (rng.below(8192) as i64 - 4096) >> level;
+        let z = (rng.below(8192) as i64 - 4096) >> level;
+        let h = generator.surface_height(x << shift, z << shift);
+        let y = (h >> shift) as i32;
+        let pos = CubePos {
+            x: x as i32,
+            y,
+            z: z as i32,
+        };
+        if !positions.contains(&pos) {
+            positions.push(pos);
+        }
+    }
+    positions
+}
+
+#[test]
+fn sample_lod_level_1_is_the_downsample_of_generated_cubes() {
+    let generator = Generator::new(DEFAULT_SEED, blocks());
+    let mut rng = XorShift64(0x5EED_10D1);
+    // Negative coordinates and both parities, plus a cube straddling
+    // SAND_LEVEL (a beach column) and one high grass column.
+    let mut positions = surface_positions(&generator, 1, 18, &mut rng);
+    positions.retain(|&p| p.x != 0 || p.z != 0);
+    'beach: for x in (-512..512).step_by(4) {
+        for z in (-512..512).step_by(16) {
+            let sand_side = generator.surface_height(x, z) <= 61;
+            let other_side = generator.surface_height(x + 32, z + 16) <= 61;
+            if sand_side != other_side {
+                // A level-1 cube whose 64-block footprint spans both a
+                // sand and a grass column: it straddles SAND_LEVEL.
+                let h = generator.surface_height(x, z);
+                positions.push(CubePos {
+                    x: (x >> 6) as i32,
+                    y: (h >> 6) as i32,
+                    z: (z >> 6) as i32,
+                });
+                break 'beach;
+            }
+        }
+    }
+    positions.push(CubePos {
+        x: -1,
+        y: -1,
+        z: -1,
+    });
+    positions.push(CubePos { x: 0, y: 0, z: 0 });
+    assert!(positions.len() >= 20, "{} positions", positions.len());
+
+    let samples_before = generator.lod_sample_calls();
+    for &pos in &positions {
+        // The expectation generates; the counters are snapshotted around
+        // the sample call itself.
+        let expected = exact_cube(&generator, 1, pos);
+        let generates = generator.generate_calls();
+        let sampled = generator.sample_lod(1, pos);
+        assert_eq!(sampled, expected, "level 1 at {pos:?}");
+        assert_eq!(
+            generator.generate_calls(),
+            generates,
+            "sample_lod never generates, at {pos:?}"
+        );
+    }
+    assert!(
+        generator.lod_sample_calls() > samples_before,
+        "the mixed-path samples must count"
+    );
+}
+
+#[test]
+fn sample_lod_levels_2_3_4_track_the_exact_downsample() {
+    // How far the worldgen guess can be from real terrain: per column, the
+    // top filled cell within ±1 cell (≥95%) and the same top material
+    // (≥90%). These bound the visible pop when a guess is replaced by real
+    // data. Level 4 covers a 16³ LOD0 footprint, so it keeps to a few
+    // positions.
+    let generator = Generator::new(DEFAULT_SEED, blocks());
+    let mut rng = XorShift64(0xACC0_E552_0007);
+    for (level, count) in [(2u8, 30u64), (3, 10), (4, 10)] {
+        let positions = surface_positions(&generator, level, count, &mut rng);
+        let mut columns = 0usize;
+        let mut within_one = 0usize;
+        let mut same_material = 0usize;
+        for &pos in &positions {
+            let sampled = generator.sample_lod(level, pos);
+            let expected = exact_cube(&generator, level, pos);
+            let top = |cube: &Cube, x: u8, z: u8| -> Option<(u8, BlockStateId)> {
+                (0..CUBE_SIZE as u8).rev().find_map(|y| {
+                    let state = cube.get(LocalPos::new_unchecked(x, y, z));
+                    (state != BlockStateId::AIR).then_some((y, state))
+                })
+            };
+            for x in 0..CUBE_SIZE as u8 {
+                for z in 0..CUBE_SIZE as u8 {
+                    let (columns_within, columns_material) =
+                        match (top(&sampled, x, z), top(&expected, x, z)) {
+                            (Some((sy, ss)), Some((ey, es))) => {
+                                ((sy.abs_diff(ey) <= 1) as usize, (ss == es) as usize)
+                            }
+                            (None, None) => (1, 1),
+                            // A column filled only on one side counts as a miss
+                            // unless the miss is exactly one cell of height.
+                            (Some((sy, _)), None) => ((sy == 0) as usize, 0),
+                            (None, Some((ey, _))) => ((ey == 0) as usize, 0),
+                        };
+                    columns += 1;
+                    within_one += columns_within;
+                    same_material += columns_material;
+                }
+            }
+        }
+        let height_fraction = within_one as f64 / columns as f64;
+        let material_fraction = same_material as f64 / columns as f64;
+        println!(
+            "sample_lod accuracy level {level}: top within ±1: {within_one}/{columns} = \
+             {height_fraction:.3}, same top material: {same_material}/{columns} = \
+             {material_fraction:.3}"
+        );
+        assert!(
+            height_fraction >= 0.95,
+            "level {level}: only {height_fraction:.3} of columns within ±1"
+        );
+        assert!(
+            material_fraction >= 0.90,
+            "level {level}: only {material_fraction:.3} of columns keep their material"
+        );
+    }
+}
+
+#[test]
+fn sample_lod_bounds_fast_paths_sample_nothing_and_never_generate() {
+    let generator = Generator::new(DEFAULT_SEED, blocks());
+    let samples = generator.lod_sample_calls();
+    let generates = generator.generate_calls();
+    for level in 1..=4u8 {
+        let air = generator.sample_lod(
+            level,
+            CubePos {
+                x: 0,
+                y: 100,
+                z: -3,
+            },
+        );
+        assert_eq!(air, Cube::default(), "air fast path at level {level}");
+        let stone = generator.sample_lod(
+            level,
+            CubePos {
+                x: 3,
+                y: -100,
+                z: -3,
+            },
+        );
+        assert_eq!(
+            stone,
+            Cube::filled(blocks().stone),
+            "stone fast path at level {level}"
+        );
+    }
+    assert_eq!(generator.lod_sample_calls(), samples, "no sampling ran");
+    assert_eq!(generator.generate_calls(), generates, "no generation ran");
+}
+
+// ---------------------------------------------------------------------
+// Content model: pending, no placeholder air, real data wins
+
+/// An inline pyramid with the fill pipeline: what the content-model tests
+/// drive directly.
+fn inline_pyramid(levels: u8, budget: usize) -> LodPyramid {
+    LodPyramid::with_workers(
+        levels,
+        Arc::new(Generator::new(DEFAULT_SEED, blocks())),
+        None,
+        0,
+        budget,
+    )
+}
+
+/// Pops every queued job: after this the pyramid holds no pending work.
+fn drain_pyramid(pyramid: &mut LodPyramid) {
+    let mut spins = 0;
+    loop {
+        pyramid.poll();
+        if pyramid.in_flight() == 0 {
+            break;
+        }
+        spins += 1;
+        assert!(
+            spins < 10_000,
+            "drain stuck with {} jobs",
+            pyramid.in_flight()
+        );
+    }
+}
+
+/// Asserts every cell of `octant` inside `got` equals `expected` (a cell
+/// probe at the octant's offset).
+fn assert_octant_equals(
+    got: &Cube,
+    octant: u8,
+    expected: impl Fn(LocalPos) -> BlockStateId,
+    what: &str,
+) {
+    let half = (CUBE_SIZE / 2) as usize;
+    let [ox, oy, oz] = octant_offset(octant).map(|v| v as usize * half);
+    for y in 0..half {
+        for z in 0..half {
+            for x in 0..half {
+                let cell = LocalPos::new_unchecked((ox + x) as u8, (oy + y) as u8, (oz + z) as u8);
+                assert_eq!(got.get(cell), expected(cell), "{what} at {cell:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn no_placeholder_air_half_visited_level_2_cube() {
+    // Visit the bottom half of a level-2 cube's footprint only, then ask
+    // for the cube: its unvisited octants equal the worldgen sample, its
+    // visited octants the downsample of the real level-1 children — which
+    // are themselves filled. Placeholder air appears nowhere.
+    let generator = Generator::new(DEFAULT_SEED, blocks());
+    let mut pyramid = inline_pyramid(2, 64);
+    let h = generator.surface_height(0, 0);
+    let level2 = CubePos {
+        x: 0,
+        y: (h >> 7) as i32,
+        z: 0,
+    };
+    let y0 = level2.y * 4;
+    // The bottom half: LOD0 y 0..2 of the level-2 cube's 4-cube-per-axis
+    // span — the four level-1 children with dy = 0, all eight octants real.
+    for dy in 0..2i32 {
+        for dx in 0..4i32 {
+            for dz in 0..4i32 {
+                let pos = CubePos {
+                    x: level2.x * 4 + dx,
+                    y: y0 + dy,
+                    z: level2.z * 4 + dz,
+                };
+                let cube = generator.generate(pos);
+                pyramid.insert_lod0(pos, &cube);
+            }
+        }
+    }
+    pyramid.request(2, level2);
+    drain_pyramid(&mut pyramid);
+
+    let lod2 = pyramid.ready(2, level2).expect("the level-2 cube is ready");
+    let sample = generator.sample_lod(2, level2);
+    let base = CubePos {
+        x: level2.x * 2,
+        y: level2.y * 2,
+        z: level2.z * 2,
+    };
+    for octant in 0..8u8 {
+        let [dx, dy, dz] = octant_offset(octant).map(i32::from);
+        let child = CubePos {
+            x: base.x + dx,
+            y: base.y + dy,
+            z: base.z + dz,
+        };
+        if dy == 0 {
+            // Visited: the downsample of the real, filled level-1 child.
+            let child_lod = pyramid
+                .ready(1, child)
+                .expect("the visited level-1 child is ready");
+            let mut want = Cube::filled(BlockStateId::AIR);
+            jbm_core::lod::downsample_octant(child_lod, &mut want, octant);
+            assert_octant_equals(
+                lod2,
+                octant,
+                |cell| want.get(cell),
+                "visited octant (real level-1 child)",
+            );
+        } else {
+            // Unvisited: the worldgen sample's octant.
+            let expected = sample.clone();
+            assert_octant_equals(
+                lod2,
+                octant,
+                move |cell| expected.get(cell),
+                "unvisited octant (worldgen sample)",
+            );
+        }
+    }
+}
+
+#[test]
+fn ready_is_none_while_pending_and_changed_reports_only_ready_cubes() {
+    let generator = Generator::new(DEFAULT_SEED, blocks());
+    let mut pyramid = inline_pyramid(4, 64);
+    let h = generator.surface_height(0, 0);
+    let pos = CubePos {
+        x: 3,
+        y: (h >> 5) as i32,
+        z: -2,
+    };
+    let cube = generator.generate(pos);
+    pyramid.insert_lod0(pos, &cube);
+    let (p1, _) = parent(pos);
+    let (p2, _) = parent(p1);
+    // The chain exists but nothing is ready, and nothing is reported.
+    assert!(pyramid.get(1, p1).is_some());
+    assert!(pyramid.ready(1, p1).is_none(), "one octant of eight");
+    assert!(pyramid.ready(2, p2).is_none());
+    assert!(pyramid.take_changed().is_empty());
+
+    // Fill the level-1 cube: it readies, and the deferral cascade fills
+    // the whole chain — each ancestor gains its real octant and is filled
+    // in turn, so every level becomes ready and reported.
+    pyramid.request(1, p1);
+    drain_pyramid(&mut pyramid);
+    assert!(pyramid.ready(1, p1).is_some());
+    let p3 = parent(p2).0;
+    let changed = pyramid.take_changed();
+    assert_eq!(
+        changed,
+        vec![(1, p1), (2, p2), (3, p3)],
+        "every readied level of the chain is reported"
+    );
+    for (level, cube_pos) in [(1, p1), (2, p2), (3, p3)] {
+        assert!(pyramid.ready(level, cube_pos).is_some());
+    }
+}
+
+#[test]
+fn an_edit_under_a_ready_level_3_cube_reaches_levels_1_to_3() {
+    let generator = Generator::new(DEFAULT_SEED, blocks());
+    let mut pyramid = inline_pyramid(3, 256);
+    let h = generator.surface_height(0, 0);
+    // One LOD0 cube on the surface; its chain runs to level 3. Requesting
+    // the level-3 cube fills everything the chain needs.
+    let pos = CubePos {
+        x: 0,
+        y: (h >> 5) as i32,
+        z: 0,
+    };
+    let mut cube = generator.generate(pos);
+    pyramid.insert_lod0(pos, &cube);
+    let p1 = parent(pos).0;
+    let p2 = parent(p1).0;
+    let p3 = parent(p2).0;
+    pyramid.request(3, p3);
+    drain_pyramid(&mut pyramid);
+    let chain = [p1, p2, p3];
+    for (level, &cube_pos) in chain.iter().enumerate() {
+        assert!(
+            pyramid.ready(level as u8 + 1, cube_pos).is_some(),
+            "level {} ready before the edit",
+            level + 1
+        );
+    }
+    // A material edit at the surface: the whole 2×2×2 group of the first
+    // grass block turns to planks (a single block could not outvote its
+    // group), so the level-1 cell flips. The edit must reach level 3 and
+    // be reported at every level.
+    let surface_local = (0..jbm_core::coords::CUBE_VOLUME)
+        .map(LocalPos::from_index)
+        .find(|&local| cube.get(local) == blocks().grass_block)
+        .expect("a grass block in the surface cube");
+    let group_base = (
+        surface_local.x & !1,
+        surface_local.y & !1,
+        surface_local.z & !1,
+    );
+    for dy in 0..2u8 {
+        for dz in 0..2u8 {
+            for dx in 0..2u8 {
+                let local = LocalPos::new_unchecked(
+                    group_base.0 + dx,
+                    group_base.1 + dy,
+                    group_base.2 + dz,
+                );
+                cube.set(local, blocks().oak_planks);
+                pyramid.edit_lod0(pos.block(local), &cube);
+            }
+        }
+    }
+    let changed = pyramid.take_changed();
+    for (level, &cube_pos) in chain.iter().enumerate() {
+        assert!(
+            changed.contains(&(level as u8 + 1, cube_pos)),
+            "level {} missing from {changed:?}",
+            level + 1
+        );
+    }
+    let world = pos.block(surface_local);
+    let (cube1, cell1) = lod_cell(1, world.x, world.y, world.z);
+    assert_eq!(cube1, p1);
+    assert_eq!(
+        pyramid.ready(1, cube1).unwrap().get(cell1),
+        blocks().oak_planks,
+        "the material edit must show at level 1"
+    );
+}
+
+#[test]
+fn real_data_wins_over_an_in_flight_sample() {
+    // Threaded, workers held: the sample job for the parent is in flight
+    // while the LOD0 cube lands. The real octant survives the merge.
+    let generator = Arc::new(Generator::new(DEFAULT_SEED, blocks()));
+    let mut pyramid = LodPyramid::with_workers(1, Arc::clone(&generator), None, 2, 0);
+    pyramid.hold_workers();
+    let h = generator.surface_height(0, 0);
+    let child = CubePos {
+        x: 0,
+        y: (h >> 5) as i32,
+        z: 0,
+    };
+    let (p1, octant) = parent(child);
+    pyramid.request(1, p1);
+    // Give the workers a moment to take the job, then insert real data.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let cube = generator.generate(child);
+    pyramid.insert_lod0(child, &cube);
+    pyramid.release_workers();
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    while pyramid.ready(1, p1).is_none() {
+        pyramid.poll();
+        assert!(Instant::now() < deadline, "the held job never finished");
+    }
+    let merged = pyramid.get(1, p1).unwrap();
+    assert_eq!(merged.known, 1 << octant, "the real octant survived");
+    assert_eq!(merged.filled, !(1 << octant), "the other seven are filled");
+    assert!(merged.ready());
+    // The real octant's content is the child's downsample, not the sample.
+    let mut expected = Cube::filled(BlockStateId::AIR);
+    jbm_core::lod::downsample_octant(&cube, &mut expected, octant);
+    let expected = expected;
+    assert_octant_equals(
+        &merged.cube,
+        octant,
+        |cell| expected.get(cell),
+        "the real octant is the child's downsample",
+    );
+}
+
+#[test]
+fn a_lod_job_panic_reaches_the_calling_thread() {
+    let mut pyramid = inline_pyramid(1, 8);
+    pyramid.fail_next_job();
+    pyramid.request(1, CubePos { x: 0, y: 0, z: 0 });
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pyramid.poll();
+    }));
+    assert!(panicked.is_err(), "the injected panic must surface");
+}
+
+#[test]
+fn drop_with_a_deep_lod_backlog_returns_promptly() {
+    let start = Instant::now();
+    {
+        let mut pyramid = LodPyramid::with_workers(
+            2,
+            Arc::new(Generator::new(DEFAULT_SEED, blocks())),
+            None,
+            2,
+            0,
+        );
+        for x in 0..64i32 {
+            for z in 0..64i32 {
+                pyramid.request(1, CubePos { x, y: 0, z });
+            }
+        }
+    }
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "pyramid drop with a deep backlog took {elapsed:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Stored LOD through the Server
+
+/// The default 2.6 disks around spawn: every level's
+/// `lod_view_radius`/`lod_vertical_radius` cube set, centered on spawn.
+fn ring_positions(generator: &Generator) -> Vec<(u8, CubePos)> {
+    let [sx, sy, sz] = generator.spawn();
+    let mut out = Vec::new();
+    for level in 1..=4u8 {
+        let shift = 5 + level as i64;
+        let (cx, cy, cz) = (
+            (sx as i64) >> shift,
+            (sy as i64) >> shift,
+            (sz as i64) >> shift,
+        );
+        let (r, v) = (8i64, 3i64);
+        for dy in -v..=v {
+            for dx in -r..=r {
+                for dz in -r..=r {
+                    if dx * dx + dz * dz <= r * r {
+                        out.push((
+                            level,
+                            CubePos {
+                                x: (cx + dx) as i32,
+                                y: (cy + dy) as i32,
+                                z: (cz + dz) as i32,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A persistence server in inline mode with a huge poll budget: one tick
+/// drains whatever is queued.
+fn lod_server(dir: &std::path::Path) -> Server {
+    Server::with_config(ServerConfig {
+        world_dir: Some(dir.to_owned()),
+        gen_threads: 0,
+        gen_budget_per_tick: 20_000,
+        ..ServerConfig::default()
+    })
+}
+
+/// Requests `rings` and ticks until every cube is ready. Returns how long
+/// that took.
+fn request_until_ready(server: &mut Server, rings: &[(u8, CubePos)]) -> std::time::Duration {
+    let start = Instant::now();
+    for &(level, pos) in rings {
+        server.request_lod(level, pos);
+    }
+    let deadline = Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        server.tick();
+        if rings
+            .iter()
+            .all(|&(level, pos)| server.lod_ready(level, pos).is_some())
+        {
+            return start.elapsed();
+        }
+        assert!(Instant::now() < deadline, "the rings never became ready");
+    }
+}
+
+#[test]
+fn stored_lod_reloads_without_sampling_and_unchanged() {
+    // The default rings around spawn: ready from worldgen once, then —
+    // after a flush and reopen — ready from storage alone, with zero
+    // samples, and cube for cube the same. Both times and the database
+    // size are printed for the task report.
+    let dir = tempfile::TempDir::new().unwrap();
+    let rings = {
+        let generator = Generator::new(DEFAULT_SEED, blocks());
+        ring_positions(&generator)
+    };
+    assert!(rings.len() > 1_000, "{} ring cubes", rings.len());
+
+    let before: std::collections::HashMap<_, _> = {
+        let mut server = lod_server(dir.path());
+        let from_worldgen = request_until_ready(&mut server, &rings);
+        println!(
+            "rings ready from worldgen: {from_worldgen:?} ({} cubes)",
+            rings.len()
+        );
+        assert!(server.lod_samples() > 0, "the first pass must sample");
+        let snapshot: std::collections::HashMap<_, _> = rings
+            .iter()
+            .map(|&(level, pos)| {
+                (
+                    (level, pos),
+                    server.lod_ready(level, pos).expect("ready").clone(),
+                )
+            })
+            .collect();
+        server.flush();
+        snapshot
+    }; // dropped: the flush above already persisted everything
+
+    let mut server = lod_server(dir.path());
+    let from_storage = request_until_ready(&mut server, &rings);
+    println!("rings ready from storage: {from_storage:?}");
+    assert_eq!(server.lod_samples(), 0, "a reload must not sample worldgen");
+    for &(level, pos) in &rings {
+        assert_eq!(
+            server.lod_ready(level, pos),
+            before
+                .get(&(level, pos))
+                .map(|cube| cube as &jbm_core::cube::Cube),
+            "the reloaded cube changed at ({level}, {pos:?})"
+        );
+    }
+    let storage = server.storage().expect("persistence on");
+    println!(
+        "database: {} bytes, {} LOD records, {} records total",
+        std::fs::metadata(storage.path()).unwrap().len(),
+        storage.lod_record_count().unwrap(),
+        storage.cube_count().unwrap()
+    );
+}
+
+#[test]
+fn edits_survive_in_lod_without_the_lod0_cube_loaded() {
+    // Edit a pillar, flush, reopen with no player (nothing loads LOD0),
+    // and ask for the ancestors: the edit shows from the stored LOD.
+    let dir = tempfile::TempDir::new().unwrap();
+    let ground = {
+        let mut server = Server::with_config(ServerConfig {
+            world_dir: Some(dir.path().to_owned()),
+            gen_threads: 0,
+            ..streaming_config()
+        });
+        let (mut client, server_end) = in_process_pair();
+        client
+            .send(ClientMsg::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                name: "editor".to_owned(),
+            })
+            .unwrap();
+        server.add_connection(server_end);
+        for _ in 0..100 {
+            server.tick();
+            drain(&mut client);
+        }
+        let ground = BlockPos {
+            x: 0,
+            y: surface_y(&server),
+            z: 0,
+        };
+        break_block(&mut server, &mut client, ground);
+        server.flush();
+        ground
+    };
+
+    let mut server = lod_server(dir.path());
+    assert_eq!(server.world_cube_count(), 0, "no LOD0 cube is loaded");
+    let (cube1, cell1) = lod_cell(1, ground.x, ground.y, ground.z);
+    server.request_lod(1, cube1);
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    while server.lod_ready(1, cube1).is_none() {
+        server.tick();
+        assert!(Instant::now() < deadline, "the level-1 cube never readied");
+    }
+    // The stored LOD0 cube (with the edit) downsamples to exactly the
+    // stored level-1 cell.
+    let storage = server.storage().unwrap();
+    let stored_lod0 = storage
+        .load(ground.split().0)
+        .unwrap()
+        .expect("stored LOD0");
+    let mut expected = Cube::filled(BlockStateId::AIR);
+    jbm_core::lod::downsample_octant(&stored_lod0, &mut expected, parent(ground.split().0).1);
+    let got = server.lod_ready(1, cube1).unwrap();
+    assert_eq!(
+        got.get(cell1),
+        expected.get(cell1),
+        "the edit must survive in the stored level-1 cube"
+    );
+}
+
+#[test]
+fn a_corrupt_lod_record_is_resampled_never_a_panic() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let pos = {
+        let generator = Generator::new(DEFAULT_SEED, blocks());
+        let h = generator.surface_height(0, 0);
+        CubePos {
+            x: 0,
+            y: (h >> 6) as i32,
+            z: 0,
+        }
+    };
+    {
+        let mut server = lod_server(dir.path());
+        server.request_lod(1, pos);
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while server.lod_ready(1, pos).is_none() {
+            server.tick();
+            assert!(Instant::now() < deadline);
+        }
+        server.flush();
+    }
+    // Tear the stored record, as a half-written batch would.
+    lod_server(dir.path())
+        .storage()
+        .unwrap()
+        .damage_lod_record(1, pos)
+        .unwrap();
+    let mut server = lod_server(dir.path());
+    server.request_lod(1, pos);
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    while server.lod_ready(1, pos).is_none() {
+        server.tick(); // the corrupt record is logged, the cube resampled
+        assert!(
+            Instant::now() < deadline,
+            "the corrupt record stalled the fill"
+        );
+    }
+    assert!(server.lod_ready(1, pos).is_some());
+}
+
+#[test]
+fn far_terrain_needs_no_full_detail() {
+    // With a slice of the rings ready around spawn (every eighth cube, all
+    // levels — the full-ring pass is the reload test's job), the server
+    // holds exactly the LOD0 cubes streaming alone loads: LOD jobs never
+    // generate LOD0.
+    let generator = Generator::new(DEFAULT_SEED, blocks());
+    let rings: Vec<_> = ring_positions(&generator).into_iter().step_by(8).collect();
+    assert!(rings.len() > 500, "{} ring cubes", rings.len());
+
+    let mut lodless = Server::with_config(ServerConfig {
+        lod_levels: 0,
+        gen_threads: 0,
+        ..streaming_config()
+    });
+    let (mut client, server_end) = in_process_pair();
+    client
+        .send(ClientMsg::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            name: "baseline".to_owned(),
+        })
+        .unwrap();
+    lodless.add_connection(server_end);
+    for _ in 0..300 {
+        lodless.tick();
+        drain(&mut client);
+    }
+    let baseline = lodless.world_cube_count();
+    drop(client);
+    drop(lodless);
+    assert!(baseline > 1);
+
+    let mut server = Server::with_config(ServerConfig {
+        gen_threads: 0,
+        ..streaming_config()
+    });
+    let (mut client, server_end) = in_process_pair();
+    client
+        .send(ClientMsg::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            name: "far-view".to_owned(),
+        })
+        .unwrap();
+    server.add_connection(server_end);
+    for _ in 0..300 {
+        server.tick();
+        drain(&mut client);
+    }
+    let _ = request_until_ready(&mut server, &rings);
+    assert_eq!(
+        server.world_cube_count(),
+        baseline,
+        "the far terrain loaded extra LOD0 cubes"
+    );
+    assert!(
+        server.lod_cube_count() > 0,
+        "the pyramid holds the far view"
+    );
+}
+
+#[test]
+fn lod0_generation_is_not_delayed_by_a_lod_backlog() {
+    // The LOD workers are held with a deep LOD backlog queued; LOD0
+    // streaming (a separate pool) still settles within a few ticks.
+    let mut server = Server::with_config(ServerConfig {
+        gen_threads: 2,
+        view_radius: 3,
+        vertical_radius: 1,
+        ..streaming_config()
+    });
+    server.lod_pyramid().hold_workers();
+    let generator = Generator::new(DEFAULT_SEED, blocks());
+    for (level, pos) in ring_positions(&generator).into_iter().take(600) {
+        server.request_lod(level, pos);
+    }
+    assert!(server.lod_in_flight() > 500, "the backlog is queued");
+    let (mut client, server_end) = in_process_pair();
+    client
+        .send(ClientMsg::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            name: "walker".to_owned(),
+        })
+        .unwrap();
+    server.add_connection(server_end);
+    // The small view streams in full while the LOD jobs are stuck (the
+    // workers are held, not busy): a few LOD0 generations' worth of
+    // ticks, well inside what the backlog could ever delay.
+    // The desired set is a disk (dx² + dz² ≤ r²), |dy| ≤ v: 29 columns
+    // of 3 cubes for r = 3, v = 1.
+    let columns = (-3i32..=3)
+        .flat_map(|dx| (-3i32..=3).map(move |dz| (dx, dz)))
+        .filter(|(dx, dz)| dx * dx + dz * dz <= 9)
+        .count();
+    let desired = columns * 3;
+    let deadline = Instant::now() + std::time::Duration::from_secs(60);
+    while server.world_cube_count() < desired {
+        server.tick();
+        drain(&mut client);
+        // Yield: the generation workers, not this loop, do the work.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert!(
+            Instant::now() < deadline,
+            "LOD0 streaming starved by the LOD backlog: {} of {desired}",
+            server.world_cube_count()
+        );
+    }
+    assert!(server.lod_in_flight() > 0, "the backlog is still held");
+    server.lod_pyramid().release_workers();
+}
+
+// ---------------------------------------------------------------------
+// Kill during save (task 2.7's stored-LOD half, as 2.3's crash test)
+
+/// The child role selector; without it the children do nothing.
+const KILL_CHILD_VAR: &str = "JBM_LOD_KILL_CHILD";
+const KILL_DIR_VAR: &str = "JBM_LOD_KILL_WORLD_DIR";
+
+/// Runs this test binary as the kill child on `dir`, waits for its
+/// "started" line, and returns it.
+fn spawn_kill_child(dir: &std::path::Path) -> std::process::Child {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    let exe = std::env::current_exe().expect("current test binary");
+    let mut child = Command::new(exe)
+        .arg("lod_kill_child")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(KILL_CHILD_VAR, "1")
+        .env(KILL_DIR_VAR, dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning the kill child");
+    {
+        let stdout = child.stdout.take().expect("piped stdout");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            while let Ok(n) = reader.read_line(&mut line) {
+                if n == 0 {
+                    break;
+                }
+                if line.trim() == "started" {
+                    let _ = tx.send(());
+                    break;
+                }
+                line.clear();
+            }
+        });
+        let deadline = Instant::now() + std::time::Duration::from_secs(20);
+        while rx.try_recv().is_err() {
+            assert!(Instant::now() < deadline, "child never reported startup");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+    child
+}
+
+#[test]
+#[cfg(unix)]
+fn kill_during_save_leaves_lod_records_consistent_with_lod0() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut child = spawn_kill_child(dir.path());
+    std::thread::sleep(std::time::Duration::from_millis(147));
+    child.kill().expect("SIGKILL the child");
+    let _ = child.wait();
+
+    // The world reopens, every stored LOD record decodes, and every real
+    // octant whose LOD0 cube is also stored agrees with its downsample.
+    let server = lod_server(dir.path());
+    let storage = server.storage().expect("persistence on");
+    let lod_keys = storage.lod_positions().expect("lod positions");
+    assert!(!lod_keys.is_empty(), "some LOD records were committed");
+    for (level, pos) in &lod_keys {
+        let (cube, _known) = storage
+            .load_lod(*level, *pos)
+            .unwrap_or_else(|e| panic!("LOD {level} {pos:?} failed to decode: {e}"))
+            .unwrap_or_else(|| panic!("LOD {level} {pos:?} vanished"));
+        if *level == 1 {
+            for octant in 0..8u8 {
+                let [dx, dy, dz] = octant_offset(octant).map(i32::from);
+                let child = CubePos {
+                    x: pos.x * 2 + dx,
+                    y: pos.y * 2 + dy,
+                    z: pos.z * 2 + dz,
+                };
+                if let Some(lod0) = storage.load(child).expect("lod0 load") {
+                    let mut expected = Cube::filled(BlockStateId::AIR);
+                    jbm_core::lod::downsample_octant(&lod0, &mut expected, octant);
+                    assert_octant_equals(
+                        &cube,
+                        octant,
+                        |cell| expected.get(cell),
+                        "stored LOD disagrees with stored LOD0",
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn lod_kill_child() {
+    // The child role: settle a streaming player, make an edit, ask for a
+    // few LOD cubes, then tick (and save) until killed.
+    if std::env::var(KILL_CHILD_VAR).as_deref() != Ok("1") {
+        return;
+    }
+    use std::io::Write as _;
+    let dir = std::env::var(KILL_DIR_VAR).expect("child gets the world dir");
+    let mut server = Server::with_config(ServerConfig {
+        world_dir: Some(std::path::PathBuf::from(dir)),
+        save_interval: std::time::Duration::from_millis(50),
+        view_radius: 2,
+        vertical_radius: 1,
+        gen_threads: 0,
+        gen_budget_per_tick: 512,
+        ..ServerConfig::default()
+    });
+    let (mut client, server_end) = in_process_pair();
+    client
+        .send(ClientMsg::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            name: "killer".to_owned(),
+        })
+        .unwrap();
+    server.add_connection(server_end);
+    for _ in 0..100 {
+        server.tick();
+        drain(&mut client);
+    }
+    let ground = BlockPos {
+        x: 0,
+        y: surface_y(&server),
+        z: 0,
+    };
+    break_block(&mut server, &mut client, ground);
+    let generator = Generator::new(DEFAULT_SEED, blocks());
+    let h = generator.surface_height(0, 0);
+    for level in 1..=4u8 {
+        let shift = 5 + level as i64;
+        server.request_lod(
+            level,
+            CubePos {
+                x: 0,
+                y: (h >> shift) as i32,
+                z: 0,
+            },
+        );
+    }
+    println!("started");
+    std::io::stdout().flush().unwrap();
+    loop {
+        server.tick();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }

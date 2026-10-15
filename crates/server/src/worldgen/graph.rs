@@ -519,6 +519,96 @@ enum Op {
 }
 
 impl Op {
+    /// Feeds the op's discriminant, operands and float payloads (as bit
+    /// patterns) to `hasher` — the fingerprint's per-instruction half.
+    /// Every variant carries its own tag, so two different op kinds never
+    /// hash alike.
+    fn feed(&self, mut hasher: impl std::hash::Hasher) {
+        use std::hash::Hash;
+        macro_rules! tag {
+            ($n:literal) => {
+                $n.hash(&mut hasher)
+            };
+        }
+        match self {
+            Op::X => tag!(0),
+            Op::Y => tag!(1),
+            Op::Z => tag!(2),
+            Op::Add(a, b) => {
+                tag!(3);
+                a.hash(&mut hasher);
+                b.hash(&mut hasher);
+            }
+            Op::Sub(a, b) => {
+                tag!(4);
+                a.hash(&mut hasher);
+                b.hash(&mut hasher);
+            }
+            Op::Mul(a, b) => {
+                tag!(5);
+                a.hash(&mut hasher);
+                b.hash(&mut hasher);
+            }
+            Op::Neg(a) => {
+                tag!(6);
+                a.hash(&mut hasher);
+            }
+            Op::Min(a, b) => {
+                tag!(7);
+                a.hash(&mut hasher);
+                b.hash(&mut hasher);
+            }
+            Op::Max(a, b) => {
+                tag!(8);
+                a.hash(&mut hasher);
+                b.hash(&mut hasher);
+            }
+            Op::Abs(a) => {
+                tag!(9);
+                a.hash(&mut hasher);
+            }
+            Op::Floor(a) => {
+                tag!(10);
+                a.hash(&mut hasher);
+            }
+            Op::Clamp { input, min, max } => {
+                tag!(11);
+                input.hash(&mut hasher);
+                min.hash(&mut hasher);
+                max.hash(&mut hasher);
+            }
+            Op::Noise2 {
+                salt,
+                x_scale,
+                z_scale,
+            } => {
+                tag!(12);
+                salt.hash(&mut hasher);
+                x_scale.to_bits().hash(&mut hasher);
+                z_scale.to_bits().hash(&mut hasher);
+            }
+            Op::Fbm2 {
+                salt,
+                scale,
+                octaves,
+            } => {
+                tag!(13);
+                salt.hash(&mut hasher);
+                scale.to_bits().hash(&mut hasher);
+                octaves.hash(&mut hasher);
+            }
+            Op::Spline { input, points } => {
+                tag!(14);
+                input.hash(&mut hasher);
+                points.len().hash(&mut hasher);
+                for &(x, y) in points.iter() {
+                    x.to_bits().hash(&mut hasher);
+                    y.to_bits().hash(&mut hasher);
+                }
+            }
+        }
+    }
+
     /// Register operands, in evaluation-irrelevant order. Compile-time only.
     fn operands(&self) -> Vec<u32> {
         match self {
@@ -1068,6 +1158,38 @@ impl CompiledGraph {
     /// The solidity band ([`Band`]) if the interval bounds prove one.
     pub fn band(&self) -> Option<&Band> {
         self.band.as_ref()
+    }
+
+    /// A deterministic fingerprint of the compiled graph: equal graphs
+    /// (same instructions, constants, salts and spline points, bit for bit)
+    /// hash equal, and any edit to the graph changes it with overwhelming
+    /// probability. Persistence (task 2.7) stores it mixed with the world
+    /// seed so a changed worldgen invalidates stored LOD without touching
+    /// stored LOD0 records. `DefaultHasher` is seeded with fixed keys, so
+    /// the value is stable across runs and platforms (f64s enter as their
+    /// bit patterns).
+    pub fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.const_values.len().hash(&mut hasher);
+        for &value in &self.const_values {
+            value.to_bits().hash(&mut hasher);
+        }
+        self.xz_ops.len().hash(&mut hasher);
+        for op in &self.xz_ops {
+            op.feed(&mut hasher);
+        }
+        self.xyz_ops.len().hash(&mut hasher);
+        for op in &self.xyz_ops {
+            op.feed(&mut hasher);
+        }
+        self.output.hash(&mut hasher);
+        self.live_xz.hash(&mut hasher);
+        match &self.band {
+            None => 0u8.hash(&mut hasher),
+            Some(band) => (band.low(), band.high(), band.rows()).hash(&mut hasher),
+        }
+        hasher.finish()
     }
 
     /// Prepares `regs` with the folded constants and, optionally, cached
