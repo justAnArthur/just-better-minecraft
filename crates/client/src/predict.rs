@@ -78,9 +78,14 @@ impl Predictor {
 
     /// Applies an authoritative state: trims acknowledged inputs, replays
     /// the rest on top of it, and counts a correction if the replay
-    /// disagrees with the prediction. Corrections snap — both the state
-    /// and the render interpolation's previous state jump to the replayed
-    /// result. Smoothing the snap is a later task.
+    /// disagrees with the prediction.
+    ///
+    /// An agreeing ack (the normal case, every tick) must not touch the
+    /// render interpolation: resetting `prev` there made the camera jump
+    /// to the newest tick on every ack, a 20 Hz stutter. A correction
+    /// moves both endpoints by the correction offset, so the rendered
+    /// motion keeps its shape and only the error itself shows as a snap.
+    /// Smoothing that snap is a later task.
     pub fn on_server_state(&mut self, ack_seq: u64, state: PlayerState, world: &impl BlockShapes) {
         while self.pending.front().is_some_and(|(seq, _)| *seq <= ack_seq) {
             self.pending.pop_front();
@@ -91,9 +96,9 @@ impl Predictor {
         }
         if replayed != self.state {
             self.corrections += 1;
+            self.prev.position += replayed.position - self.state.position;
+            self.state = replayed;
         }
-        self.state = replayed;
-        self.prev = replayed;
     }
 
     /// The current predicted state.
@@ -242,5 +247,58 @@ mod tests {
         // At alpha 1 the eye sits at the current state's eye.
         let m = predictor.state();
         assert_eq!(predictor.render_position(1.0), m.eye());
+    }
+
+    #[test]
+    fn an_agreeing_ack_leaves_render_interpolation_alone() {
+        let floor = Floor { top: 64 };
+        let mut predictor = Predictor::new(DVec3::new(0.5, 64.0, 0.5));
+        let walk = MoveInput {
+            forward: 1,
+            ..MoveInput::IDLE
+        };
+        // A server that agrees: it steps the same inputs from the same start.
+        let mut server = predictor.state();
+        for _ in 0..3 {
+            predictor.tick(walk, &floor);
+            server = physics::step(server, &walk, &floor);
+        }
+        let before = predictor.render_position(0.5);
+        predictor.on_server_state(2, physics_state_after(2, walk, &floor), &floor);
+        assert_eq!(predictor.corrections(), 0);
+        assert_eq!(predictor.state(), server);
+        assert_eq!(predictor.render_position(0.5), before);
+    }
+
+    #[test]
+    fn a_correction_shifts_both_interpolation_endpoints() {
+        let floor = Floor { top: 64 };
+        let mut predictor = Predictor::new(DVec3::new(0.5, 64.0, 0.5));
+        let walk = MoveInput {
+            forward: 1,
+            ..MoveInput::IDLE
+        };
+        predictor.tick(walk, &floor);
+        predictor.tick(walk, &floor);
+        let before_mid = predictor.render_position(0.5);
+        let before_end = predictor.render_position(1.0);
+        // The server says tick 1 ended one block further along +X.
+        let mut off = physics_state_after(1, walk, &floor);
+        off.position.x += 1.0;
+        predictor.on_server_state(1, off, &floor);
+        assert_eq!(predictor.corrections(), 1);
+        let shift = predictor.render_position(1.0) - before_end;
+        assert!((shift - DVec3::X).length() < 1e-9, "{shift:?}");
+        let mid_shift = predictor.render_position(0.5) - before_mid;
+        assert!((mid_shift - DVec3::X).length() < 1e-9, "{mid_shift:?}");
+    }
+
+    /// The state after `n` steps of `input` from the predictor's spawn.
+    fn physics_state_after(n: usize, input: MoveInput, world: &Floor) -> PlayerState {
+        let mut state = Predictor::new(DVec3::new(0.5, 64.0, 0.5)).state();
+        for _ in 0..n {
+            state = physics::step(state, &input, world);
+        }
+        state
     }
 }

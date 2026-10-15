@@ -2,7 +2,7 @@
 
 ## Next up
 
-Stage 1 gate: the user plays the wave C build (walk, jump, fly with F, break with left click, place with right click, hotbar 1–9). Then `/clear` and start Stage 2 wave A.
+Stage 2 · Far view, wave A: 2.1 declarative worldgen (density graph), 2.2 GPU buffer suballocator + multi-draw indirect, 2.3 redb persistence. Specs not written yet. Start with `/clear`.
 
 ## Benchmarks
 
@@ -95,3 +95,4 @@ Baselines are bench worker runs on an otherwise idle machine. Run-to-run noise o
   - `Arc::make_mut` in `set_block`;
   - released held edit buttons on focus loss and Esc;
   - fixed clippy errors and wrote the READMEs.
+- Stage 1 gate passed: the user played the wave C build (walk, fly, break, place). Movement stuttered at 20 Hz because every server ack reset the render interpolation; fixed in fix/interp-snap (agreeing acks leave it alone, corrections shift both endpoints). The user confirmed it is smooth.
