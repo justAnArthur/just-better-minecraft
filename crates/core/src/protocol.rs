@@ -10,13 +10,14 @@
 //!   them directly.
 //! - No serde yet; serialization arrives with the network transport.
 
-use crate::coords::CubePos;
+use crate::block::BlockStateId;
+use crate::coords::{BlockPos, CubePos};
 use crate::cube::Cube;
 use crate::physics::{MoveInput, PlayerState};
 
 /// Version of the client/server protocol. A `Hello` carrying any other
 /// version is rejected.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Identifies a joined player inside one server. Ids start at 1 and count up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -38,6 +39,13 @@ pub enum ClientMsg {
     },
     /// Round-trip latency probe; answered by [`ServerMsg::Pong`].
     Ping { nonce: u64 },
+    /// Break the block at `pos` (task 1.7). Sent after the client's
+    /// optimistic edit; the server validates and reverts rejections.
+    BreakBlock { pos: BlockPos },
+    /// Place `state` into the air cell at `pos`. `pos` is the cell being
+    /// filled — the client computes it as the hit block plus the hit
+    /// face's normal.
+    PlaceBlock { pos: BlockPos, state: BlockStateId },
     /// Polite goodbye; the server removes the player on the next tick.
     Disconnect,
 }
@@ -73,4 +81,9 @@ pub enum ServerMsg {
     CubeData { pos: CubePos, cube: Box<Cube> },
     /// The cube left the player's range; the client drops it and its mesh.
     UnloadCube { pos: CubePos },
+    /// The authoritative state of one block (task 1.7): an accepted edit
+    /// broadcast to every player with the cube loaded, or the revert of a
+    /// rejected edit sent to its sender only. Sent in phase 5 before the
+    /// streaming pass and the `Tick`, so edits land within one tick.
+    BlockChange { pos: BlockPos, state: BlockStateId },
 }

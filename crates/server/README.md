@@ -137,9 +137,33 @@ offset list, so nothing is scanned. Unload scans and world eviction run
 only when something changed (a player moved or left, results arrived).
 
 **Eviction:** cubes are dropped from server memory when no player's keep
-set contains them. Regeneration is exact, so this is lossless — for now.
-**Task 1.7 must pin edited cubes (or they will be lost on walk-away) until
-persistence lands in 2.3.**
+set contains them, except pinned (edited) cubes, which are never evicted.
+Unedited cubes regenerate exactly, so dropping them is lossless. Pinned
+cubes grow without bound until persistence lands in 2.3. Generation
+results never overwrite a cube already in the world (`entry().or_insert`),
+so an edit cannot be clobbered by a late generation result.
+
+## Block edits (task 1.7)
+
+`BreakBlock` and `PlaceBlock` are handled in phase 1, in message order,
+against the player's authoritative `PlayerState` at that moment. An edit
+is accepted only when:
+
+- the block's cube is in the server world;
+- the block center is within `REACH + 1.0` of the player's eye (the
+  margin covers latency);
+- break: the block is not air;
+- place: the target is air, the state is registered and not air, and a
+  solid state's unit box does not strictly overlap any joined player.
+
+An accepted edit sets the block, pins its cube and queues a `BlockChange`
+for everyone. A rejected one queues a `BlockChange` with the current
+state to the sender only, reverting their optimistic edit; rejections
+never disconnect. In phase 5, queued changes go out before the streaming
+pass and before `Tick`, to each player whose sent set holds the cube, so
+an edit reaches every nearby client within the tick it was made. A cube
+first sent later in the same tick already contains the edit, so it is
+never stale. Test reads: `pinned_count()`, `block(pos)`.
 
 **Disconnect:** the player's sent-set is freed and its cubes are evicted
 on the next tick unless another player keeps them.

@@ -157,6 +157,27 @@ their `MeshInput` and version. A mesh result older than the cube's
 current version is stale and dropped (a newer version implies a newer
 dirty entry).
 
+**Edits (task 1.7):** `set_block` (optimistic) and `BlockChange`
+(authoritative) set one block and dirty its cube plus every loaded
+neighbor the block touches through a face, edge or corner (x == 0 dirties
+−X, x == CUBE_SIZE−1 dirties +X, and so on: up to 7 neighbors). All of
+those go into a priority set that `take_dirty` drains first, nearest
+first, before streaming dirt; a late neighbor would show a hole. Setting
+a block to its current state dirties nothing, so the server's echo of an
+accepted edit costs no re-mesh. `Arc::make_mut` copies the cube only
+while a mesh job still holds the old one.
+
+**Edit flow:** each frame the app raycasts from the camera (the rendered
+eye, so the crosshair matches what is drawn) up to `REACH` against
+`ClientWorld`. Left button breaks the target: optimistic air, then
+`BreakBlock`. Right button places the hotbar block at target + face
+normal when that cell is loaded, air, and (for solid states) clear of
+the predicted player box: optimistic set, then `PlaceBlock`. Held
+buttons repeat every 0.25 s; the first press acts at once. A rejected
+edit comes back as a `BlockChange` with the real state and is reverted
+like any other change. Hotbar, repeat timers and the place decision live
+in `edit.rs`, winit-free and unit-tested.
+
 ### Terrain rendering
 
 Per meshed cube: one storage buffer of `PackedFace`s, one bind group, one
@@ -276,7 +297,9 @@ Above the horizon the color rises from horizon pale to zenith blue with
 | Ctrl | Sprint (walk 5.6, fly 22 blocks/s) |
 | F | Toggle fly (one edge per press) |
 | Mouse | Look (while cursor grabbed) |
-| Left click | Grab + hide cursor (Locked, falls back to Confined) |
+| Left click | Grab + hide cursor (Locked, falls back to Confined); once grabbed, break the target block (hold to repeat every 0.25 s) |
+| Right click | Place the hotbar block against the targeted face (hold to repeat) |
+| 1–9 | Hotbar: stone, dirt, grass_block, sand, glass, oak_planks, oak_log, leaves, water |
 | Esc | Release cursor; a second Esc quits |
 
 `JBM_VSYNC=0` switches the surface from `AutoVsync` to `AutoNoVsync`.
@@ -289,8 +312,16 @@ quads (integer scale, 2× by default) with alpha blending: white text on a
 semi-transparent dark box per line. `FrameStats` averages FPS / frame ms
 over a sliding 0.5 s window (pure logic, unit-tested). The app fills the
 lines `FPS`, `XYZ` (2 decimals), `CUBE` (32-block cube coordinates),
-`YAW`/`PITCH` in degrees, `CUBES`/`MESHED`/`PENDING` and
-`FACES`/`DRAWS`.
+`YAW`/`PITCH` in degrees, `CUBES`/`MESHED`/`PENDING`,
+`FACES`/`DRAWS`, `TARGET` (block position and state name) and `HOTBAR`.
+Whenever an overlay is drawn, a centered crosshair (white with a dark
+outline) is drawn too.
+
+**Target outline:** `render/outline.rs` draws a line-list box around the
+targeted block, expanded by 0.002, depth-tested, 60% black. Lines get no
+depth bias, so the shader pulls each vertex 0.2% of its distance toward
+the camera; without that the edges z-fought into dashes against
+coplanar neighbor faces.
 
 ## Screenshot tests
 

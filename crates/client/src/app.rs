@@ -8,11 +8,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use glam::DVec3;
-use jbm_core::block::{BlockRegistry, builtin};
+use jbm_core::block::{BlockRegistry, BlockStateId, builtin};
 use jbm_core::coords::CUBE_SIZE;
 use jbm_core::link::ClientLink;
 use jbm_core::physics::TICK_DT;
 use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION, ServerMsg};
+use jbm_core::raycast::{REACH, RayHit, raycast};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -20,6 +21,7 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
 use crate::camera::Camera;
+use crate::edit::{Hotbar, Repeat, place_target};
 use crate::gpu::Gpu;
 use crate::input::{InputState, Key as MoveKey, apply_mouse_look, move_input};
 use crate::mesh::appearance::BlockAppearance;
@@ -97,6 +99,15 @@ struct App {
     /// Set when the server refused, disconnected or the link closed; the
     /// loop exits cleanly after the current frame.
     fatal: Option<String>,
+    /// Block editing (task 1.7): hold-to-repeat timers per button and the
+    /// 9-slot hotbar. `frame_time` is the monotonic seconds counter the
+    /// timers run on.
+    edit_break: Repeat,
+    edit_place: Repeat,
+    hotbar: Hotbar,
+    frame_time: f64,
+    /// The registry, kept for state-name lookups in the overlay.
+    registry: Arc<BlockRegistry>,
 }
 
 impl App {
@@ -131,6 +142,11 @@ impl App {
             in_flight: 0,
             joined: false,
             fatal: None,
+            edit_break: Repeat::new(),
+            edit_place: Repeat::new(),
+            hotbar: Hotbar::new(),
+            frame_time: 0.0,
+            registry: Arc::new(registry),
         }
     }
 
@@ -230,7 +246,9 @@ impl App {
                         self.fatal = Some(reason.clone());
                         return;
                     }
-                    ServerMsg::CubeData { .. } | ServerMsg::UnloadCube { .. } => {
+                    ServerMsg::CubeData { .. }
+                    | ServerMsg::UnloadCube { .. }
+                    | ServerMsg::BlockChange { .. } => {
                         if let crate::world::WorldChange::Unloaded(pos) = self.world.apply(&msg) {
                             w.terrain.remove(pos);
                         }
@@ -275,6 +293,58 @@ impl App {
         }
     }
 
+    /// The block under the crosshair: a ray from the predicted eye along
+    /// the camera forward vector, up to `REACH`, against the client world
+    /// (`StateInfo::solid` decides what is targetable; unloaded space
+    /// stops the ray). `None` while not joined or the cursor is free.
+    fn target_block(&self) -> Option<RayHit> {
+        if !self.joined || !self.cursor_grabbed {
+            return None;
+        }
+        let dir = DVec3::from(self.camera.forward());
+        raycast(self.camera.position, dir, REACH, |pos| {
+            self.world
+                .block(pos)
+                .map(|state| self.world.is_solid_state(state))
+        })
+    }
+
+    /// Fires due edit buttons against `target`: the optimistic edit lands
+    /// in the world immediately (dirty with priority) and the message goes
+    /// to the server, which validates and reverts on rejection.
+    fn pump_edits(&mut self, target: Option<RayHit>) {
+        let break_due = self.edit_break.due(self.frame_time);
+        if break_due {
+            self.edit_break.fired(self.frame_time);
+        }
+        let place_due = self.edit_place.due(self.frame_time);
+        if place_due {
+            self.edit_place.fired(self.frame_time);
+        }
+        if break_due && let Some(hit) = target {
+            self.world.set_block(hit.block, BlockStateId::AIR);
+            self.send_edit(ClientMsg::BreakBlock { pos: hit.block });
+        }
+        if place_due
+            && let Some(hit) = target
+            && let Some(aabb) = self.predictor.as_ref().map(|p| p.state().aabb())
+        {
+            let state = self.hotbar.state();
+            if let Some(pos) = place_target(&hit, state, &self.world, &aabb) {
+                self.world.set_block(pos, state);
+                self.send_edit(ClientMsg::PlaceBlock { pos, state });
+            }
+        }
+    }
+
+    /// Sends an edit message; a closed link ends the loop.
+    fn send_edit(&mut self, msg: ClientMsg) {
+        if let Err(err) = self.link.send(msg) {
+            eprintln!("cannot send edit, server link closed: {err}");
+            self.fatal = Some(err.to_string());
+        }
+    }
+
     /// Submits dirty cubes to the pool and receives finished meshes,
     /// uploading at most [`UPLOAD_BUDGET`] of them. Stale results (the
     /// cube changed again) are dropped.
@@ -308,6 +378,7 @@ impl App {
             .unwrap_or(Duration::ZERO);
         self.stats.push(dt);
         let dt = Duration::from_secs_f32(dt.as_secs_f32().min(MAX_DT));
+        self.frame_time += dt.as_secs_f64();
 
         // Mouse look stays per frame; movement is sampled per sim tick.
         apply_mouse_look(&mut self.camera, &self.input);
@@ -331,6 +402,8 @@ impl App {
         }
 
         self.pump_link(w);
+        let target = self.target_block();
+        self.pump_edits(target);
         self.pump_meshing(w);
 
         let mut overlay = OverlayText::new();
@@ -351,6 +424,23 @@ impl App {
             "YAW {:.1} PITCH {:.1}",
             self.camera.yaw.to_degrees(),
             self.camera.pitch.to_degrees()
+        ));
+        if let Some(hit) = target
+            && let Some(state) = self.world.block(hit.block)
+        {
+            overlay.push(format!(
+                "TARGET {} {} {} {}",
+                hit.block.x,
+                hit.block.y,
+                hit.block.z,
+                self.registry.info(state).name
+            ));
+        } else {
+            overlay.push("TARGET ---".to_string());
+        }
+        overlay.push(format!(
+            "HOTBAR {}",
+            self.registry.info(self.hotbar.state()).name
         ));
         if let Some(predictor) = &self.predictor {
             let state = predictor.state();
@@ -417,6 +507,7 @@ impl App {
             &self.camera,
             Some(&overlay),
             Some(&mut w.terrain),
+            target.map(|hit| hit.block),
         );
         w.gpu.queue.present(frame);
         if !self.occluded {
@@ -499,8 +590,11 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::Focused(false) => {
-                // Do not keep moving when the window loses focus mid-press.
+                // Do not keep moving or editing when the window loses
+                // focus mid-press: the release event never arrives.
                 self.input.clear_keys();
+                self.edit_break.set_held(false);
+                self.edit_place.set_held(false);
                 if self.cursor_grabbed {
                     release_cursor(&w.window);
                     self.cursor_grabbed = false;
@@ -513,6 +607,8 @@ impl ApplicationHandler for App {
                         if self.cursor_grabbed {
                             release_cursor(&w.window);
                             self.cursor_grabbed = false;
+                            self.edit_break.set_held(false);
+                            self.edit_place.set_held(false);
                         } else {
                             event_loop.exit();
                         }
@@ -523,6 +619,17 @@ impl ApplicationHandler for App {
                         if pressed && matches!(key, Key::Character(c) if c.to_lowercase() == "f") {
                             self.input.press_fly_toggle();
                         }
+                        // Keys 1-9 select a hotbar slot (task 1.7).
+                        if pressed
+                            && let Key::Character(c) = key
+                            && let Some(slot) = c
+                                .as_str()
+                                .chars()
+                                .next()
+                                .and_then(|ch| ch.to_digit(10).filter(|d| (1..=9).contains(d)))
+                        {
+                            self.hotbar.select(slot as usize - 1);
+                        }
                         if let Some(mk) = map_key(key) {
                             self.input.set_key(mk, pressed);
                         }
@@ -530,11 +637,18 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if state == ElementState::Pressed
-                    && button == MouseButton::Left
-                    && !self.cursor_grabbed
-                {
-                    self.cursor_grabbed = grab_cursor(&w.window);
+                let pressed = state == ElementState::Pressed;
+                match button {
+                    // While the cursor is free, the first left click grabs
+                    // it and does nothing else.
+                    MouseButton::Left if !self.cursor_grabbed => {
+                        if pressed {
+                            self.cursor_grabbed = grab_cursor(&w.window);
+                        }
+                    }
+                    MouseButton::Left => self.edit_break.set_held(pressed),
+                    MouseButton::Right => self.edit_place.set_held(pressed),
+                    _ => {}
                 }
             }
             WindowEvent::Occluded(occluded) => {

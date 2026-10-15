@@ -156,6 +156,14 @@ const PAD: u32 = 2;
 const BG_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.55];
 const TEXT_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 
+/// Crosshair geometry in pixels: white arms over a dark outline, so it
+/// reads on both sky and terrain.
+const CROSS_ARM: f32 = 6.0;
+const CROSS_THICK: f32 = 2.0;
+const CROSS_OUTLINE: f32 = 1.0;
+const CROSS_DARK: [f32; 4] = [0.0, 0.0, 0.0, 0.7];
+const CROSS_WHITE: [f32; 4] = [1.0, 1.0, 1.0, 0.9];
+
 impl OverlayRenderer {
     pub fn new(
         gpu: &Gpu,
@@ -332,21 +340,30 @@ impl OverlayRenderer {
     }
 
     /// Lays out `text` and records the overlay draw into `encoder`.
-    /// The pass loads the existing color (drawn on top of the sky).
+    /// The pass loads the existing color (drawn on top of the sky) and
+    /// also draws the crosshair: a small centered white cross with a dark
+    /// outline, visible on both sky and terrain. `viewport` is the target
+    /// size in pixels (crosshair centering).
     pub fn draw(
         &mut self,
         gpu: &Gpu,
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         uniforms: &wgpu::BindGroup,
+        viewport: (u32, u32),
         text: &OverlayText,
     ) {
-        let instances = self.layout(text);
+        let (boxes, glyphs) = self.layout(text);
+        // Solid quads: line boxes then the crosshair (dark bars under
+        // white arms). Glyph quads follow.
+        let mut instances = boxes;
+        let solid_count = instances.len() as u32 + 4;
+        instances.extend(crosshair_quads(viewport));
+        instances.extend(glyphs);
         let instance_count = instances.len() as u32;
         if instance_count == 0 {
             return;
         }
-        let bg_count = instances.len() as u32 - self.glyph_count(text) as u32;
 
         let bytes = bytemuck::cast_slice(&instances);
         if instance_count as u64 > self.capacity {
@@ -378,31 +395,20 @@ impl OverlayRenderer {
         });
         pass.set_bind_group(0, uniforms, &[]);
         // Both pipelines share this layout, so the atlas bind group is set
-        // even for the solid boxes (which do not sample it).
+        // even for the solid quads (which do not sample it).
         pass.set_bind_group(1, &self.atlas_bind_group, &[]);
         pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
 
-        // Background boxes first (solid color), then the glyphs on top.
         pass.set_pipeline(&self.solid_pipeline);
-        pass.draw(0..6, 0..bg_count);
+        pass.draw(0..6, 0..solid_count);
         pass.set_pipeline(&self.glyph_pipeline);
-        pass.draw(0..6, bg_count..instance_count);
+        pass.draw(0..6, solid_count..instance_count);
     }
 
-    fn glyph_count(&self, text: &OverlayText) -> usize {
-        text.lines
-            .iter()
-            .map(|line| {
-                line.chars()
-                    .filter(|c| c.is_ascii_graphic() || *c == ' ')
-                    .count()
-            })
-            .sum()
-    }
-
-    /// Turns lines into background-box instances followed by glyph
-    /// instances, all in pixels (top-left origin).
-    fn layout(&self, text: &OverlayText) -> Vec<QuadInstance> {
+    /// Turns lines into background-box instances and glyph instances, all
+    /// in pixels (top-left origin). The caller interleaves the crosshair
+    /// quads between the two halves.
+    fn layout(&self, text: &OverlayText) -> (Vec<QuadInstance>, Vec<QuadInstance>) {
         let scale = self.scale;
         let glyph_w = GLYPH_SIZE * scale;
         let glyph_h = GLYPH_SIZE * scale;
@@ -443,9 +449,54 @@ impl OverlayRenderer {
                 });
             }
         }
-        boxes.extend(glyphs);
-        boxes
+        (boxes, glyphs)
     }
+}
+
+/// The crosshair as four solid quads: two dark outline bars drawn under
+/// two white arms, centered on the target.
+fn crosshair_quads(viewport: (u32, u32)) -> [QuadInstance; 4] {
+    let (cx, cy) = (viewport.0 as f32 / 2.0, viewport.1 as f32 / 2.0);
+    let quad = |x: f32, y: f32, w: f32, h: f32, color: [f32; 4]| QuadInstance {
+        pos: [x, y],
+        size: [w, h],
+        uv_min: [0.0, 0.0],
+        uv_max: [0.0, 0.0],
+        color,
+    };
+    let o = CROSS_OUTLINE;
+    [
+        // Dark outline: each bar padded by `o` on every side.
+        quad(
+            cx - CROSS_ARM - o,
+            cy - CROSS_THICK / 2.0 - o,
+            2.0 * (CROSS_ARM + o),
+            CROSS_THICK + 2.0 * o,
+            CROSS_DARK,
+        ),
+        quad(
+            cx - CROSS_THICK / 2.0 - o,
+            cy - CROSS_ARM - o,
+            CROSS_THICK + 2.0 * o,
+            2.0 * (CROSS_ARM + o),
+            CROSS_DARK,
+        ),
+        // White arms on top.
+        quad(
+            cx - CROSS_ARM,
+            cy - CROSS_THICK / 2.0,
+            2.0 * CROSS_ARM,
+            CROSS_THICK,
+            CROSS_WHITE,
+        ),
+        quad(
+            cx - CROSS_THICK / 2.0,
+            cy - CROSS_ARM,
+            CROSS_THICK,
+            2.0 * CROSS_ARM,
+            CROSS_WHITE,
+        ),
+    ]
 }
 
 #[cfg(test)]
@@ -495,6 +546,24 @@ mod tests {
     fn quad_instance_layout_is_packed() {
         assert_eq!(std::mem::size_of::<QuadInstance>(), 48);
         assert_eq!(std::mem::offset_of!(QuadInstance, color), 32);
+    }
+
+    #[test]
+    fn crosshair_quads_center_a_white_cross_over_its_dark_outline() {
+        let quads = crosshair_quads((256, 128));
+        // Dark bars first, white arms after; all centered at (128, 64).
+        for (i, quad) in quads.iter().enumerate() {
+            let cx = quad.pos[0] + quad.size[0] / 2.0;
+            let cy = quad.pos[1] + quad.size[1] / 2.0;
+            assert_eq!((cx, cy), (128.0, 64.0), "quad {i} centered");
+        }
+        assert_eq!(quads[0].color, super::CROSS_DARK);
+        assert_eq!(quads[1].color, super::CROSS_DARK);
+        assert_eq!(quads[2].color, super::CROSS_WHITE);
+        assert_eq!(quads[3].color, super::CROSS_WHITE);
+        // The outline is strictly larger than the arm it sits under.
+        assert!(quads[0].size[0] > quads[2].size[0] && quads[0].size[1] > quads[2].size[1]);
+        assert!(quads[1].size[0] > quads[3].size[0] && quads[1].size[1] > quads[3].size[1]);
     }
 
     #[test]

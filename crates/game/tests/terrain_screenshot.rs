@@ -102,6 +102,7 @@ fn streamed_terrain_matches_golden() {
         &camera,
         None,
         Some(&mut terrain),
+        None,
     );
     assert_matches_golden("terrain_spawn", &target.read_rgba(&gpu));
 }
