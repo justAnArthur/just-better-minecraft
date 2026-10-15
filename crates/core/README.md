@@ -112,9 +112,10 @@ consistent with the palette length, exact byte length, and every packed
 index below the palette length. The result always satisfies
 `check_invariants`, decode never panics on any input (fuzzed in tests with
 random bytes, every truncation, and single-byte mutations), and errors are
-the typed `CubeDecodeError`. Decode rebuilds through `from_fn`: ≈ 207 µs
-per surface cube at 32³ (measured by `storage/decode_surface_cube`); encode
-is ≈ 13 µs. Round trips are exact for uniform, two-state, full-palette and
+the typed `CubeDecodeError`. The stored words use the in-memory packing,
+so decode validates them and keeps them as the cube's data (re-packing via
+`from_fn` only if `map` collides two disk ids): ≈ 30 µs per surface cube at
+32³ including zstd (`storage/decode_surface_cube`); encode is ≈ 9 µs. Round trips are exact for uniform, two-state, full-palette and
 random cubes.
 
 ### `physics` — the one shared player step (task 1.6)

@@ -14,19 +14,18 @@
 //! on the server's `jbm-save` thread through [`Storage::save_batch`].
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
 
 use jbm_core::block::{BlockRegistry, BlockStateId, StateInfo};
-use jbm_core::coords::CubePos;
+use jbm_core::coords::{CUBE_VOLUME, CubePos};
 use jbm_core::cube::Cube;
 use redb::{
     Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
 };
-use zstd::stream::{Encoder, decode_all};
+use zstd::stream::decode_all;
 
 /// `meta` table: small named blobs (`format_version`, `seed`, …).
 const META: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("meta");
@@ -58,6 +57,8 @@ pub enum StorageError {
         pos: CubePos,
         reason: String,
     },
+    /// A `meta` entry (named here) has the wrong shape.
+    CorruptMeta(&'static str),
     /// The database names a block state the running registry does not know.
     UnknownBlockState(String),
     /// The database was written by a newer format version.
@@ -70,6 +71,7 @@ impl std::fmt::Display for StorageError {
             Self::Io(message) => write!(f, "storage I/O error: {message}"),
             Self::Locked(path) => write!(f, "world database {path:?} is locked by another holder"),
             Self::Corrupt { pos, reason } => write!(f, "corrupt record at {pos:?}: {reason}"),
+            Self::CorruptMeta(key) => write!(f, "corrupt world meta entry {key:?}"),
             Self::UnknownBlockState(name) => write!(f, "unknown block state {name:?}"),
             Self::VersionTooNew => write!(f, "world database format is newer than this build"),
         }
@@ -77,6 +79,15 @@ impl std::fmt::Display for StorageError {
 }
 
 impl std::error::Error for StorageError {}
+
+fn meta_corrupt(key: &'static str) -> StorageError {
+    StorageError::CorruptMeta(key)
+}
+
+/// Upper bound on a cube's codec bytes (header, a full palette, and one
+/// word per block — looser than any real width), so a corrupt frame header
+/// cannot make decode allocate without limit.
+const MAX_PLAIN_BYTES: usize = 16 + 4 * CUBE_VOLUME + 8 * CUBE_VOLUME;
 
 fn io_err(error: impl std::fmt::Display) -> StorageError {
     StorageError::Io(error.to_string())
@@ -233,7 +244,12 @@ impl Storage {
             let stored_version: Option<u32> = meta
                 .get("format_version")
                 .map_err(io_err)?
-                .map(|guard| u32::from_le_bytes(guard.value().try_into().expect("4 bytes")));
+                .map(|guard| {
+                    <[u8; 4]>::try_from(guard.value())
+                        .map(u32::from_le_bytes)
+                        .map_err(|_| meta_corrupt("format_version"))
+                })
+                .transpose()?;
             match stored_version {
                 None => {
                     meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
@@ -246,7 +262,12 @@ impl Storage {
                     let stored = meta
                         .get("seed")
                         .map_err(io_err)?
-                        .map(|guard| u64::from_le_bytes(guard.value().try_into().expect("8 bytes")))
+                        .map(|guard| {
+                            <[u8; 8]>::try_from(guard.value())
+                                .map(u64::from_le_bytes)
+                                .map_err(|_| meta_corrupt("seed"))
+                        })
+                        .transpose()?
                         .unwrap_or(seed);
                     if stored != seed {
                         eprintln!(
@@ -370,9 +391,10 @@ impl Storage {
                 cube.encode_with(|state| self.runtime_to_disk[state.0 as usize], &mut plain);
                 record.clear();
                 record.push(RECORD_SCHEMA);
-                let mut encoder = Encoder::new(&mut record, ZSTD_LEVEL).map_err(io_err)?;
-                encoder.write_all(&plain).map_err(io_err)?;
-                encoder.finish().map_err(io_err)?;
+                // Bulk compression records the content size in the frame
+                // header, so decoding can size its buffer exactly.
+                let frame = zstd::bulk::compress(&plain, ZSTD_LEVEL).map_err(io_err)?;
+                record.extend_from_slice(&frame);
                 cubes
                     .insert(&cube_key(pos), record.as_slice())
                     .map_err(io_err)?;
@@ -446,7 +468,19 @@ impl Storage {
         if schema != RECORD_SCHEMA {
             return Err(corrupt(format!("record schema {schema}")));
         }
-        let plain = decode_all(frame).map_err(|e| corrupt(format!("zstd: {e}")))?;
+        // Frames carry their content size (bulk compression), so one exact
+        // bulk decompress replaces a streaming decoder and its window
+        // buffers (~10x faster on a surface cube). A frame without a size
+        // (written by a streaming encoder) still decodes, the slow way.
+        let plain = match zstd::zstd_safe::get_frame_content_size(frame) {
+            Ok(Some(size)) if size <= MAX_PLAIN_BYTES as u64 => {
+                zstd::bulk::decompress(frame, size as usize)
+                    .map_err(|e| corrupt(format!("zstd: {e}")))?
+            }
+            Ok(Some(size)) => return Err(corrupt(format!("zstd content size {size}"))),
+            Ok(None) => decode_all(frame).map_err(|e| corrupt(format!("zstd: {e}")))?,
+            Err(_) => return Err(corrupt("zstd: bad frame header".into())),
+        };
         let disk_to_runtime = &self.disk_to_runtime;
         Cube::decode_with(&plain, |disk| disk_to_runtime.get(&disk).copied())
             .map_err(|e| corrupt(e.to_string()))

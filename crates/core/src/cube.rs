@@ -636,27 +636,52 @@ impl Cube {
             return Ok(Self::filled(state));
         }
 
-        let epw = entries_per_word(bits as u32);
+        // The stored words use the in-memory layout (same width, entries
+        // never straddle a word), so they become the cube's data directly:
+        // validate every index, clear the padding bits, and keep the words.
+        // Much faster than re-packing through `from_fn` (~200 µs → a few µs
+        // on a surface cube).
+        let bits = u32::from(bits);
+        let epw = entries_per_word(bits);
         let mask = (1u64 << bits) - 1;
-        let mut indices = Vec::with_capacity(CUBE_VOLUME);
-        for i in 0..CUBE_VOLUME {
-            let word = read_u64(&bytes[words_start + (i / epw) * 8..]);
-            let pi = (word >> ((i % epw) * bits as usize)) & mask;
-            if pi >= palette_len as u64 {
-                return Err(CubeDecodeError::Index {
-                    value: pi,
-                    palette_len: palette_len as u16,
-                });
+        let mut data = Vec::with_capacity(word_count(bits));
+        for w in 0..word_count(bits) {
+            let word = read_u64(&bytes[words_start + w * 8..]);
+            let entries = epw.min(CUBE_VOLUME - w * epw);
+            let mut kept = 0u64;
+            for e in 0..entries {
+                let pi = (word >> (e * bits as usize)) & mask;
+                if pi >= palette_len as u64 {
+                    return Err(CubeDecodeError::Index {
+                        value: pi,
+                        palette_len: palette_len as u16,
+                    });
+                }
+                kept |= pi << (e * bits as usize);
             }
-            indices.push(pi as usize);
+            data.push(kept);
         }
-        // Map the palette once; from_fn packs (and re-dedups, should `map`
-        // collide two disk ids onto one runtime state).
         let runtime: Vec<BlockStateId> = disk_ids
             .iter()
             .map(|&id| map(id).ok_or(CubeDecodeError::UnmappedState(id)))
             .collect::<Result<_, _>>()?;
-        Ok(Self::from_fn(|pos| runtime[indices[pos.index()]]))
+        let mut cube = Self {
+            palette: runtime,
+            reverse: ReverseMap::default(),
+            data,
+            bits,
+        };
+        let unique = cube.palette.iter().collect::<HashSet<_>>().len() == palette_len;
+        if !unique {
+            // `map` collided two disk ids onto one runtime state: re-pack so
+            // the palette stays unique.
+            let packed = cube.clone();
+            return Ok(Self::from_fn(|pos| packed.get(pos)));
+        }
+        if cube.palette.len() > LINEAR_SCAN_LIMIT {
+            cube.rebuild_reverse();
+        }
+        Ok(cube)
     }
 }
 

@@ -306,11 +306,13 @@ Current cases:
 - `worldgen/surface_cube` — a cube intersecting the surface (mixed path,
   heightmap cached).
 - `worldgen/air_cube` — a cube far above the surface (fast path).
-- `storage/encode_surface_cube` ≈ 13 µs — codec plus zstd level 3.
-- `storage/decode_surface_cube` ≈ 207 µs — zstd plus codec rebuild.
-- `storage/save_batch_64` ≈ 4.7 ms — one committed 64-cube transaction,
+- `storage/encode_surface_cube` ≈ 9 µs — codec plus zstd level 3 (bulk
+  frames, which record their content size).
+- `storage/decode_surface_cube` ≈ 30 µs — exact-size zstd decompress plus
+  codec validation.
+- `storage/save_batch_64` ≈ 4.0 ms — one committed 64-cube transaction,
   fsync included.
-- `storage/load_cube` ≈ 1 µs — a hot read plus decode. On this machine a
+- `storage/load_cube` ≈ 24 µs — a hot read plus decode of a mixed cube. On this machine a
   surface cube's record is 199 bytes against 8.2 kB of heap storage (air
   and uniform-stone records are 18 bytes), and one flush-sized commit of
   1,000 cubes takes ≈ 24 ms.

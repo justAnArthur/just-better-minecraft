@@ -10,7 +10,6 @@ use jbm_core::cube::Cube;
 use jbm_server::DEFAULT_SEED;
 use jbm_server::Generator;
 use jbm_server::storage::Storage;
-use std::io::Write;
 
 /// A cube whose column intersects the surface near the origin (same recipe
 /// as `worldgen/surface_cube`): the mixed-path record.
@@ -35,11 +34,7 @@ fn bench(c: &mut Criterion) {
     let record = {
         let mut plain = Vec::new();
         cube.encode_with(|state| state.0, &mut plain);
-        let mut record = Vec::new();
-        let mut encoder = zstd::stream::Encoder::new(&mut record, 3).unwrap();
-        encoder.write_all(&plain).unwrap();
-        encoder.finish().unwrap();
-        record
+        zstd::bulk::compress(&plain, 3).unwrap()
     };
 
     let mut group = c.benchmark_group("storage");
@@ -48,17 +43,17 @@ fn bench(c: &mut Criterion) {
         b.iter(|| {
             let mut plain = Vec::new();
             cube.encode_with(|state| state.0, &mut plain);
-            let mut record = Vec::new();
-            let mut encoder = zstd::stream::Encoder::new(&mut record, 3).unwrap();
-            encoder.write_all(&plain).unwrap();
-            encoder.finish().unwrap();
-            record.len()
+            zstd::bulk::compress(&plain, 3).unwrap().len()
         })
     });
 
     group.bench_function("decode_surface_cube", |b| {
         b.iter(|| {
-            let plain = zstd::stream::decode_all(record.as_slice()).unwrap();
+            // Same path as `Storage::load`: exact-size bulk decompress.
+            let size = zstd::zstd_safe::get_frame_content_size(&record)
+                .unwrap()
+                .unwrap();
+            let plain = zstd::bulk::decompress(&record, size as usize).unwrap();
             Cube::decode_with(&plain, |id| Some(jbm_core::block::BlockStateId(id))).unwrap()
         })
     });
@@ -85,16 +80,15 @@ fn bench(c: &mut Criterion) {
         })
     });
 
+    // A hot read plus decode of a mixed (non-uniform) cube from the batch:
+    // uniform cubes decode trivially and would hide the decode cost.
+    let mixed = batch_cubes
+        .iter()
+        .find(|(_, cube)| cube.uniform().is_none())
+        .map(|(pos, _)| *pos)
+        .expect("the batch holds a surface cube");
     group.bench_function("load_cube", |b| {
-        b.iter(|| {
-            storage
-                .load(CubePos {
-                    x: 3,
-                    y: (h >> 5) as i32,
-                    z: 1,
-                })
-                .unwrap()
-        })
+        b.iter(|| storage.load(mixed).unwrap().expect("stored"))
     });
 
     group.finish();
