@@ -247,28 +247,30 @@ fn bench_lod(c: &mut Criterion) {
     group.bench_function("edit_cell", |b| {
         // One `downsample_region` call on one changed cell, against a
         // parent that already holds the child's downsample — the per-edit
-        // cost at one level, `Cube::compact` included.
+        // cost at one level, `Cube::compact` included. The edit is chosen
+        // so the parent cell really changes (a no-op edit would skip the
+        // write and the compact).
         let child = lod_surface_cube();
-        let mut edited = child.clone();
-        let local = LocalPos::new_unchecked(5, (CUBE_SIZE / 2) as u8, 5);
-        let was = edited.set(local, BlockStateId(7));
-        assert_ne!(was, BlockStateId(7));
+        let mut base = Cube::filled(BlockStateId::AIR);
+        downsample_octant(&child, &mut base, 0);
+        let (edited, local) = (0..CUBE_VOLUME)
+            .find_map(|i| {
+                let local = LocalPos::from_index(i);
+                let mut edited = child.clone();
+                edited.set(local, BlockStateId(7));
+                let mut parent = base.clone();
+                downsample_region(&edited, &mut parent, 0, CellBox::single(local))
+                    .map(|_| (edited, local))
+            })
+            .expect("some single edit changes the parent");
         b.iter_batched(
-            || {
-                let mut parent = Cube::filled(BlockStateId::AIR);
-                downsample_octant(&child, &mut parent, 0);
-                parent
-            },
+            || base.clone(),
             |mut parent| {
-                black_box(downsample_region(
-                    &edited,
-                    &mut parent,
-                    0,
-                    CellBox::single(local),
-                ));
+                let changed = downsample_region(&edited, &mut parent, 0, CellBox::single(local));
+                assert!(changed.is_some());
                 parent
             },
-            BatchSize::PerIteration,
+            BatchSize::SmallInput,
         )
     });
 

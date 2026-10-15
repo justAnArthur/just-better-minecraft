@@ -125,26 +125,30 @@ fn bench(c: &mut Criterion) {
     });
 
     group.bench_function("edit", |b| {
-        // One edit through all levels: break a surface block so its group's
-        // occupancy or material flips at LOD1, against a pyramid that
-        // already holds the cube's downsample.
+        // One edit through all levels, against a pyramid that already
+        // holds the cube's downsample. The edit (breaking one block) is
+        // picked so that LOD1 really changes; a no-op edit would stop at
+        // the first level and measure nothing.
         let cube = generator.generate(pos);
-        let mut edited = cube.clone();
-        let surface_y = generator.surface_height(0, 0) as u8 & 31;
-        let local = LocalPos::new_unchecked(0, surface_y, 0);
-        let was = edited.set(local, jbm_core::block::BlockStateId::AIR);
-        assert_ne!(
-            was,
-            jbm_core::block::BlockStateId::AIR,
-            "not a surface cell"
-        );
+        let base = {
+            let mut pyramid = LodPyramid::new(4);
+            pyramid.insert_lod0(pos, &cube);
+            pyramid
+        };
+        let (edited, local) = (0..jbm_core::coords::CUBE_VOLUME)
+            .map(LocalPos::from_index)
+            .filter(|&local| cube.get(local) != jbm_core::block::BlockStateId::AIR)
+            .find_map(|local| {
+                let mut edited = cube.clone();
+                edited.set(local, jbm_core::block::BlockStateId::AIR);
+                let mut pyramid = base.clone();
+                (!pyramid.edit_lod0(pos.block(local), &edited).is_empty())
+                    .then_some((edited, local))
+            })
+            .expect("some single break changes LOD1");
         let block = pos.block(local);
         b.iter_batched(
-            || {
-                let mut pyramid = LodPyramid::new(4);
-                pyramid.insert_lod0(pos, &cube);
-                pyramid
-            },
+            || base.clone(),
             |mut pyramid| {
                 black_box(pyramid.edit_lod0(block, &edited));
                 pyramid

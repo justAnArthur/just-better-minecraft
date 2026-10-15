@@ -58,6 +58,7 @@ impl LodChanges {
 /// The pyramid itself: levels `1..=max_levels`, each a map of cubes. A
 /// pyramid with `max_levels == 0` is disabled — it allocates nothing and
 /// every operation is a no-op.
+#[derive(Clone)]
 pub struct LodPyramid {
     /// `levels[l - 1]` holds level `l`; empty while disabled.
     levels: Vec<HashMap<CubePos, LodCube>>,

@@ -60,6 +60,10 @@ pub const CHILDREN: usize = 8;
 /// states, indexed `c = dx + 2·dz + 4·dy`. See the module docs for the rule
 /// and its rationale.
 pub fn downsample_cell(children: [BlockStateId; CHILDREN]) -> BlockStateId {
+    // Eight equal states (the bulk of any real cube) give that state.
+    if children.iter().all(|&state| state == children[0]) {
+        return children[0];
+    }
     let mut filled = 0;
     for &state in &children {
         if state != BlockStateId::AIR {
@@ -189,27 +193,53 @@ pub fn downsample_region(
     octant: u8,
     region: CellBox,
 ) -> Option<CellBox> {
+    // Parent cells (octant-local) whose group {2k, 2k+1} overlaps
+    // [min, max): k from floor(min / 2) to ceil(max / 2), exclusive.
+    let first = region.min.map(|m| m as usize / 2);
+    let last = region.max.map(|m| (m as usize).div_ceil(2));
+    let groups = (last[0] - first[0]) * (last[1] - first[1]) * (last[2] - first[2]);
+    // Large regions (whole-octant ingest) unpack the child once with the
+    // sequential iterator, which is several times cheaper per cell than a
+    // random `get`; small ones (edits) read the few cells they need.
+    if groups >= UNPACK_GROUPS {
+        let cells: Vec<BlockStateId> = child.iter().collect();
+        downsample_groups(|i| cells[i], parent, octant, first, last)
+    } else {
+        downsample_groups(|i| child.get_index(i), parent, octant, first, last)
+    }
+}
+
+/// Region size (in parent cells) from which [`downsample_region`] unpacks
+/// the whole child instead of reading cells one by one.
+const UNPACK_GROUPS: usize = 512;
+
+/// The shared loop of [`downsample_region`]: `read` returns the child state
+/// at a linear [`LocalPos::index`], `first..last` are the octant-local
+/// parent cells to recompute.
+fn downsample_groups(
+    read: impl Fn(usize) -> BlockStateId,
+    parent: &mut Cube,
+    octant: u8,
+    first: [usize; 3],
+    last: [usize; 3],
+) -> Option<CellBox> {
     let half = CUBE_SIZE as usize / 2;
     let [ox, oy, oz] = octant_offset(octant).map(|v| v as usize * half);
-
-    // Parent cells (octant-local) whose group {2k, 2k+1} overlaps
-    // [min, max): k from floor((min-1)/2) to ceil(max/2) - 1.
-    let first = |min: u8| (min as usize).saturating_sub(1) >> 1;
-    let last = |max: u8| (max as usize + 1) >> 1; // exclusive
-
     let mut changed: Option<CellBox> = None;
     let mut children = [BlockStateId::AIR; CHILDREN];
-    for ky in first(region.min[1])..last(region.max[1]) {
-        for kz in first(region.min[2])..last(region.max[2]) {
-            for kx in first(region.min[0])..last(region.max[0]) {
+    for ky in first[1]..last[1] {
+        for kz in first[2]..last[2] {
+            for kx in first[0]..last[0] {
                 for dy in 0..2usize {
                     for dz in 0..2usize {
                         for dx in 0..2usize {
-                            children[dx + 2 * dz + 4 * dy] = child.get(LocalPos::new_unchecked(
+                            let index = LocalPos::new_unchecked(
                                 (2 * kx + dx) as u8,
                                 (2 * ky + dy) as u8,
                                 (2 * kz + dz) as u8,
-                            ));
+                            )
+                            .index();
+                            children[dx + 2 * dz + 4 * dy] = read(index);
                         }
                     }
                 }
@@ -218,8 +248,7 @@ pub fn downsample_region(
                 let pos =
                     LocalPos::new_unchecked((ox + kx) as u8, (oy + ky) as u8, (oz + kz) as u8);
                 let down = downsample_cell(children);
-                if parent.get(pos) != down {
-                    parent.set(pos, down);
+                if parent.set(pos, down) != down {
                     let cell = CellBox::single(pos);
                     changed = Some(match changed {
                         None => cell,
