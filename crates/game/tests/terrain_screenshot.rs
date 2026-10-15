@@ -34,6 +34,7 @@ fn looking_at(eye: DVec3, look_at: DVec3) -> Camera {
 }
 
 #[test]
+#[cfg(not(feature = "cube16"))] // streaming shape and golden are 32³-only
 fn streamed_terrain_matches_golden() {
     let Some(gpu) = gpu_or_skip() else {
         return;
@@ -101,6 +102,7 @@ fn streamed_terrain_matches_golden() {
         &camera,
         None,
         Some(&mut terrain),
+        None,
     );
     assert_matches_golden("terrain_spawn", &target.read_rgba(&gpu));
 }

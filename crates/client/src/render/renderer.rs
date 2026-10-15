@@ -3,10 +3,12 @@
 
 use bytemuck::{Pod, Zeroable};
 use glam::Mat4;
+use jbm_core::coords::BlockPos;
 
 use crate::camera::Camera;
 use crate::gpu::Gpu;
 use crate::render::chunks::TerrainPass;
+use crate::render::outline::OutlinePass;
 use crate::render::overlay::{OverlayRenderer, OverlayText};
 
 /// Depth buffer format. Reverse-Z (cleared to 0.0, `Greater` compare) with
@@ -106,6 +108,7 @@ pub struct Renderer {
     uniform_bind_group: wgpu::BindGroup,
     sky_pipeline: wgpu::RenderPipeline,
     overlay: OverlayRenderer,
+    outline: OutlinePass,
     viewport: (u32, u32),
 }
 
@@ -183,6 +186,7 @@ impl Renderer {
         });
 
         let overlay = OverlayRenderer::new(gpu, color_format, &uniform_layout);
+        let outline = OutlinePass::new(gpu, color_format, &uniform_layout);
 
         Renderer {
             uniform_buffer,
@@ -190,6 +194,7 @@ impl Renderer {
             uniform_bind_group,
             sky_pipeline,
             overlay,
+            outline,
             viewport: (1, 1),
         }
     }
@@ -227,7 +232,9 @@ impl Renderer {
     }
 
     /// Draws one frame: the sky pass (which also clears depth to 0.0),
-    /// then the terrain pass, then the debug overlay on top.
+    /// then the terrain pass, then the target outline (`outline`, task
+    /// 1.7), then the debug overlay — crosshair included — on top.
+    #[allow(clippy::too_many_arguments)] // one optional input per pass; bundle into a frame struct when the next pass lands
     pub fn render(
         &mut self,
         gpu: &Gpu,
@@ -236,6 +243,7 @@ impl Renderer {
         camera: &Camera,
         overlay: Option<&OverlayText>,
         terrain: Option<&mut TerrainPass>,
+        outline: Option<BlockPos>,
     ) {
         let uniforms = self.build_uniforms(camera);
         gpu.queue
@@ -289,9 +297,27 @@ impl Renderer {
             );
         }
 
+        if let Some(block) = outline {
+            self.outline.draw(
+                gpu,
+                &mut encoder,
+                target,
+                depth,
+                &self.uniform_bind_group,
+                camera,
+                block,
+            );
+        }
+
         if let Some(text) = overlay {
-            self.overlay
-                .draw(gpu, &mut encoder, target, &self.uniform_bind_group, text);
+            self.overlay.draw(
+                gpu,
+                &mut encoder,
+                target,
+                &self.uniform_bind_group,
+                self.viewport,
+                text,
+            );
         }
 
         gpu.queue.submit([encoder.finish()]);

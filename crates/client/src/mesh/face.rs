@@ -23,6 +23,8 @@
 
 use bytemuck::{Pod, Zeroable};
 
+use jbm_core::coords::CUBE_SIZE;
+
 /// One packed face: 8 bytes, two `u32` words.
 ///
 /// **Word 0:**
@@ -129,13 +131,13 @@ pub fn quad_corners(f: &FaceFields) -> [[i32; 3]; 4] {
 /// The unpacked fields of a [`PackedFace`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FaceFields {
-    /// Cube-local position of the block that owns the face, 0..32.
+    /// Cube-local position of the block that owns the face, `0..CUBE_SIZE`.
     pub x: u32,
     pub y: u32,
     pub z: u32,
-    /// Face extent along u, 1..=32.
+    /// Face extent along u, `1..=CUBE_SIZE`.
     pub width: u32,
-    /// Face extent along v, 1..=32.
+    /// Face extent along v, `1..=CUBE_SIZE`.
     pub height: u32,
     pub direction: Direction,
     /// Texture array layer.
@@ -147,11 +149,20 @@ pub struct FaceFields {
 }
 
 /// Packs fields into the two words. Debug-asserts the documented ranges so
-/// a broken mesher fails loudly in tests instead of aliasing fields.
+/// a broken mesher fails loudly in tests instead of aliasing fields. The
+/// 5-bit field layout is fixed whatever `CUBE_SIZE` is (16 fits); only the
+/// asserts track the cube size.
 pub fn pack(f: &FaceFields) -> PackedFace {
-    debug_assert!(f.x < 32 && f.y < 32 && f.z < 32, "owner out of cube");
-    debug_assert!(f.width >= 1 && f.width <= 32, "width out of 1..=32");
-    debug_assert!(f.height >= 1 && f.height <= 32, "height out of 1..=32");
+    let size = CUBE_SIZE as u32;
+    debug_assert!(f.x < size && f.y < size && f.z < size, "owner out of cube");
+    debug_assert!(
+        f.width >= 1 && f.width <= size,
+        "width out of 1..=CUBE_SIZE"
+    );
+    debug_assert!(
+        f.height >= 1 && f.height <= size,
+        "height out of 1..=CUBE_SIZE"
+    );
     debug_assert!(f.layer <= u16::MAX as u32, "layer overflows 16 bits");
     debug_assert!(f.light <= 15, "light out of 0..=15");
     let w0 = f.x
@@ -209,8 +220,11 @@ mod tests {
 
     #[test]
     fn pack_unpack_round_trips_edge_values() {
-        // Every field at its extreme, in combinations that exercise
-        // adjacent bit boundaries.
+        // Every field at its extreme (the cube-size bounds, not the 5-bit
+        // field bounds), in combinations that exercise adjacent bit
+        // boundaries.
+        let last = (CUBE_SIZE - 1) as u32;
+        let size = CUBE_SIZE as u32;
         let cases = [
             FaceFields {
                 x: 0,
@@ -224,22 +238,22 @@ mod tests {
                 light: 0,
             },
             FaceFields {
-                x: 31,
-                y: 31,
-                z: 31,
-                width: 32,
-                height: 32,
+                x: last,
+                y: last,
+                z: last,
+                width: size,
+                height: size,
                 direction: Direction::NegZ,
                 layer: u16::MAX as u32,
                 ao: [3, 3, 3, 3],
                 light: 15,
             },
             FaceFields {
-                x: 31,
+                x: last,
                 y: 0,
-                z: 31,
+                z: last,
                 width: 1,
-                height: 32,
+                height: size,
                 direction: Direction::NegY,
                 layer: 1,
                 ao: [3, 0, 1, 2],
@@ -247,9 +261,9 @@ mod tests {
             },
             FaceFields {
                 x: 1,
-                y: 31,
+                y: last,
                 z: 0,
-                width: 32,
+                width: size,
                 height: 1,
                 direction: Direction::PosZ,
                 layer: 10,

@@ -1,11 +1,11 @@
-//! Paletted, bit-packed storage for one 32³ cube of block states.
+//! Paletted, bit-packed storage for one `CUBE_SIZE³` cube of block states.
 //!
 //! Layout: a palette of distinct [`BlockStateId`]s plus palette indices
 //! bit-packed into `u64` words. Entries never straddle a word:
 //! `entries_per_word = 64 / bits`, padding bits are unused. Bits per entry are
-//! `max(1, ceil(log2(palette_len)))`, at most 15 (a palette can never exceed
-//! the 32768 cells). A uniform cube (one palette entry) has no index array at
-//! all — an all-air cube costs only its palette.
+//! `max(1, ceil(log2(palette_len)))`, at most `ceil(log2(CUBE_VOLUME))` (a
+//! palette can never exceed the cube's cells). A uniform cube (one palette
+//! entry) has no index array at all — an all-air cube costs only its palette.
 //!
 //! Array order is [`LocalPos::index`](crate::coords::LocalPos::index):
 //! x fastest, then z, then y.
@@ -102,7 +102,7 @@ fn word_count(bits: u32) -> usize {
     CUBE_VOLUME.div_ceil(entries_per_word(bits))
 }
 
-/// One 32³ cube of block states, palette-compressed.
+/// One `CUBE_SIZE³` cube of block states, palette-compressed.
 ///
 /// Invariants (checked by [`Cube::check_invariants`] in tests):
 /// - palette entries are unique and at most `CUBE_VOLUME` of them;
@@ -133,7 +133,7 @@ impl PartialEq for Cube {
 
 impl Eq for Cube {}
 
-/// Summarises the storage instead of dumping 32768 states.
+/// Summarises the storage instead of dumping every state.
 impl std::fmt::Debug for Cube {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Cube")
@@ -599,17 +599,15 @@ mod tests {
 
     #[test]
     fn growth_through_thresholds() {
+        /// Palette lengths after each phase: 2, 3, 5, 17, 257 (and 4097 at
+        /// 32³; a 4097-entry palette needs more cells than a 16³ cube has).
+        #[cfg(not(feature = "cube16"))]
+        const PHASES: &[(usize, u32)] = &[(1, 1), (2, 2), (4, 3), (16, 5), (256, 9), (4096, 13)];
+        #[cfg(feature = "cube16")]
+        const PHASES: &[(usize, u32)] = &[(1, 1), (2, 2), (4, 3), (16, 5), (256, 9)];
         let mut cube = Cube::default();
         let mut written: Vec<(usize, BlockStateId)> = Vec::new();
-        // Palette lengths after each phase: 2, 3, 5, 17, 257, 4097 (with air).
-        for (target, expected_bits) in [
-            (1usize, 1u32),
-            (2, 2),
-            (4, 3),
-            (16, 5),
-            (256, 9),
-            (4096, 13),
-        ] {
+        for &(target, expected_bits) in PHASES {
             while cube.palette().len() <= target {
                 let id = BlockStateId(written.len() as u32 + 1);
                 let index = written.len();
@@ -623,7 +621,7 @@ mod tests {
             }
             cube.check_invariants();
         }
-        assert_eq!(cube.palette().len(), 4097);
+        assert_eq!(cube.palette().len(), PHASES.last().copied().unwrap().0 + 1);
     }
 
     #[test]
@@ -642,8 +640,11 @@ mod tests {
     #[test]
     fn compact_shrinks_palette_and_width() {
         let mut cube = Cube::default();
-        // 4096 distinct states, then all cells overwritten with 16 states.
-        for i in 0..4096 {
+        // Many distinct states (an eighth of the cube's cells, so the stale
+        // palette stays within the CUBE_VOLUME bound at both cube sizes),
+        // then all cells overwritten with 16 states.
+        let distinct = CUBE_VOLUME / 8;
+        for i in 0..distinct {
             cube.set_index(i, BlockStateId(i as u32 + 1));
         }
         let mut reference = vec![BlockStateId::AIR; CUBE_VOLUME];
@@ -652,7 +653,7 @@ mod tests {
             cube.set_index(i, state);
             *cell = state;
         }
-        assert!(cube.palette().len() > 4096);
+        assert!(cube.palette().len() > distinct);
         cube.compact();
         assert!(
             cube.palette().len() <= 17,
@@ -698,11 +699,18 @@ mod tests {
     }
 
     #[test]
-    fn worst_case_32768_states() {
+    fn worst_case_every_cell_distinct() {
         let cube = Cube::from_fn(|pos| BlockStateId(pos.index() as u32));
         assert_eq!(cube.palette().len(), CUBE_VOLUME);
-        assert_eq!(cube.palette()[CUBE_VOLUME - 1], BlockStateId(32767));
-        assert_eq!(cube.bits_per_entry(), 15);
+        assert_eq!(
+            cube.palette()[CUBE_VOLUME - 1],
+            BlockStateId((CUBE_VOLUME - 1) as u32)
+        );
+        // ceil(log2(CUBE_VOLUME)) bits: 15 at 32³, 12 at 16³.
+        assert_eq!(
+            cube.bits_per_entry(),
+            usize::BITS - (CUBE_VOLUME - 1).leading_zeros()
+        );
         cube.check_invariants();
         for i in 0..CUBE_VOLUME {
             assert_eq!(cube.get_index(i), BlockStateId(i as u32));

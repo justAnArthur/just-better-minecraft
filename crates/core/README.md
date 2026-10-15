@@ -1,26 +1,47 @@
 # jbm-core
 
 Shared types for the whole engine: coordinates, block states and the block
-registry, paletted cube storage, and the protocol messages the client and
-server exchange.
+registry, paletted cube storage, the shared player physics, and the
+protocol messages the client and server exchange.
+
+## The `cube16` feature
+
+`cube16` is a compile-time benchmark feature (task 1.8) that shrinks cubes
+from 32³ to 16³: `CUBE_BITS` becomes 4 and `CUBE_SIZE`, `CUBE_VOLUME` and
+every mask/shift in `coords` derive from it. Everything in this crate and
+in the client mesher derives from those constants, so both compile and their
+unit tests pass at either size. Limits:
+
+- **The server is not supported under `cube16`.** It compiles, but its
+  behavior (streaming radii, terrain assumptions, tests) is only defined at
+  32³. Do not run the game binary or the end-to-end tests with it.
+- CI never enables it. Only the task 1.8 bench
+  (`cargo bench -p jbm-game --bench cube_size`) and example
+  (`cargo run -p jbm-game --release --example cube_size_metrics`) use it,
+  via the passthrough features on `jbm-client` and `jbm-game`.
+- Client goldens and hand-placed scene tests are 32³-only and cfg-gated off.
+- Changing the default cube size is an orchestrator decision, recorded in
+  docs/progress.md; this feature only measures the trade-off.
 
 ## Modules
 
 ### `coords` — positions across the ±2³¹-cube world
 
-- `CUBE_SIZE = 32`, `CUBE_BITS = 5`, `CUBE_VOLUME = 32768`.
+- `CUBE_BITS = 5` (4 under `cube16`), `CUBE_SIZE = 1 << CUBE_BITS`,
+  `CUBE_VOLUME = CUBE_SIZE³`, `CUBE_MASK = CUBE_SIZE - 1`.
 - `CubePos { x, y, z: i32 }` — which cube a block is in; totally ordered by
   `(x, y, z)`.
 - `BlockPos { x, y, z: i64 }` — world block position. `i64` because
-  `i32::MIN * 32` overflows `i32`.
-- `LocalPos` — a block inside a cube, `0..32` on each axis (fields are `u8`).
-  `LocalPos::new -> Option<Self>` validates; `new_unchecked` only
+  `i32::MIN * CUBE_SIZE` overflows `i32`.
+- `LocalPos` — a block inside a cube, `0..CUBE_SIZE` on each axis (fields
+  are `u8`). `LocalPos::new -> Option<Self>` validates; `new_unchecked` only
   debug-asserts.
-- **Index order:** `LocalPos::index() = (y * 32 + z) * 32 + x` — x fastest,
-  then z, then y. Every cube array in the engine uses this order;
-  `LocalPos::from_index` inverts it.
-- Conversions are floor arithmetic (`>> 5` and `& 31` on `i64`), so block -1
-  splits to cube -1, local 31: `BlockPos::split`, `CubePos::block`.
+- **Index order:** `LocalPos::index() = (y * CUBE_SIZE + z) * CUBE_SIZE + x`
+  — x fastest, then z, then y. Every cube array in the engine uses this
+  order; `LocalPos::from_index` inverts it.
+- Conversions are floor arithmetic (`>> CUBE_BITS` and `& CUBE_MASK` on
+  `i64`), so block -1 splits to cube -1, local `CUBE_SIZE - 1`:
+  `BlockPos::split`, `CubePos::block`.
 
 ### `block` — block states and the registry
 
@@ -43,14 +64,14 @@ server exchange.
 
 ### `cube` — paletted, bit-packed storage
 
-- A `Cube` is 32³ block states as a palette (`Vec<BlockStateId>`, unique
-  entries) plus palette indices bit-packed into `Vec<u64>` words.
+- A `Cube` is `CUBE_SIZE³` block states as a palette (`Vec<BlockStateId>`,
+  unique entries) plus palette indices bit-packed into `Vec<u64>` words.
 - **Packing rules:** entries never straddle a word —
   `entries_per_word = 64 / bits` with the tail bits of each word unused;
-  `bits = max(1, ceil(log2(palette_len)))`, at most 15 (a palette can never
-  exceed the 32768 cells). A uniform cube (single palette entry) has **no
-  index array at all**; `bits_per_entry()` is 0 and `heap_bytes()` is a few
-  bytes.
+  `bits = max(1, ceil(log2(palette_len)))`, at most `ceil(log2(CUBE_VOLUME))`
+  (a palette can never exceed the cube's cells). A uniform cube (single
+  palette entry) has **no index array at all**; `bits_per_entry()` is 0 and
+  `heap_bytes()` is a few bytes.
 - **Growth:** setting a state absent from the palette appends it; when the
   palette outgrows the width, all entries repack at the new width. Setting a
   block to the state it already has does not touch the palette. Palette
@@ -69,15 +90,104 @@ server exchange.
 - Invariants (unique palette entries; array empty iff uniform; every index
   `< palette.len()`) are asserted by `#[cfg(test)] Cube::check_invariants`,
   which tests call after operations.
+
+### `physics` — the one shared player step (task 1.6)
+
+Units are blocks and seconds, f64. The step is fixed:
+`TICK_DT = 1/20`, one tick at a time, no variable dt. The client's
+predictor and the authoritative server call the same pure
+`physics::step(state, input, world) -> PlayerState`, so identical worlds
+give bit-identical results.
+
+**Constants** (all public, all documented here):
+
+| constant | value |
+| --- | --- |
+| player box | 0.6 × 1.8 × 0.6, feet at the bottom center |
+| `EYE_HEIGHT` | 1.62 |
+| walk speed | 4.3 |
+| sprint speed | 5.6 |
+| gravity | 32 blocks/s² |
+| jump velocity | 9.0 (a jump clears just over 1.25 blocks) |
+| terminal fall speed | 78 |
+| fly speed | 11 |
+| fly sprint speed | 22 |
+
+**Types:** `MoveInput` (forward/strafe/up as i8, jump, sprint, fly_toggle,
+yaw — the same yaw convention as the camera: 0 looks toward −Z, positive
+turns toward +X), `PlayerState` (feet position, velocity, on_ground,
+flying; `aabb()` and `eye()`), `trait BlockShapes` (`solid(pos) ->
+Option<bool>`, `None` = block not loaded) and `SolidTable` (a flat
+`Vec<bool>` by `BlockStateId` built from a `BlockRegistry`, so the hot
+path never touches the registry — and the one place a state's collision
+shape is decided, a full unit box when solid for now).
+
+**Step order:**
+
+1. `fly_toggle` flips `flying`. The server trusts the flag — Stage 1 is
+   creative-only; permission checks come with anti-cheat.
+2. Wish velocity: horizontal direction from forward/strafe rotated by
+   yaw, normalized so diagonals are not faster, times the speed
+   (fly/sprint variants above). Velocity is set directly — no
+   acceleration or friction yet, air control equals ground control. Walk
+   mode jumps from the ground and subtracts gravity, clamped to terminal
+   speed; the vertical displacement is gravity's exact integral across
+   the tick (the average of the pre/post-gravity velocities), so a jump's
+   apex is v²/2g = 1.2656 blocks. Fly mode sets `velocity.y = up × fly
+   speed`, no gravity.
+3. Swept collision per axis, **Y then X then Z**: clip the axis
+   displacement against every solid block the moving box would cross,
+   then move; a blocked axis zeroes that velocity component.
+   `on_ground` is true when the Y sweep was blocked while moving down.
+
+**Boundary rule:** touching faces do not overlap. The blocks a box
+strictly overlaps on an axis are exactly `floor(min) ..= ceil(max) - 1`;
+a box resting exactly on `y = 64.0` spans Y blocks 64..=65 and never
+collides with block 63 during the X/Z sweeps, and a falling box stops
+with its feet at exactly `64.0` (bitwise — tests assert it). There is
+deliberately **no epsilon**: one that let the box sink into a block would
+make client and server disagree about resting positions.
+
+**Unloaded rule:** if any block the swept box touches this tick is not
+loaded (`None`), the step returns the state unchanged — no movement, no
+gravity, no fly toggle. A player freezes at the edge of loaded terrain
+instead of falling into it; client and server both apply this, keeping
+them in agreement while cubes stream in.
+
+**Determinism:** only `+ - * / floor ceil min max sqrt` on f64, so steps
+are bit-exact across platforms. The one exception is `yaw.sin_cos()`,
+computed once per step — the only platform-dependent operation; server
+correction absorbs any drift.
+
+### `raycast` — block targeting (task 1.7)
+
+`raycast(origin, dir, max_dist, hit)` walks voxels with Amanatides–Woo
+DDA and returns the first block for which `hit` says `Some(true)`, as a
+`RayHit { block, face, distance }` (`face` is the face entered).
+`Some(false)` passes through, and `None` (not loaded) stops the ray with
+no hit. Zero direction components never divide (they step at infinity);
+origins on exact grid coordinates and at |x| ≈ 10⁷ are tested. An origin
+inside a targetable block hits that block at distance 0, on the face
+opposite the direction's dominant axis. `REACH = 5.0` blocks. Callers
+target `StateInfo::solid` states via `SolidTable` (air and water pass
+through); per-state outline shapes are later.
+
 ## Protocol and links
 
-`protocol` holds the message enums the client and server exchange:
-`PROTOCOL_VERSION`, `PlayerId`, `ClientMsg` (`Hello`, `PlayerInput`,
-`Ping`, `Disconnect`) and `ServerMsg` (`Welcome` with the spawn position,
-`Rejected`, `Tick`, `Pong`, `Disconnected`, `CubeData { pos, cube }`,
-`UnloadCube { pos }`). Messages are plain owned data — no `Arc`, no
-references, no trait objects — all derive `Debug, Clone, PartialEq`, and
-stay serializable for a future network transport (no serde yet).
+`protocol` holds the message enums the client and server exchange
+(`PROTOCOL_VERSION = 4`): `ClientMsg` (`Hello`, `PlayerInput { seq,
+input, pitch }`, `BreakBlock { pos }`, `PlaceBlock { pos, state }`,
+`Ping`, `Disconnect`) and `ServerMsg` (`Welcome` with
+the spawn feet position — the initial state: velocity 0, not on ground,
+walking — `PlayerState { ack_seq, state }` sent before `Tick` in ticks
+where the server processed at least one input, `Rejected`, `Tick`,
+`Pong`, `Disconnected`, `CubeData { pos, cube }`, `UnloadCube { pos }`,
+`BlockChange { pos, state }` — the authoritative state of one block).
+`PlayerInput.seq` starts at 1 and increments per client tick; the server
+ignores seqs ≤ the last processed one. Pitch is display-only; physics
+ignores it. Messages are plain owned data — no `Arc`, no references, no
+trait objects — all derive `Debug, Clone, PartialEq`, and stay
+serializable for a future network transport (no serde yet).
 
 `link` is the transport boundary: `trait Link<Out, In>: Send` with
 non-blocking `try_recv` (returns `Ok(None)` when empty) and
@@ -100,6 +210,10 @@ harness = false
 To add a case, add a function to `benches/core_bench.rs` inside a
 `benchmark_group` named for the area, with the case as the function name, so
 reports read `<area>/<case>` (e.g. `sample/fill_32cubed`, `cube/get_all_16_states`).
+Current cases include `physics/step_walk_flat` (median ≈ 12 ns on this
+Mac against a trivial flat-floor world) and `physics/step_fall_terminal`
+(≈ 13 ns, fall at terminal speed over loaded air), and
+`raycast/reach_5_diagonal` (≈ 58 ns).
 `criterion` is a dev-dependency via `[workspace.dependencies]` only — never a
 runtime dep.
 

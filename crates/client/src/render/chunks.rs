@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
 use glam::{DVec3, Mat4, Vec3, Vec4};
-use jbm_core::coords::CubePos;
+use jbm_core::coords::{CUBE_SIZE, CubePos};
 
 use crate::camera::Camera;
 use crate::gpu::Gpu;
@@ -344,12 +344,12 @@ impl TerrainPass {
             .filter(|(_, mesh)| mesh.face_count > 0)
             .filter(|(pos, _)| {
                 let world_min = DVec3::new(
-                    f64::from(pos.x) * 32.0,
-                    f64::from(pos.y) * 32.0,
-                    f64::from(pos.z) * 32.0,
+                    f64::from(pos.x) * f64::from(CUBE_SIZE),
+                    f64::from(pos.y) * f64::from(CUBE_SIZE),
+                    f64::from(pos.z) * f64::from(CUBE_SIZE),
                 );
                 let min = camera.relative(world_min);
-                let max = min + Vec3::splat(32.0);
+                let max = min + Vec3::splat(CUBE_SIZE as f32);
                 frustum.intersects_aabb(min, max)
             })
             .map(|(pos, mesh)| (*pos, mesh))
@@ -397,9 +397,9 @@ impl TerrainPass {
         let mut origins = Vec::with_capacity(visible.len());
         for (pos, _) in &visible {
             let world_min = DVec3::new(
-                f64::from(pos.x) * 32.0,
-                f64::from(pos.y) * 32.0,
-                f64::from(pos.z) * 32.0,
+                f64::from(pos.x) * f64::from(CUBE_SIZE),
+                f64::from(pos.y) * f64::from(CUBE_SIZE),
+                f64::from(pos.z) * f64::from(CUBE_SIZE),
             );
             let relative = camera.relative(world_min);
             origins.push(CubeOrigin {

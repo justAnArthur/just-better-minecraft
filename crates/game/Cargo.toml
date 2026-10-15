@@ -9,6 +9,11 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Passthrough so the 1.8 cube-size bench/example can run at 16³; see
+# jbm-core's README for what is and is not supported under it.
+cube16 = ["jbm-core/cube16"]
+
 [dependencies]
 jbm-client.workspace = true
 jbm-core.workspace = true
@@ -18,8 +23,15 @@ jbm-server.workspace = true
 # End-to-end screenshot: real server terrain rendered by the real client.
 jbm-client = { workspace = true, features = ["testing"] }
 jbm-testkit.workspace = true
+criterion.workspace = true
 glam.workspace = true
+# The cube-size metrics example polls the device between timed frames.
+wgpu.workspace = true
 
 [[bin]]
 name = "jbm"
 path = "src/main.rs"
+
+[[bench]]
+name = "cube_size"
+harness = false

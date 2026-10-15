@@ -830,17 +830,20 @@ name = "jbm-core"
 version = "0.0.0"
 dependencies = [
  "criterion",
+ "glam",
 ]
 
 [[package]]
 name = "jbm-game"
 version = "0.0.0"
 dependencies = [
+ "criterion",
  "glam",
  "jbm-client",
  "jbm-core",
  "jbm-server",
  "jbm-testkit",
+ "wgpu",
 ]
 
 [[package]]
@@ -855,6 +858,7 @@ name = "jbm-server"
 version = "0.0.0"
 dependencies = [
  "criterion",
+ "glam",
  "jbm-core",
 ]
 

@@ -2,7 +2,7 @@
 
 ## Next up
 
-Stage 1 · Voxel sandbox, wave C: 1.6 collision + walk/fly + client prediction with server correction, 1.7 raycast + break/place + re-mesh on change (must pin edited cubes against server eviction), 1.8 16³ vs 32³ bench.
+Stage 1 gate: the user plays the wave C build (walk, jump, fly with F, break with left click, place with right click, hotbar 1–9). Then `/clear` and start Stage 2 wave A.
 
 ## Benchmarks
 
@@ -41,13 +41,29 @@ Baselines are bench worker runs on an otherwise idle machine. Run-to-run noise o
 - 2026-10-14: Workers run through `scripts/delegate.sh` (the `glm` CLI directly, in the background) rather than the haiku relay agent, so long Rust builds aren't cut off by the relay's 10-minute Bash timeout.
 - 2026-10-14: Screenshot tests compare with a tolerance and skip when no GPU adapter exists, unless `JBM_REQUIRE_GPU=1` (set in CI on Linux with Mesa lavapipe).
 
+- 2026-10-15: **Cube size stays 32³** (task 1.8). Same 128×96×128 terrain region, M5 Pro under light load:
+
+  | | 32³ | 16³ |
+  |---|---|---|
+  | mesh whole region | 5.65 ms | 8.70 ms (+54%) |
+  | re-mesh one edited cube | 236 µs | 55 µs |
+  | build region (gen proxy) | 67 ms | 79 ms |
+  | draw calls (region) | 24 | 82 |
+  | cubes to stream, 256-block view | 1,773 | 13,549 |
+  | cube memory (region) | 240 KB | 132 KB + 8× map entries |
+  | GPU frame (region, 720p) | 0.71 ms | 0.92 ms |
+
+  16³ wins only single-edit latency and storage of mostly-uniform space. A 236 µs re-mesh, even ×8 for a corner edit, is far inside a frame on the worker pool. Every per-cube cost scales 8× at 16³: messages, map entries, draws, and later LOD nodes and redb keys. The `cube16` feature stays for re-measuring, but CI does not build it, so expect it to rot.
+
 ## Known issues
 
 - client/render/texture_array.rs: mip box filter applies the sRGB curve to alpha too. Fix in 1.4 before translucent textures (filter alpha linearly).
 - client/render/overlay.rs: `layout` and `glyph_count` duplicate the char filter (keep in sync or return both counts); `FrameStats` grows unbounded on repeated zero-dt frames (unreachable in app); `render` trusts `set_viewport`.
 - server/run.rs: stop/drop can wait up to one tick (≤50 ms) while the thread sleeps. Fine until shutdown latency matters.
 - Windowed app path has no automated test (workers' sandbox can't open a window). The orchestrator launches `cargo run -p jbm-game` before merging any wave that touches `client/src/app.rs`; this caught a redraw loop that stalled on macOS.
-- Server eviction drops cubes no player keeps; 1.7 must pin edited cubes until persistence (2.3), or edits are lost.
+- Edited cubes are pinned in server memory and never evicted, so they grow without bound until persistence (2.3).
+- Golden tolerance (0.5% of pixels differing) is larger than thin features such as the target outline (~40–140 px). Tests for thin features must also assert directly: `edit_screenshot` renders with and without the outline and requires a difference.
+- `Renderer::render` takes one optional argument per pass (8 args, clippy allowed with a reason). Bundle them into a frame struct when the next pass lands.
 - Reviewers passed 1.4 with three visible bugs (one-block face offset for +X/−Z, stale mesh race, magenta grass side). The orchestrator must keep inspecting goldens zoomed in, and golden cameras must be close enough to show per-block detail.
 - First release/bench build is slow (wgpu + thin LTO + codegen-units=1). Revisit profile if CI bench-smoke gets too slow.
 
@@ -68,3 +84,14 @@ Baselines are bench worker runs on an otherwise idle machine. Run-to-run noise o
 - User played the merged build: terrain renders and streams.
 - Wave B follow-ups: workspace crates build at opt-level 1 in dev (client unit tests 32 s → 4 s, workspace suite ~8 s); end-to-end terrain screenshot (`crates/game/tests/terrain_screenshot.rs`, golden `terrain_spawn`, inspected: terraces, grass sides, sand, no holes). Mesh/worldgen baselines deferred: machine never idle.
 - bench-2: mesh/worldgen baselines from an idle run (user ran them with other apps closed). terrain_like 221 µs, inside the ≤300 µs target; the earlier 2× numbers were load.
+- 1.8 merged on stage-1/wave-c: `cube16` feature (cube-size literals now derive from `CUBE_SIZE`), `cube_size` bench and `cube_size_metrics` example in jbm-game. Decision: keep 32³ (see Decisions).
+- 1.6 merged on stage-1/wave-c: shared player physics in core (swept AABB, Y-X-Z, exact face contact, freeze at unloaded blocks, exact ballistic integration so a jump apex is v²/2g = 1.27), protocol v3 (`PlayerInput { seq, input }`, `PlayerState { ack_seq, state }`), input-driven server stepping (≤4 inputs per tick, queue 20), client `Predictor` with replay on ack and 20 Hz fixed sim plus render interpolation. Reviewer: one finding (an orchestrator probe left in the tree). The orchestrator added a wall-contact test at offsets up to 10⁷. physics/step_walk_flat ≈12.5 ns.
+- 1.7 merged on stage-1/wave-c: raycast (DDA, `REACH = 5`), protocol v4 (`BreakBlock`, `PlaceBlock`, `BlockChange`), server validation (reach + 1 margin, air rules, player overlap) with revert-to-sender, `BlockChange` flushed before streaming and `Tick` (same-tick delivery), pinned edited cubes, `or_insert` for generation results. Client: optimistic edits, priority re-mesh queue, hold-to-repeat, 1–9 hotbar, crosshair, depth-tested target outline, golden `edit_spawn`. raycast/reach_5_diagonal ≈ 58 ns. The GLM worker hit its Z.ai usage limit before finishing, so the orchestrator finished it:
+  - fixed the outline: it was invisible (40% black on dirt), and its edges z-fought into dashes; fix is a vertex pull toward the camera and 60% alpha;
+  - moved the golden camera closer;
+  - added the outline visibility check;
+  - made touched border neighbors share edit priority;
+  - skipped re-meshing on a no-op `BlockChange` (the server's echo of an accepted edit);
+  - `Arc::make_mut` in `set_block`;
+  - released held edit buttons on focus loss and Esc;
+  - fixed clippy errors and wrote the READMEs.

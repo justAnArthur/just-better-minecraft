@@ -3,6 +3,13 @@
 The player-facing side: renderer, UI, input, audio, and client-side
 prediction. Talks to the server only through `jbm-core` protocol messages.
 
+**Cube size:** all mesher and renderer dimensions derive from
+`jbm_core::coords::CUBE_SIZE`, so the crate compiles and its unit tests
+pass under `jbm-core`'s `cube16` feature (16³ cubes; see jbm-core's
+README). The terrain-scene goldens are hand-placed at 32³-local
+coordinates and cfg-gated off under the crate's own `cube16` passthrough;
+`app.rs` camera-cube math is 32³-only (out of task 1.8's scope).
+
 **Public API**
 
 - `gpu::Gpu` / `gpu::GpuError` — GPU acquisition. `Gpu::headless()` for
@@ -11,8 +18,10 @@ prediction. Talks to the server only through `jbm-core` protocol messages.
 - `camera::Camera` — f64 position, yaw/pitch (pitch clamped to ±89°),
   reverse-Z infinite-far projection, camera-relative `view_proj()` and
   `relative()`.
-- `input::InputState` / `input::FlyController` — winit-independent key
-  set + mouse delta accumulation, and the fly movement that consumes them.
+- `input::InputState` — winit-independent key set, mouse delta
+  accumulation and the F-key fly-toggle edge; `input::move_input` maps
+  held keys onto the physics `MoveInput`, `input::apply_mouse_look`
+  applies the per-frame look.
 - `mesh::appearance` — the flat per-state appearance table plus the
   procedural builtin 16×16 placeholder textures (`builtin_textures`).
 - `mesh::face` — the 8-byte `PackedFace` format (see below).
@@ -35,6 +44,8 @@ prediction. Talks to the server only through `jbm-core` protocol messages.
 - `render::offscreen::OffscreenTarget` — an `Rgba8UnormSrgb` render
   target with `read_rgba(&Gpu) -> image::RgbaImage` readback.
 - `render::triangle` — the minimal test pipeline.
+- `predict::Predictor` — client-side prediction of the shared physics
+  (see below).
 - `app::run(link)` — opens the window and runs the frame loop against a
   server link.
 - `testing::screenshot` (only with `--features testing` or in unit tests)
@@ -109,10 +120,10 @@ occlude; cutout and air do not.
 
 ### Greedy merge
 
-The mesher first builds a padded 34³ array (center via `Cube::iter()`,
-which is ~3× faster than per-block `get`; neighbor shells via bounded
-loops — uniform neighbors fill, non-uniform use `get_index` on just the
-~1k border cells). Per direction and slice, coplanar faces with identical
+The mesher first builds a padded `(CUBE_SIZE + 2)³` array (center via
+`Cube::iter()`, which is ~3× faster than per-block `get`; neighbor shells
+via bounded loops — uniform neighbors fill, non-uniform use `get_index` on
+just the border cells). Per direction and slice, coplanar faces with identical
 (texture layer, AO pattern, light) merge into maximal rectangles: extend
 along u first, then along v. Faces never span outside the cube. Output is
 grouped by direction (`ranges`) so 2.2 can skip back-facing directions.
@@ -146,6 +157,27 @@ their `MeshInput` and version. A mesh result older than the cube's
 current version is stale and dropped (a newer version implies a newer
 dirty entry).
 
+**Edits (task 1.7):** `set_block` (optimistic) and `BlockChange`
+(authoritative) set one block and dirty its cube plus every loaded
+neighbor the block touches through a face, edge or corner (x == 0 dirties
+−X, x == CUBE_SIZE−1 dirties +X, and so on: up to 7 neighbors). All of
+those go into a priority set that `take_dirty` drains first, nearest
+first, before streaming dirt; a late neighbor would show a hole. Setting
+a block to its current state dirties nothing, so the server's echo of an
+accepted edit costs no re-mesh. `Arc::make_mut` copies the cube only
+while a mesh job still holds the old one.
+
+**Edit flow:** each frame the app raycasts from the camera (the rendered
+eye, so the crosshair matches what is drawn) up to `REACH` against
+`ClientWorld`. Left button breaks the target: optimistic air, then
+`BreakBlock`. Right button places the hotbar block at target + face
+normal when that cell is loaded, air, and (for solid states) clear of
+the predicted player box: optimistic set, then `PlaceBlock`. Held
+buttons repeat every 0.25 s; the first press acts at once. A rejected
+edit comes back as a `BlockChange` with the real state and is reverted
+like any other change. Hotbar, repeat timers and the place decision live
+in `edit.rs`, winit-free and unit-tested.
+
 ### Terrain rendering
 
 Per meshed cube: one storage buffer of `PackedFace`s, one bind group, one
@@ -172,13 +204,46 @@ shading (top 1.0, ±Z 0.8, ±X 0.6, bottom 0.5) times the AO factor
 ### App runtime
 
 `app::run(link)` sends `Hello`, then polls the link every frame without
-blocking. `Welcome` moves the camera to the spawn point; `Rejected`,
-`Disconnected` or a closed link print the reason to stderr and exit the
-loop cleanly. Each frame drains the link into `ClientWorld`, submits
-dirty cubes, receives and uploads meshes within the budgets above, and
-sends `PlayerInput` at most 20×/s. The overlay adds
-`CUBES <loaded> MESHED <n> PENDING <dirty + in flight>` and
-`FACES <total> DRAWS <n>`.
+blocking. `Welcome` creates the `Predictor` at the spawn feet position
+(the sim does not run before it); `Rejected`, `Disconnected` or a closed
+link print the reason to stderr and exit the loop cleanly. Each frame
+applies mouse look, runs a fixed 20 Hz sim clock with an accumulator (at
+most 5 catch-up ticks per frame; the leftover accumulator is dropped so a
+stall never spirals), sets the camera position to
+`predictor.render_position(alpha)` where `alpha` is the accumulator
+fraction, drains the link into `ClientWorld` and the `Predictor`
+(`PlayerState` → `on_server_state`), submits dirty cubes, receives and
+uploads meshes within the budgets above. The overlay adds
+`CUBES <loaded> MESHED <n> PENDING <dirty + in flight>`,
+`FACES <total> DRAWS <n>`, and the prediction lines
+`MODE <WALK/FLY> GROUND <YES/NO>`, `VEL <x y z>` and
+`PENDING <n> CORRECTIONS <n>`.
+
+## Prediction (task 1.6)
+
+`predict::Predictor` runs the shared `jbm_core::physics::step` ahead of
+the server:
+
+- **Tick:** each sim tick steps the prediction, stores the input with
+  its seq (starting at 1) and returns the `PlayerInput` to send. Pending
+  (unacknowledged) inputs are capped at 128; past that the oldest is
+  dropped and counted — the server's next state resynchronizes anyway.
+- **Correction:** `on_server_state(ack_seq, state)` drops pending inputs
+  with seq ≤ ack, re-simulates from the authoritative state through the
+  remaining pending inputs **in seq order**, and counts a correction when
+  the replay differs from the prediction (exact `PartialEq`). The
+  replayed state wins; corrections **snap** — the render interpolation's
+  previous state jumps too. Smoothing the snap is a later task.
+- **Interpolation:** `render_position(alpha)` returns the eye position
+  lerped between the previous and current tick states, so rendering at
+  any frame rate stays smooth between 20 Hz sim ticks.
+
+The client's `ClientWorld` implements `jbm_core::physics::BlockShapes`
+(its `SolidTable` is built from the builtin registry in `new`), so
+prediction collides against exactly the cubes the server sent — the
+unloaded rule freezes both sides identically at streaming edges. End-to
+end convergence (and the client-world-lies correction path) is proven by
+`crates/game/tests/prediction.rs`.
 
 ### Reverse-Z rendering
 
@@ -227,10 +292,14 @@ Above the horizon the color rises from horizon pale to zenith blue with
 | Input | Action |
 | --- | --- |
 | W / A / S / D | Move (yaw-plane) |
-| Space / Shift | Move up / down (world Y) |
-| Ctrl | Sprint (×4) |
+| Space | Jump (walk) / fly up |
+| Shift | Fly down |
+| Ctrl | Sprint (walk 5.6, fly 22 blocks/s) |
+| F | Toggle fly (one edge per press) |
 | Mouse | Look (while cursor grabbed) |
-| Left click | Grab + hide cursor (Locked, falls back to Confined) |
+| Left click | Grab + hide cursor (Locked, falls back to Confined); once grabbed, break the target block (hold to repeat every 0.25 s) |
+| Right click | Place the hotbar block against the targeted face (hold to repeat) |
+| 1–9 | Hotbar: stone, dirt, grass_block, sand, glass, oak_planks, oak_log, leaves, water |
 | Esc | Release cursor; a second Esc quits |
 
 `JBM_VSYNC=0` switches the surface from `AutoVsync` to `AutoNoVsync`.
@@ -243,8 +312,16 @@ quads (integer scale, 2× by default) with alpha blending: white text on a
 semi-transparent dark box per line. `FrameStats` averages FPS / frame ms
 over a sliding 0.5 s window (pure logic, unit-tested). The app fills the
 lines `FPS`, `XYZ` (2 decimals), `CUBE` (32-block cube coordinates),
-`YAW`/`PITCH` in degrees, `CUBES`/`MESHED`/`PENDING` and
-`FACES`/`DRAWS`.
+`YAW`/`PITCH` in degrees, `CUBES`/`MESHED`/`PENDING`,
+`FACES`/`DRAWS`, `TARGET` (block position and state name) and `HOTBAR`.
+Whenever an overlay is drawn, a centered crosshair (white with a dark
+outline) is drawn too.
+
+**Target outline:** `render/outline.rs` draws a line-list box around the
+targeted block, expanded by 0.002, depth-tested, 60% black. Lines get no
+depth bias, so the shader pulls each vertex 0.2% of its distance toward
+the camera; without that the edges z-fought into dashes against
+coplanar neighbor faces.
 
 ## Screenshot tests
 

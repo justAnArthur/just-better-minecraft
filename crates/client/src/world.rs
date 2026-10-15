@@ -6,8 +6,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use glam::DVec3;
-use jbm_core::coords::CubePos;
+use jbm_core::block::{BlockRegistry, builtin};
+use jbm_core::coords::{BlockPos, CUBE_SIZE, CubePos};
 use jbm_core::cube::Cube;
+use jbm_core::physics::{BlockShapes, SolidTable};
 use jbm_core::protocol::ServerMsg;
 
 use crate::mesh::greedy::{MeshInput, neighbor_index};
@@ -22,12 +24,22 @@ pub enum WorldChange {
     Loaded(CubePos),
     /// A cube left the range; the app also drops its GPU mesh.
     Unloaded(CubePos),
+    /// One block changed (`BlockChange`, or an optimistic edit): the cube
+    /// and its border neighbors were dirtied with edit priority. The
+    /// position is the block's, not the cube's.
+    Edited(BlockPos),
 }
 
 /// Cubes the client has, plus re-mesh bookkeeping.
 ///
 /// - `CubeData` dirties the cube and its 26 loaded neighbors (a new
 ///   neighbor changes border faces and AO).
+/// - A block edit (`BlockChange` or an optimistic `set_block`) dirties the
+///   block's cube plus every loaded neighbor cube the block touches
+///   through faces, edges or corners (see [`ClientWorld::set_block`]) and
+///   gives the edited cube priority: [`ClientWorld::take_dirty`] takes
+///   priority cubes first, so edits re-mesh promptly even while streaming
+///   keeps the queue busy.
 /// - Every dirtying gives the cube a fresh version from one world-wide
 ///   counter that never resets, so a mesh job built from older data (even
 ///   one from before an unload and reload) can never match the current
@@ -39,7 +51,13 @@ pub struct ClientWorld {
     cubes: HashMap<CubePos, Arc<Cube>>,
     versions: HashMap<CubePos, u32>,
     dirty: HashSet<CubePos>,
+    /// Dirty cubes taken first by `take_dirty`: those holding a recent
+    /// edit. Always a subset of `dirty`.
+    priority: HashSet<CubePos>,
     next_version: u32,
+    /// Per-state solidity for collision; `new` builds the builtin table so
+    /// plain construction stays usable in tests.
+    solid: SolidTable,
 }
 
 impl Default for ClientWorld {
@@ -48,13 +66,26 @@ impl Default for ClientWorld {
     }
 }
 
+impl BlockShapes for ClientWorld {
+    fn solid(&self, pos: BlockPos) -> Option<bool> {
+        let (cube_pos, local) = pos.split();
+        self.cubes
+            .get(&cube_pos)
+            .map(|cube| self.solid.is_solid(cube.get(local)))
+    }
+}
+
 impl ClientWorld {
     pub fn new() -> ClientWorld {
+        let mut registry = BlockRegistry::new();
+        builtin::register(&mut registry);
         ClientWorld {
             cubes: HashMap::new(),
             versions: HashMap::new(),
             dirty: HashSet::new(),
+            priority: HashSet::new(),
             next_version: 0,
+            solid: SolidTable::new(&registry),
         }
     }
 
@@ -85,10 +116,20 @@ impl ClientWorld {
                 }
                 WorldChange::Loaded(*pos)
             }
+            ServerMsg::BlockChange { pos, state } => {
+                if self.set_block(*pos, *state) {
+                    WorldChange::Edited(*pos)
+                } else {
+                    // The cube is not loaded: nothing to update. A later
+                    // `CubeData` for it already contains the edit.
+                    WorldChange::None
+                }
+            }
             ServerMsg::UnloadCube { pos } => {
                 self.cubes.remove(pos);
                 self.versions.remove(pos);
                 self.dirty.remove(pos);
+                self.priority.remove(pos);
                 WorldChange::Unloaded(*pos)
             }
             _ => WorldChange::None,
@@ -103,25 +144,107 @@ impl ClientWorld {
         self.dirty.insert(pos);
     }
 
-    /// Takes up to `budget` dirty cubes, nearest to `camera` first, and
-    /// builds their mesh inputs (center plus the 26 loaded neighbors).
-    /// Taken cubes leave the dirty set; results that arrive stale are
-    /// dropped by the caller using the returned version.
+    /// [`mark_dirty`] plus edit priority: `take_dirty` takes this cube
+    /// before any streaming-dirty cube.
+    fn mark_dirty_priority(&mut self, pos: CubePos) {
+        self.mark_dirty(pos);
+        self.priority.insert(pos);
+    }
+
+    /// Sets one block (an optimistic edit, or an authoritative
+    /// `BlockChange`). Returns `false` when the block's cube is not
+    /// loaded — the edit is then ignored, and a later `CubeData` for the
+    /// cube carries the authoritative content anyway.
+    ///
+    /// Dirties the block's cube plus every loaded neighbor cube the block
+    /// touches through faces, edges or corners: a block at local x == 0
+    /// dirties the -X neighbor, one at x == CUBE_SIZE - 1 the +X neighbor,
+    /// and so on per axis, up to 7 neighbors for a corner block (a border
+    /// block changes the neighbor's face culling and AO). Only loaded
+    /// neighbors are dirtied, all at edit priority.
+    ///
+    /// Setting a block to the state it already has dirties nothing: the
+    /// server's echo of an accepted optimistic edit costs no re-mesh.
+    pub fn set_block(&mut self, pos: BlockPos, state: jbm_core::block::BlockStateId) -> bool {
+        let (cube_pos, local) = pos.split();
+        let Some(cube) = self.cubes.get_mut(&cube_pos) else {
+            return false;
+        };
+        if cube.get(local) == state {
+            return true;
+        }
+        // Copies only when a mesh job still holds the old cube.
+        Arc::make_mut(cube).set(local, state);
+        self.dirty_block(cube_pos, local);
+        true
+    }
+
+    /// The edit dirty rule from [`ClientWorld::set_block`], on an
+    /// already-split position. The edited cube gets priority; its dirtied
+    /// neighbors do not (they re-mesh right behind it in the normal
+    /// nearest-first order).
+    fn dirty_block(&mut self, cube_pos: CubePos, local: jbm_core::coords::LocalPos) {
+        self.mark_dirty_priority(cube_pos);
+        // Offsets to reach on each axis: none, or -1 / +1 on a border.
+        let span = |v: u8| -> ([i32; 1], usize) {
+            if v == 0 {
+                ([-1], 1)
+            } else if v == (CUBE_SIZE - 1) as u8 {
+                ([1], 1)
+            } else {
+                ([0], 0)
+            }
+        };
+        let ([dx], nx) = span(local.x);
+        let ([dy], ny) = span(local.y);
+        let ([dz], nz) = span(local.z);
+        for i in 0..=nx {
+            for j in 0..=ny {
+                for k in 0..=nz {
+                    if i + j + k == 0 {
+                        continue; // the edited cube itself
+                    }
+                    let neighbor = CubePos {
+                        x: cube_pos.x + if i == 0 { 0 } else { dx },
+                        y: cube_pos.y + if j == 0 { 0 } else { dy },
+                        z: cube_pos.z + if k == 0 { 0 } else { dz },
+                    };
+                    // Priority too: a border edit opens or closes faces
+                    // in the neighbor's mesh, and a late neighbor shows a
+                    // hole into the world.
+                    if self.cubes.contains_key(&neighbor) {
+                        self.mark_dirty_priority(neighbor);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Takes up to `budget` dirty cubes — edited cubes first (task 1.7's
+    /// priority set), then the rest — each group nearest to `camera` first
+    /// — and builds their mesh inputs (center plus the 26 loaded
+    /// neighbors). Taken cubes leave the dirty set; results that arrive
+    /// stale are dropped by the caller using the returned version.
     pub fn take_dirty(&mut self, budget: usize, camera: DVec3) -> Vec<(CubePos, u32, MeshInput)> {
         if self.dirty.is_empty() {
             return Vec::new();
         }
-        let mut order: Vec<(CubePos, f64)> = self
+        let distance = |pos: CubePos| (cube_center(pos) - camera).length_squared();
+        let mut ordered: Vec<CubePos> = self.priority.iter().copied().collect();
+        ordered.sort_by(|a, b| distance(*a).total_cmp(&distance(*b)));
+        let mut rest: Vec<CubePos> = self
             .dirty
             .iter()
-            .map(|&pos| {
-                let center = cube_center(pos);
-                let d = center - camera;
-                (pos, d.length_squared())
-            })
+            .copied()
+            .filter(|pos| !self.priority.contains(pos))
             .collect();
-        order.sort_by(|a, b| a.1.total_cmp(&b.1));
-        let taken: Vec<CubePos> = order.into_iter().take(budget).map(|(pos, _)| pos).collect();
+        rest.sort_by(|a, b| distance(*a).total_cmp(&distance(*b)));
+        ordered.extend(rest);
+        let taken: Vec<CubePos> = ordered.into_iter().take(budget).collect();
+        for pos in &taken {
+            self.dirty.remove(pos);
+            self.priority.remove(pos);
+        }
         let mut inputs = Vec::with_capacity(taken.len());
         for pos in taken {
             self.dirty.remove(&pos);
@@ -171,14 +294,35 @@ impl ClientWorld {
     pub fn cube(&self, pos: CubePos) -> Option<&Arc<Cube>> {
         self.cubes.get(&pos)
     }
+
+    /// The block at `pos`, or `None` when its cube is not loaded.
+    pub fn block(&self, pos: BlockPos) -> Option<jbm_core::block::BlockStateId> {
+        let (cube_pos, local) = pos.split();
+        self.cubes.get(&cube_pos).map(|cube| cube.get(local))
+    }
+
+    /// Whether `state` has a collision shape (the builtin registry's
+    /// table) — the place-overlap check for optimistic edits.
+    pub fn is_solid_state(&self, state: jbm_core::block::BlockStateId) -> bool {
+        self.solid.is_solid(state)
+    }
+
+    /// Test hook: removes a single block from the client's copy of the
+    /// world only — the server never learns of it. Prediction tests use it
+    /// to make the client's collision world disagree with the server's.
+    #[cfg(feature = "testing")]
+    pub fn remove_block(&mut self, pos: BlockPos) {
+        self.set_block(pos, jbm_core::block::BlockStateId::AIR);
+    }
 }
 
 /// World-space center of a cube, for distance ordering.
 fn cube_center(pos: CubePos) -> DVec3 {
+    let size = f64::from(CUBE_SIZE);
     DVec3::new(
-        f64::from(pos.x) * 32.0 + 16.0,
-        f64::from(pos.y) * 32.0 + 16.0,
-        f64::from(pos.z) * 32.0 + 16.0,
+        f64::from(pos.x) * size + size / 2.0,
+        f64::from(pos.y) * size + size / 2.0,
+        f64::from(pos.z) * size + size / 2.0,
     )
 }
 
@@ -341,5 +485,230 @@ mod tests {
             WorldChange::None
         );
         assert_eq!(world.cube_count(), 0);
+    }
+
+    #[test]
+    fn block_shapes_reads_loaded_air_and_missing() {
+        use jbm_core::physics::BlockShapes;
+
+        let mut world = ClientWorld::new();
+        let origin = CubePos { x: 0, y: 0, z: 0 };
+        // A stone floor cube below an air cube above it.
+        world.apply(&ServerMsg::CubeData {
+            pos: origin,
+            cube: stone_cube(),
+        });
+        world.apply(&ServerMsg::CubeData {
+            pos: CubePos { x: 0, y: 1, z: 0 },
+            cube: Box::new(Cube::default()),
+        });
+        let solid = |x: i64, y: i64, z: i64| world.solid(BlockPos { x, y, z });
+        assert_eq!(solid(3, 2, 7), Some(true), "stone inside the floor cube");
+        assert_eq!(solid(0, 32, 0), Some(false), "air in the cube above");
+        assert_eq!(solid(0, 64, 0), None, "an unloaded cube is None");
+    }
+
+    /// Loads a 3x3x3 grid of cubes, clears the dirty set and returns the
+    /// world ready for an edit-dirty-rule assertion.
+    fn settled_grid() -> ClientWorld {
+        let mut world = ClientWorld::new();
+        for dy in -1..=1 {
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    world.apply(&cube_data(CubePos {
+                        x: dx,
+                        y: dy,
+                        z: dz,
+                    }));
+                }
+            }
+        }
+        let _ = world.take_dirty(usize::MAX, DVec3::ZERO);
+        assert_eq!(world.dirty_count(), 0);
+        world
+    }
+
+    #[test]
+    fn block_edits_dirty_exactly_the_touched_cubes() {
+        let last = (CUBE_SIZE - 1) as u8;
+        let cases: [(u8, u8, u8, Vec<CubePos>); 4] = [
+            // Interior: only the edited cube.
+            (5, 5, 5, vec![CubePos { x: 0, y: 0, z: 0 }]),
+            // Face block on -X: the -X neighbor too.
+            (
+                0,
+                5,
+                5,
+                vec![CubePos { x: 0, y: 0, z: 0 }, CubePos { x: -1, y: 0, z: 0 }],
+            ),
+            // Edge block at (-X, -Y, +Z): two face neighbors, one edge.
+            (
+                0,
+                0,
+                last,
+                vec![
+                    CubePos { x: 0, y: 0, z: 0 },
+                    CubePos { x: -1, y: 0, z: 0 },
+                    CubePos { x: 0, y: -1, z: 0 },
+                    CubePos { x: -1, y: -1, z: 0 },
+                    CubePos { x: 0, y: 0, z: 1 },
+                    CubePos { x: -1, y: 0, z: 1 },
+                    CubePos { x: 0, y: -1, z: 1 },
+                    CubePos { x: -1, y: -1, z: 1 },
+                ],
+            ),
+            // Corner block: all 7 neighbors.
+            (
+                last,
+                0,
+                0,
+                vec![
+                    CubePos { x: 0, y: 0, z: 0 },
+                    CubePos { x: 1, y: 0, z: 0 },
+                    CubePos { x: 0, y: -1, z: 0 },
+                    CubePos { x: 1, y: -1, z: 0 },
+                    CubePos { x: 0, y: 0, z: -1 },
+                    CubePos { x: 1, y: 0, z: -1 },
+                    CubePos { x: 0, y: -1, z: -1 },
+                    CubePos { x: 1, y: -1, z: -1 },
+                ],
+            ),
+        ];
+        for (x, y, z, expected) in cases {
+            let mut world = settled_grid();
+            let at = BlockPos {
+                x: i64::from(x),
+                y: i64::from(y),
+                z: i64::from(z),
+            };
+            assert!(
+                world.set_block(at, jbm_core::block::BlockStateId::AIR),
+                "cube loaded"
+            );
+            let mut dirtied: Vec<CubePos> = world
+                .take_dirty(usize::MAX, DVec3::new(16.0, 16.0, 16.0))
+                .into_iter()
+                .map(|(pos, _, _)| pos)
+                .collect();
+            dirtied.sort_by_key(|p| (p.x, p.y, p.z));
+            let mut expected = expected;
+            expected.sort_by_key(|p| (p.x, p.y, p.z));
+            assert_eq!(dirtied, expected, "local ({x},{y},{z})");
+            assert_eq!(world.dirty_count(), 0);
+        }
+    }
+
+    #[test]
+    fn an_edit_echo_dirties_nothing() {
+        let mut world = settled_grid();
+        let at = BlockPos { x: 5, y: 5, z: 5 };
+        assert!(world.set_block(at, jbm_core::block::BlockStateId::AIR));
+        let _ = world.take_dirty(usize::MAX, DVec3::ZERO);
+        let version = world.version(CubePos { x: 0, y: 0, z: 0 });
+        let echo = ServerMsg::BlockChange {
+            pos: at,
+            state: jbm_core::block::BlockStateId::AIR,
+        };
+        assert_eq!(world.apply(&echo), WorldChange::Edited(at));
+        assert_eq!(world.dirty_count(), 0);
+        assert_eq!(world.version(CubePos { x: 0, y: 0, z: 0 }), version);
+    }
+
+    #[test]
+    fn unloaded_neighbors_are_not_dirtied_by_an_edit() {
+        let mut world = ClientWorld::new();
+        // A lone cube: every neighbor is missing, so only it dirties.
+        world.apply(&cube_data(CubePos { x: 7, y: 0, z: 0 }));
+        let _ = world.take_dirty(usize::MAX, DVec3::ZERO);
+        let corner =
+            CubePos { x: 7, y: 0, z: 0 }.block(jbm_core::coords::LocalPos { x: 0, y: 0, z: 0 });
+        assert!(world.set_block(corner, jbm_core::block::BlockStateId::AIR));
+        assert_eq!(world.dirty_count(), 1);
+    }
+
+    #[test]
+    fn block_change_sets_loaded_blocks_and_ignores_the_rest() {
+        let mut world = ClientWorld::new();
+        let origin = CubePos { x: 0, y: 0, z: 0 };
+        world.apply(&cube_data(origin));
+        let _ = world.take_dirty(usize::MAX, DVec3::ZERO);
+        let at = BlockPos { x: 3, y: 2, z: 7 };
+        let mut registry = BlockRegistry::new();
+        let blocks = builtin::Blocks::register(&mut registry);
+        assert_eq!(
+            world.apply(&ServerMsg::BlockChange {
+                pos: at,
+                state: blocks.dirt
+            }),
+            WorldChange::Edited(at)
+        );
+        assert_eq!(world.block(at), Some(blocks.dirt));
+        assert_eq!(world.dirty_count(), 1, "interior block: just the cube");
+
+        // An unloaded cube ignores the change entirely.
+        let far = BlockPos {
+            x: 1000,
+            y: 0,
+            z: 0,
+        };
+        assert_eq!(
+            world.apply(&ServerMsg::BlockChange {
+                pos: far,
+                state: blocks.dirt
+            }),
+            WorldChange::None
+        );
+        assert_eq!(world.block(far), None);
+        assert_eq!(world.dirty_count(), 1);
+    }
+
+    #[test]
+    fn edited_cubes_jump_the_mesh_queue() {
+        let mut world = ClientWorld::new();
+        // Streaming dirt: three cubes, the far one nearest the camera.
+        for pos in [
+            CubePos { x: 40, y: 0, z: 0 },
+            CubePos { x: 5, y: 0, z: 0 },
+            CubePos { x: 0, y: 0, z: 0 },
+        ] {
+            world.apply(&cube_data(pos));
+        }
+        let camera = DVec3::new(1290.0, 16.0, 16.0); // near the x=40 cube
+        let edited = BlockPos { x: 3, y: 2, z: 7 }; // inside cube (0,0,0)
+        let mut registry = BlockRegistry::new();
+        let blocks = builtin::Blocks::register(&mut registry);
+        assert!(world.set_block(edited, blocks.dirt));
+
+        // The edited cube is taken first even though it is farthest.
+        let taken = world.take_dirty(1, camera);
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].0, CubePos { x: 0, y: 0, z: 0 });
+        // Then normal nearest-first for the rest.
+        let rest = world.take_dirty(usize::MAX, camera);
+        let order: Vec<CubePos> = rest.iter().map(|(p, _, _)| *p).collect();
+        assert_eq!(
+            order,
+            vec![CubePos { x: 40, y: 0, z: 0 }, CubePos { x: 5, y: 0, z: 0 }]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn remove_block_guts_only_the_client_copy() {
+        use jbm_core::physics::BlockShapes;
+
+        let mut world = ClientWorld::new();
+        let origin = CubePos { x: 0, y: 0, z: 0 };
+        world.apply(&cube_data(origin));
+        let at = BlockPos { x: 3, y: 2, z: 7 };
+        assert_eq!(world.solid(at), Some(true));
+        world.remove_block(at);
+        assert_eq!(world.solid(at), Some(false), "the block is gone");
+        assert_eq!(
+            world.solid(BlockPos { x: 4, y: 2, z: 7 }),
+            Some(true),
+            "its neighbors stay"
+        );
+        assert_eq!(world.dirty_count(), 1, "the cube re-meshes");
     }
 }

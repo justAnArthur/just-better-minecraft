@@ -68,11 +68,33 @@ threads — what exact-message-sequence tests and benches use.
 
 A connection is pending until a valid `Hello` (matching `PROTOCOL_VERSION`),
 then joined with a fresh `PlayerId` starting at 1. `Welcome.spawn` is the
-terrain spawn over column (0, 0). Wrong version → `Rejected` + drop; a
+terrain spawn over column (0, 0) — the player's initial physics state:
+velocity 0, not on ground, walking. Wrong version → `Rejected` + drop; a
 non-`Hello` while pending → `Disconnected` + drop; `Ping` → `Pong`;
-`PlayerInput` → stored as latest input and counted; `Disconnect` or a
-closed link → the player is removed. Sends to closed links remove the
-player and never panic.
+`PlayerInput` → queued for phase 4; `Disconnect` or a closed link → the
+player is removed. Sends to closed links remove the player and never
+panic.
+
+## Player physics and input processing (task 1.6)
+
+Each joined player holds the authoritative `PlayerState` (from spawn), a
+queue of received inputs and the last processed seq. Phase 1 pushes
+`PlayerInput`s onto the queue: an input whose seq is ≤ the last processed
+one is ignored; the queue is capped at **20**, dropping the oldest on
+overflow. Phase 4 steps, per player in join order, up to **4** queued
+inputs per tick through the shared `jbm_core::physics::step`, against a
+`BlockShapes` view of the server's world (a missing cube reads as `None`
+— one cube lookup per block, no clones; the flat `SolidTable` decides
+shapes). Physics is **input-driven**: a tick with no queued input does
+not step the player, so a stalled client freezes in place. Anti-cheat
+and input timeouts are a later task; the caps above are the only
+protection for now.
+
+Phase 5 sends `PlayerState { ack_seq, state }` — the state after
+processing input `ack_seq` — before the `Tick`, only in ticks where at
+least one input was processed. The streaming center is the cube
+containing the authoritative position. `PlayerView` (what `players()`
+returns) exposes `state`, `last_seq` and `input_count`.
 
 **Tick phases** (fixed order, per `docs/design.md` "Simulation"):
 
@@ -80,14 +102,15 @@ player and never panic.
    at 256 messages per connection per tick (leftovers wait).
 2. Scheduled block ticks — stub until Stage 2.
 3. Block update queue — stub until Stage 2.
-4. ECS systems — stub until bevy_ecs (task 1.5+).
-5. Light and outgoing changes — the streaming pass (below), then `Tick`
-   is sent to every joined player (so cubes always precede their tick).
+4. ECS systems — player physics, as described above.
+5. Light and outgoing changes — the streaming pass (below), then each
+   player's `PlayerState` (if any input was processed), then `Tick` for
+   every joined player (so cubes and state always precede their tick).
 
 ## Cube streaming (phase 5)
 
-For a player whose center cube is `c` (latest `PlayerInput` position, else
-the spawn cube):
+For a player whose center cube is `c` (the cube containing their
+authoritative `PlayerState` position):
 
 - **Desired set:** every cube with `dx² + dz² ≤ R²` and `|dy| ≤ V`. The
   offset list is precomputed once per config, sorted nearest-first by
@@ -114,9 +137,33 @@ offset list, so nothing is scanned. Unload scans and world eviction run
 only when something changed (a player moved or left, results arrived).
 
 **Eviction:** cubes are dropped from server memory when no player's keep
-set contains them. Regeneration is exact, so this is lossless — for now.
-**Task 1.7 must pin edited cubes (or they will be lost on walk-away) until
-persistence lands in 2.3.**
+set contains them, except pinned (edited) cubes, which are never evicted.
+Unedited cubes regenerate exactly, so dropping them is lossless. Pinned
+cubes grow without bound until persistence lands in 2.3. Generation
+results never overwrite a cube already in the world (`entry().or_insert`),
+so an edit cannot be clobbered by a late generation result.
+
+## Block edits (task 1.7)
+
+`BreakBlock` and `PlaceBlock` are handled in phase 1, in message order,
+against the player's authoritative `PlayerState` at that moment. An edit
+is accepted only when:
+
+- the block's cube is in the server world;
+- the block center is within `REACH + 1.0` of the player's eye (the
+  margin covers latency);
+- break: the block is not air;
+- place: the target is air, the state is registered and not air, and a
+  solid state's unit box does not strictly overlap any joined player.
+
+An accepted edit sets the block, pins its cube and queues a `BlockChange`
+for everyone. A rejected one queues a `BlockChange` with the current
+state to the sender only, reverting their optimistic edit; rejections
+never disconnect. In phase 5, queued changes go out before the streaming
+pass and before `Tick`, to each player whose sent set holds the cube, so
+an edit reaches every nearby client within the tick it was made. A cube
+first sent later in the same tick already contains the edit, so it is
+never stale. Test reads: `pinned_count()`, `block(pos)`.
 
 **Disconnect:** the player's sent-set is freed and its cubes are evicted
 on the next tick unless another player keeps them.
@@ -172,6 +219,7 @@ Current cases:
 
 **Invariants**
 
-- Depends only on `jbm-core`; never on `jbm-client`. Both sides
-  communicate exclusively through `jbm-core` protocol messages.
+- Depends only on `jbm-core` (plus `glam` for the player state's `DVec3`);
+  never on `jbm-client`. Both sides communicate exclusively through
+  `jbm-core` protocol messages.
 - Hot paths (lighting, worldgen inner loops) never call into mods.
