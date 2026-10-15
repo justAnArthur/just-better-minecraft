@@ -41,6 +41,20 @@ Baselines are bench worker runs on an otherwise idle machine. Run-to-run noise o
 - 2026-10-14: Workers run through `scripts/delegate.sh` (the `glm` CLI directly, in the background) rather than the haiku relay agent, so long Rust builds aren't cut off by the relay's 10-minute Bash timeout.
 - 2026-10-14: Screenshot tests compare with a tolerance and skip when no GPU adapter exists, unless `JBM_REQUIRE_GPU=1` (set in CI on Linux with Mesa lavapipe).
 
+- 2026-10-15: **Cube size stays 32³** (task 1.8). Same 128×96×128 terrain region, M5 Pro under light load:
+
+  | | 32³ | 16³ |
+  |---|---|---|
+  | mesh whole region | 5.65 ms | 8.70 ms (+54%) |
+  | re-mesh one edited cube | 236 µs | 55 µs |
+  | build region (gen proxy) | 67 ms | 79 ms |
+  | draw calls (region) | 24 | 82 |
+  | cubes to stream, 256-block view | 1,773 | 13,549 |
+  | cube memory (region) | 240 KB | 132 KB + 8× map entries |
+  | GPU frame (region, 720p) | 0.71 ms | 0.92 ms |
+
+  16³ wins only single-edit latency and storage of mostly-uniform space. A 236 µs re-mesh, even ×8 for a corner edit, is far inside a frame on the worker pool. Every per-cube cost scales 8× at 16³: messages, map entries, draws, and later LOD nodes and redb keys. The `cube16` feature stays for re-measuring, but CI does not build it, so expect it to rot.
+
 ## Known issues
 
 - client/render/texture_array.rs: mip box filter applies the sRGB curve to alpha too. Fix in 1.4 before translucent textures (filter alpha linearly).
@@ -68,3 +82,4 @@ Baselines are bench worker runs on an otherwise idle machine. Run-to-run noise o
 - User played the merged build: terrain renders and streams.
 - Wave B follow-ups: workspace crates build at opt-level 1 in dev (client unit tests 32 s → 4 s, workspace suite ~8 s); end-to-end terrain screenshot (`crates/game/tests/terrain_screenshot.rs`, golden `terrain_spawn`, inspected: terraces, grass sides, sand, no holes). Mesh/worldgen baselines deferred: machine never idle.
 - bench-2: mesh/worldgen baselines from an idle run (user ran them with other apps closed). terrain_like 221 µs, inside the ≤300 µs target; the earlier 2× numbers were load.
+- 1.8 merged on stage-1/wave-c: `cube16` feature (cube-size literals now derive from `CUBE_SIZE`), `cube_size` bench and `cube_size_metrics` example in jbm-game. Decision: keep 32³ (see Decisions).

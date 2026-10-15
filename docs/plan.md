@@ -82,7 +82,7 @@ Blocks are hardcoded in Rust for now.
 | B | [x] 1.5 Simple noise terrain, cube streaming around the player | `server` | Headless test streams cubes in a radius; screenshot of terrain |
 | C | [ ] 1.6 Collision, walk and fly, client prediction with server correction | `client`, `server` | Tests: no falling through floors, prediction converges |
 | C | [ ] 1.7 Raycast, break and place blocks, re-mesh on change | `client`, `server` | Test: edit on server shows on client within one tick |
-| C | [ ] 1.8 Benchmark 16³ vs 32³ cubes (meshing time, memory, draw calls) | bench | Decision recorded in progress.md |
+| C | [x] 1.8 Benchmark 16³ vs 32³ cubes (meshing time, memory, draw calls) | bench | Decision recorded in progress.md |
 
 **Gate:** you play it: walk, break, place. Then `/clear`.
 
