@@ -860,6 +860,8 @@ dependencies = [
  "criterion",
  "glam",
  "jbm-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

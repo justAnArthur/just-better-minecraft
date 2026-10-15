@@ -5,28 +5,108 @@ server side of the protocol.
 
 ## Terrain (`terrain`)
 
-Temporary noise terrain (task 2.1 replaces it with the declarative density
-graph). `Generator::new(seed, Blocks)` produces cubes;
-`generate(CubePos) -> Cube` is a pure function of `(seed, pos)`, and
-`surface_height(x, z) -> i64` is public (the spawn point is
-`[0.5, h(0,0) + 2.0, 0.5]`).
+`Generator::new(seed, Blocks)` produces cubes by evaluating the compiled
+shipped worldgen graph (below); `generate(CubePos) -> Cube` is a pure
+function of `(seed, pos)`, and `surface_height(x, z) -> i64` is public (the
+spawn point is `[0.5, h(0,0) + 2.0, 0.5]`). `Generator::from_graph(seed,
+Blocks, &CompiledGraph)` runs any graph instead — for tests now, mods from
+Stage 3. `MIN_HEIGHT = 36` and `MAX_HEIGHT = 92` stay the documented bounds
+of the shipped graph.
 
 - **Layering per column with surface height `h`:** grass_block at `h`, dirt
   from `h-3` to `h-1`, stone below; sand replaces grass and dirt where
   `h ≤ 61`. No water, trees or caves yet.
-- **Height range:** `h = 64 + clamp(40 · hilliness · rolling, ±28)`, so
-  heights provably stay in `[36, 92]`. `rolling` is a 5-octave fractal
-  (±28 hills); `hilliness` is a very low frequency mask that leaves some
-  areas flat and others mountainous.
-- **Determinism rule:** only IEEE-754 `+ - * floor` on `f64` plus integer
-  hashing into a fixed 256-entry gradient table — no `sin`/`cos`/`exp`,
-  which are not bit-exact across platforms. The same seed gives identical
-  terrain everywhere, well past |x| = 10⁹.
-- **Fast paths:** a cube above the column-max height of its 32² area is a
-  uniform air cube; one whose top is below `min height - 4` is uniform
-  stone. The 32² heightmap of a column is computed once (bounded cache of
-  64 columns) and shared by all `cy` values. Mixed cubes are built in one
-  `Cube::from_fn` pass — never per-block `set`.
+- **Fast paths:** interval bounds over the cube decide uniform air (density
+  max < 0) and uniform stone (density min ≥ 0 over the cube extended 4 cells
+  up, so every surface run is provably saturated). Mixed cubes evaluate per
+  column in one downward pass and build in one `Cube::from_fn` sweep —
+  never per-block `set`. A bounded per-column cache (64 cube columns) keeps
+  the evaluated surface band so vertically adjacent cubes cost almost
+  nothing; it is a pure-function cache and cannot change answers.
+- The task 1.5 noise terrain lives on as `worldgen::reference`, kept only
+  for the equivalence tests and the comparison bench.
+
+## Worldgen graph (`worldgen`)
+
+Terrain shape is data: a JSON graph of density functions, compiled once by
+`compile(&Graph) -> CompiledGraph` into a flat, topologically ordered
+instruction list over a register array — no recursion, no allocation per
+sample. A cell is **solid** when `final_density ≥ 0`. The shipped graph is
+`assets/worldgen/overworld.json` (`worldgen::OVERWORLD_JSON`, also compiled
+once per process by `worldgen::overworld()`); it re-expresses the task 1.5
+terrain bit-identically.
+
+**Format** (`Graph::from_json`, version 1): a `nodes` map of named,
+shareable subexpressions (compiled once per sample however often they are
+referenced) and an `outputs` map that must contain `final_density`. An
+operand is a JSON number (constant), `{"ref": "name"}` (named node), or an
+inline node object. Every load error is a typed `GraphError` naming the
+offending node path (`nodes.hills.a`, `outputs.final_density`): unknown
+type, missing field, dangling ref, cycle, bad spline, unknown version,
+missing output. Loading never panics on bad input.
+
+**Node table** (all `f64`):
+
+| node | fields | notes |
+| --- | --- | --- |
+| `x`, `y`, `z` | — | block coordinates of the sample |
+| `add`, `sub`, `mul`, `min`, `max` | `a`, `b` | |
+| `neg`, `abs`, `floor` | `a` | |
+| `clamp` | `input`, `min`, `max` | `f64::clamp` semantics; `min > max` is a compile error when constant |
+| `noise2` | `salt`, `x_scale`, `z_scale` | the reference 2D gradient noise at `(x·x_scale, z·z_scale)`, seeded `world_seed ^ salt`; range ±√2/2 |
+| `fbm2` | `salt`, `scale`, `octaves` | the reference fractal sum at `(x·scale, z·scale)`, normalized; range ±√2/2 |
+| `spline` | `input`, `points` | piecewise linear over `[[x, y], …]`, clamped at both ends; points strictly increasing in `x`, at least two |
+
+Salts are full `u64`s written as hex strings (`"0x0D1B54A32D168ED5"`) so
+values above 2⁵³ round-trip through JSON exactly.
+
+**Determinism and the association rule.** Nodes use only IEEE-754
+`+ - * /`, `floor` and comparisons, plus integer hashing into the fixed
+256-entry gradient table — every one of those is bit-exact on every
+platform, so the same `(seed, graph)` gives identical terrain everywhere.
+No `sin`/`cos`/`exp`/`powf` anywhere. Float arithmetic is commutative but
+**not associative**: the expression tree's shape fixes the bits, so keep
+operand nesting exactly as written when editing `overworld.json` — it
+computes `(40 · hilliness) · rolling`, not `40 · (hilliness · rolling)`.
+The equivalence tests catch any drift.
+
+**Compilation stages.** `compile` folds constants, then splits
+instructions by dimension analysis: constants run once, column-stage (xz)
+instructions once per `(x, z)` column, cell-stage (xyz) instructions once
+per block. The shipped graph's only cell-stage work is `y` and `- y`, so 3D
+evaluation stays near heightmap cost. `CompiledGraph::bounds(min, max)`
+gives sound interval bounds over an inclusive box (noise contributes its
+documented ±√2/2); the cube fast paths above are built on it.
+
+**Surface stage** (code, not graph, for now): for a solid cell at `y`, let
+`d` be the number of consecutive solid cells directly above it, capped at
+4. If `d ≤ 3` and the surface `y + d` is at or below 61 (`SAND_LEVEL`):
+sand; else if `d = 0`: grass; else if `d ≤ 3`: dirt; else stone. Computing
+`d` for the top rows evaluates up to 4 cells above the cube — never a
+neighbour cube. For a pure heightmap density this is exactly the old
+`column_block`; the equivalence argument is a comment on
+`terrain::surface_block`.
+
+**Per-column cache.** Rows the interval bounds cannot decide form a band
+(the shipped graph's is `y ∈ (36, 93)`); the generator caches one solidity
+bit per band row per column — today's heightmap cache, generalized — so
+vertically adjacent cubes reuse it instead of re-running noise. Graphs
+whose band cannot be proven fall back to caching live column-stage values
+and evaluating rows on demand.
+
+**`sample_grid` layout** (for later LOD tasks): `CompiledGraph::
+sample_grid(seed, origin, step, out)` fills a 32³ grid of densities at
+`origin + step·(i, j, k)` over `(x = i, y = j, z = k)`, laid out as
+`(k·32 + j)·32 + i`, `step` a power of two in `1..=64`. The column stage
+runs once per grid column; step 1 at a cube origin gives exactly the
+densities `generate`'s solidity decisions use.
+
+**Adding a node:** add the variant to `Node` (with its serde shape), parse
+it in `parse_node` (allow-list its fields), add an `Op` variant plus its
+`operands`/`remap` arms, evaluate it in `eval_op`, give it an interval rule
+in `interval_op` (sound, not tight), extend the error tests, and add its
+row to the table above. Anything beyond `+ - * / floor` and comparisons
+breaks the determinism rule — don't.
 
 ## Generation pool (`gen_pool`)
 
@@ -214,12 +294,19 @@ Current cases:
   R = 8 (1773 cubes), inline mode, nothing left to send: the idle floor.
 - `worldgen/heightmap_32x32` — a 32×32 patch of surface heights.
 - `worldgen/surface_cube` — a cube intersecting the surface (mixed path,
-  heightmap cached).
+  per-column cache warm).
 - `worldgen/air_cube` — a cube far above the surface (fast path).
+- `worldgen/reference_surface_cube` — the task 1.5 generator on the same
+  cube; the graph path must stay within 2× of it (task 2.1 budget).
+- `worldgen/compile_overworld` — parsing and compiling the shipped graph.
+- `worldgen/sample_grid/{1,2,4,8,32}` — one 32³ density grid near the
+  surface per LOD step; step 32 spans 1,024 blocks (every column a cache
+  miss, the worst case).
 
 **Invariants**
 
-- Depends only on `jbm-core` (plus `glam` for the player state's `DVec3`);
-  never on `jbm-client`. Both sides communicate exclusively through
-  `jbm-core` protocol messages.
+- Depends only on `jbm-core` (plus `glam` for the player state's `DVec3`,
+  and `serde`/`serde_json` for the worldgen graph format); never on
+  `jbm-client`. Both sides communicate exclusively through `jbm-core`
+  protocol messages.
 - Hot paths (lighting, worldgen inner loops) never call into mods.

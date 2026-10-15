@@ -21,6 +21,8 @@ jbm-client = { path = "crates/client" }
 jbm-server = { path = "crates/server" }
 jbm-testkit = { path = "crates/testkit" }
 criterion = "0.8.2"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
 wgpu = "30.0.1"
 pollster = "1.0.1"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
