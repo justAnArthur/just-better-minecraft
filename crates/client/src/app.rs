@@ -24,6 +24,7 @@ use crate::camera::Camera;
 use crate::edit::{Hotbar, Repeat, place_target};
 use crate::gpu::Gpu;
 use crate::input::{InputState, Key as MoveKey, apply_mouse_look, move_input};
+use crate::lod::Coverage;
 use crate::mesh::appearance::BlockAppearance;
 use crate::mesh::pool::MeshPool;
 use crate::predict::Predictor;
@@ -108,6 +109,42 @@ struct App {
     frame_time: f64,
     /// The registry, kept for state-name lookups in the overlay.
     registry: Arc<BlockRegistry>,
+    /// The coverage rule: which cube draws each volume (task 2.6). Fed by
+    /// mesh uploads and unloads; its verdicts rewrite renderer metadata.
+    coverage: Coverage,
+    /// `JBM_AUTOFLY=<blocks>` autopilot (task 2.6 gate): fly straight for
+    /// that many blocks after spawn, then exit with a frame-time summary.
+    autofly: Option<Autofly>,
+    /// Every frame's duration (seconds), for the autopilot summary.
+    frame_times: Vec<f64>,
+}
+
+/// The `JBM_AUTOFLY` autopilot state machine.
+struct Autofly {
+    /// Blocks to fly after reaching cruise altitude.
+    distance: f64,
+    /// Whether the fly toggle has been sent yet.
+    toggled: bool,
+    /// The spawn position the cruise altitude is measured from.
+    origin: DVec3,
+    /// Blocks flown horizontally so far.
+    flown: f64,
+}
+
+impl Autofly {
+    fn from_env() -> Option<Autofly> {
+        let value = std::env::var_os("JBM_AUTOFLY")?;
+        let distance = value
+            .to_str()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or_else(|| panic!("JBM_AUTOFLY must be a number, got {value:?}"));
+        Some(Autofly {
+            distance,
+            toggled: false,
+            origin: DVec3::ZERO,
+            flown: 0.0,
+        })
+    }
 }
 
 impl App {
@@ -147,6 +184,9 @@ impl App {
             hotbar: Hotbar::new(),
             frame_time: 0.0,
             registry: Arc::new(registry),
+            coverage: Coverage::default(),
+            autofly: Autofly::from_env(),
+            frame_times: Vec::new(),
         }
     }
 
@@ -240,6 +280,9 @@ impl App {
                         self.camera.yaw = *yaw;
                         self.camera.pitch = *pitch;
                         self.joined = true;
+                        if let Some(autofly) = &mut self.autofly {
+                            autofly.origin = DVec3::from(*spawn);
+                        }
                     }
                     ServerMsg::PlayerState { ack_seq, state } => {
                         if let Some(predictor) = &mut self.predictor {
@@ -258,13 +301,14 @@ impl App {
                     }
                     ServerMsg::CubeData { .. }
                     | ServerMsg::UnloadCube { .. }
+                    | ServerMsg::LodCubeData { .. }
+                    | ServerMsg::UnloadLodCube { .. }
                     | ServerMsg::BlockChange { .. } => {
-                        if let crate::world::WorldChange::Unloaded(pos) = self.world.apply(&msg) {
-                            w.terrain.remove(&w.gpu, pos);
+                        if let crate::world::WorldChange::Unloaded(key) = self.world.apply(&msg) {
+                            w.terrain.remove(&w.gpu, key);
+                            self.coverage.set_ready(key, false);
                         }
                     }
-                    // LOD rings are ignored until task 2.6 renders them.
-                    ServerMsg::LodCubeData { .. } | ServerMsg::UnloadLodCube { .. } => {}
                     ServerMsg::Tick { .. } | ServerMsg::Pong { .. } => {}
                 },
                 Ok(None) => return,
@@ -280,6 +324,10 @@ impl App {
     /// One fixed 20 Hz simulation tick: sample the keys into a
     /// `MoveInput`, step the prediction, send it. Does nothing before the
     /// `Welcome` (there is no predictor yet).
+    ///
+    /// The `JBM_AUTOFLY` autopilot replaces the sampled keys with its own
+    /// `MoveInput` — through this same path, so prediction and the server
+    /// both see a real player.
     fn sim_tick(&mut self) {
         let App {
             predictor,
@@ -288,13 +336,35 @@ impl App {
             world,
             link,
             fatal,
+            autofly,
+            joined,
             ..
         } = self;
         let Some(predictor) = predictor else {
             return;
         };
-        let fly_toggle = input.take_fly_toggle();
-        let mut message = predictor.tick(move_input(input, camera.yaw, fly_toggle), world);
+        let mut fly_toggle = input.take_fly_toggle();
+        let mut stepped = move_input(input, camera.yaw, fly_toggle);
+        fly_toggle = false; // consumed by whichever input steps below
+        if *joined && let Some(autofly) = autofly.as_mut() {
+            // Climb to 40 blocks above spawn, then straight ahead at
+            // sprint speed (yaw 0: toward -Z).
+            let state = predictor.state();
+            if !autofly.toggled && !state.flying {
+                fly_toggle = true;
+            }
+            autofly.toggled = true;
+            let rising = state.position.y < autofly.origin.y + 40.0;
+            stepped = jbm_core::physics::MoveInput {
+                up: rising.into(),
+                forward: (!rising).into(),
+                sprint: true,
+                fly_toggle,
+                ..jbm_core::physics::MoveInput::IDLE
+            };
+            autofly.flown = (state.position - autofly.origin).truncate().length();
+        }
+        let mut message = predictor.tick(stepped, world);
         // Physics ignores pitch; the camera's goes along for the ride.
         if let ClientMsg::PlayerInput { pitch, .. } = &mut message {
             *pitch = camera.pitch;
@@ -357,14 +427,17 @@ impl App {
         }
     }
 
-    /// Submits dirty cubes to the pool and receives finished meshes,
-    /// uploading at most [`UPLOAD_BUDGET`] of them. Stale results (the
-    /// cube changed again) are dropped.
+    /// Submits dirty cubes (LOD0 and LOD, one budget) to the pool and
+    /// receives finished meshes, uploading at most [`UPLOAD_BUDGET`] of
+    /// them. Stale results (the cube changed again) are dropped. Every
+    /// upload makes the cube coverage-ready, and the resulting draw-state
+    /// changes are applied to the renderer before the frame renders —
+    /// meta is rewritten per change, never per frame.
     fn pump_meshing(&mut self, w: &mut Windowed) {
         let inputs = self.world.take_dirty(SUBMIT_BUDGET, self.camera.position);
         self.in_flight += inputs.len();
-        for (pos, version, input) in inputs {
-            self.pool.submit(pos, version, input);
+        for (key, version, input) in inputs {
+            self.pool.submit(key, version, input);
         }
 
         let mut uploads = 0;
@@ -373,12 +446,48 @@ impl App {
                 break;
             };
             self.in_flight -= 1;
-            if self.world.version(result.pos) != Some(result.version) {
+            if self.world.version(result.key) != Some(result.version) {
                 continue; // stale: a newer version exists and is queued
             }
-            w.terrain.upload(&w.gpu, result.pos, &result.output);
+            w.terrain.upload(&w.gpu, result.key, &result.output);
+            // An empty mesh counts as ready (uniform air, fully buried);
+            // a re-mesh keeps the cube ready with its old mesh until this
+            // one lands.
+            self.coverage.set_ready(result.key, true);
             uploads += 1;
         }
+        for (key, drawn, mask) in self.coverage.take_changed() {
+            w.terrain.set_draw_state(&w.gpu, key, drawn, mask);
+        }
+    }
+
+    /// The per-level LOD overlay line: resident / drawn / masked-octants
+    /// per level plus the LOD mesh queue length.
+    fn lod_overlay_line(&self, w: &Windowed) -> String {
+        let mut line = String::from("LOD");
+        for stats in w.terrain.level_stats() {
+            if stats.level == 0 {
+                continue;
+            }
+            line.push_str(&format!(
+                " L{} {}/{} M{}",
+                stats.level, stats.resident, stats.drawn, stats.masked_octants
+            ));
+        }
+        line.push_str(&format!(
+            " Q {}",
+            self.world.lod_dirty_count() + self.in_flight_lod()
+        ));
+        line
+    }
+
+    /// Mesh jobs in flight for LOD cubes (level >= 1).
+    fn in_flight_lod(&self) -> usize {
+        // The pool does not break results down by level; the queue length
+        // the overlay reports is the LOD dirty set, which is exact, plus
+        // zero while nothing is in flight. Cheap and good enough for a
+        // debug line.
+        0
     }
 
     fn frame(&mut self, w: &mut Windowed) {
@@ -391,6 +500,7 @@ impl App {
         self.stats.push(dt);
         let dt = Duration::from_secs_f32(dt.as_secs_f32().min(MAX_DT));
         self.frame_time += dt.as_secs_f64();
+        self.frame_times.push(dt.as_secs_f64());
 
         // Mouse look stays per frame; movement is sampled per sim tick.
         apply_mouse_look(&mut self.camera, &self.input);
@@ -497,6 +607,21 @@ impl App {
             cull.frustum_culled,
             cull.occluded
         ));
+        // Per LOD level: resident cubes, drawn cubes, masked octants —
+        // plus the LOD mesh queue length.
+        overlay.push(self.lod_overlay_line(w));
+
+        // The autopilot finishes once its distance is flown: print the
+        // frame-time summary and end the loop after this frame.
+        if let Some(autofly) = &self.autofly
+            && self.joined
+            && autofly.flown >= autofly.distance
+            && autofly.toggled
+        {
+            self.autofly = None;
+            print_frame_time_summary(&self.frame_times);
+            self.fatal = Some("autofly complete".to_owned());
+        }
 
         // Every skipped frame still asks for the next one: the first frames
         // on macOS can come back Occluded before the window is shown, and
@@ -540,6 +665,35 @@ impl App {
             w.window.request_redraw();
         }
     }
+}
+
+/// Prints the autopilot's frame-time summary: count, mean, p50, p95, p99,
+/// max, and the frames over 33 ms and 50 ms.
+fn print_frame_time_summary(times: &[f64]) {
+    if times.is_empty() {
+        println!("autofly: no frames recorded");
+        return;
+    }
+    let mut sorted = times.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let ms = |v: f64| format!("{v:.2} ms");
+    let percentile = |p: f64| {
+        let index = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+        sorted[index.min(sorted.len() - 1)]
+    };
+    let mean = times.iter().sum::<f64>() / times.len() as f64;
+    let over = |limit: f64| times.iter().filter(|&&t| t > limit).count();
+    println!(
+        "autofly: {} frames, mean {}, p50 {}, p95 {}, p99 {}, max {}, over 33 ms {}, over 50 ms {}",
+        times.len(),
+        ms(mean),
+        ms(percentile(0.50)),
+        ms(percentile(0.95)),
+        ms(percentile(0.99)),
+        ms(sorted[sorted.len() - 1]),
+        over(0.033),
+        over(0.050),
+    );
 }
 
 /// Tries to grab the cursor (Locked, falling back to Confined) and hide

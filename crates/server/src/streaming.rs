@@ -61,6 +61,49 @@ pub(crate) fn in_keep(pos: CubePos, center: CubePos, r: u32, v: u32) -> bool {
     in_desired(pos, center, r + 1, v + 1)
 }
 
+/// One entry of the merged LOD ring walk (task 2.6): a level and the
+/// offset from that level's center cube.
+pub(crate) type LodWalkEntry = (u8, Offset);
+
+/// The merged walk over `(level, offset)` for LOD ring streaming: every
+/// level 1..=lod_levels contributes a full disk of
+/// [`desired_offsets`](`lod_view_radius`, `lod_vertical_radius`) — full
+/// disks, not annuli: the client needs the coarse cube under a finer one
+/// while the finer one loads, and to fill octants the finer level does
+/// not cover yet (costing about a quarter more cubes per level than an
+/// annulus would).
+///
+/// Sorted by the offset's squared distance in level units, then by level
+/// **descending** (coarse first at equal distance), then by `(x, y, z)` —
+/// fully deterministic, and precomputed once from the config.
+pub(crate) fn lod_walk(lod_levels: u8, r: u32, v: u32) -> Vec<LodWalkEntry> {
+    let mut walk = Vec::new();
+    for level in 1..=lod_levels {
+        for offset in desired_offsets(r, v) {
+            walk.push((level, offset));
+        }
+    }
+    walk.sort_by_key(|&(level, (x, y, z))| {
+        let d =
+            i64::from(x) * i64::from(x) + i64::from(y) * i64::from(y) + i64::from(z) * i64::from(z);
+        (d, std::cmp::Reverse(level), x, y, z)
+    });
+    walk
+}
+
+/// The level-`level` cube (level >= 1) containing the LOD0 cube `lod0`:
+/// `div_euclid(2^(level-1))` per axis, so negative coordinates nest
+/// exactly.
+pub(crate) fn level_center(lod0: CubePos, level: u8) -> CubePos {
+    debug_assert!(level >= 1);
+    let shift = 1i32 << (level - 1);
+    CubePos {
+        x: lod0.x.div_euclid(shift),
+        y: lod0.y.div_euclid(shift),
+        z: lod0.z.div_euclid(shift),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{desired_offsets, in_desired, in_keep, offset_pos};
@@ -106,6 +149,55 @@ mod tests {
             }
         }
         assert_eq!(offsets.len(), expected);
+    }
+
+    #[test]
+    fn lod_walk_orders_by_distance_then_coarse_first() {
+        let walk = super::lod_walk(3, 4, 2);
+        // Full disks at every level.
+        let disk = super::desired_offsets(4, 2).len();
+        assert_eq!(walk.len(), 3 * disk);
+        // Fully ordered by (distance, level descending, x, y, z).
+        let mut prev: Option<(i64, u8, i32, i32, i32)> = None;
+        for &(level, (x, y, z)) in &walk {
+            let d = i64::from(x).pow(2) + i64::from(y).pow(2) + i64::from(z).pow(2);
+            let key = (d, level, x, y, z);
+            if let Some(prev) = prev {
+                // Level descending: encode by negating for the compare.
+                let prev_ordered = (prev.0, std::cmp::Reverse(prev.1), prev.2, prev.3, prev.4);
+                let key_ordered = (key.0, std::cmp::Reverse(key.1), key.2, key.3, key.4);
+                assert!(
+                    key_ordered > prev_ordered,
+                    "order broke at {key:?} after {prev:?}"
+                );
+            }
+            prev = Some(key);
+        }
+        // Equal distance, different levels: the coarser cube comes first.
+        let index_of = |level: u8| {
+            walk.iter()
+                .position(|&(l, (x, y, z))| l == level && (x, y, z) == (2, 0, 0))
+                .unwrap()
+        };
+        assert!(index_of(3) < index_of(2));
+        assert!(index_of(2) < index_of(1));
+    }
+
+    #[test]
+    fn level_centers_nest_at_negative_coordinates() {
+        use super::level_center;
+        let lod0 = CubePos { x: -7, y: 3, z: -5 };
+        assert_eq!(level_center(lod0, 1), lod0);
+        assert_eq!(level_center(lod0, 2), CubePos { x: -4, y: 1, z: -3 });
+        assert_eq!(level_center(lod0, 3), CubePos { x: -2, y: 0, z: -2 });
+        // Every level-n cube maps back onto its LOD0 children.
+        for level in 1..=4u8 {
+            let center = level_center(lod0, level);
+            let back = 1i32 << (level - 1);
+            assert!(center.x * back <= lod0.x && lod0.x < (center.x + 1) * back);
+            assert!(center.y * back <= lod0.y && lod0.y < (center.y + 1) * back);
+            assert!(center.z * back <= lod0.z && lod0.z < (center.z + 1) * back);
+        }
     }
 
     #[test]

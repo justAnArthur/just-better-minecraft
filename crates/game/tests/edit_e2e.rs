@@ -25,7 +25,7 @@ fn config() -> ServerConfig {
         max_in_flight: 512,
         world_dir: None,
         save_interval: std::time::Duration::from_secs(5),
-        lod_levels: 4,
+        lod_levels: 0, // this scene predates LOD rings; 2.6 keeps it LOD0-only
         lod_view_radius: 8,
         lod_vertical_radius: 3,
         lod_send_budget_per_tick: 32,
@@ -129,7 +129,7 @@ fn breaking_a_surface_block_lands_within_one_tick() {
     let dirty: std::collections::HashSet<CubePos> = world
         .take_dirty(usize::MAX, DVec3::ZERO)
         .into_iter()
-        .map(|(pos, _, _)| pos)
+        .map(|(key, _, _)| key.pos)
         .collect();
     assert_eq!(dirty, expected);
 
@@ -146,7 +146,13 @@ fn breaking_a_surface_block_lands_within_one_tick() {
         .expect("a loaded cube the edit does not touch");
     world.apply(&ServerMsg::CubeData {
         pos: far_cube,
-        cube: Box::new(world.cube(far_cube).unwrap().as_ref().clone()),
+        cube: Box::new(
+            world
+                .cube(jbm_client::lod::CubeKey::lod0(far_cube))
+                .unwrap()
+                .as_ref()
+                .clone(),
+        ),
     });
     world.set_block(at, before);
     let camera = DVec3::new(
@@ -157,7 +163,7 @@ fn breaking_a_surface_block_lands_within_one_tick() {
     let first = world.take_dirty(1, camera);
     assert_eq!(first.len(), 1);
     assert!(
-        expected.contains(&first[0].0),
+        expected.contains(&first[0].0.pos),
         "{:?} is not an edit-touched cube",
         first[0].0
     );

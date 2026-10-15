@@ -180,7 +180,7 @@ fn bench(c: &mut Criterion) {
     let make_pass = |gpu: &jbm_client::gpu::Gpu, meshes: &[(CubePos, greedy::MeshOutput)]| {
         let mut pass = TerrainPass::new(gpu, format, &uniform_layout, &textures);
         for (pos, mesh) in meshes {
-            pass.upload(gpu, *pos, mesh);
+            pass.upload(gpu, jbm_client::lod::CubeKey::lod0(*pos), mesh);
         }
         pass
     };

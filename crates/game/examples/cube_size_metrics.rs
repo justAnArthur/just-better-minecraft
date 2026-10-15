@@ -248,7 +248,7 @@ fn main() {
     let textures = BlockTextures::new(&gpu, &layers).expect("texture array");
     let mut terrain = TerrainPass::new(&gpu, target.format(), renderer.uniform_layout(), &textures);
     for (pos, mesh) in &meshes {
-        terrain.upload(&gpu, *pos, mesh);
+        terrain.upload(&gpu, jbm_client::lod::CubeKey::lod0(*pos), mesh);
     }
 
     // 45 degrees down: the camera sits as far behind the center as above it.
@@ -320,7 +320,7 @@ fn main() {
         &textures,
     );
     for (pos, mesh) in &cave_meshes {
-        cave_pass.upload(&frames.gpu, *pos, mesh);
+        cave_pass.upload(&frames.gpu, jbm_client::lod::CubeKey::lod0(*pos), mesh);
     }
     cave_pass.set_force_cpu_cull(true);
     measure_path("cave", &mut frames, &mut cave_pass, &cave_camera);

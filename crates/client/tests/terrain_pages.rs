@@ -108,7 +108,7 @@ fn render_passes_identically(
     fresh.set_force_cpu_cull(path == TerrainPath::CpuCull);
     fresh.set_force_fallback(path == TerrainPath::Fallback);
     for (pos, mesh) in fresh_meshes {
-        fresh.upload(gpu, *pos, mesh);
+        fresh.upload(gpu, jbm_client::lod::CubeKey::lod0(*pos), mesh);
     }
     renderer.render(
         gpu,
@@ -179,7 +179,7 @@ fn slot_reuse_after_churn_renders_like_a_fresh_pass() {
         } else {
             center.clone()
         };
-        terrain.upload(&gpu, pos, &mesh);
+        terrain.upload(&gpu, jbm_client::lod::CubeKey::lod0(pos), &mesh);
         meshes.insert(pos, mesh);
     }
     assert!(
@@ -200,12 +200,12 @@ fn slot_reuse_after_churn_renders_like_a_fresh_pass() {
             // A third shape so the re-upload really differs.
             mesh_of(&appearance, center_block(&blocks))
         };
-        terrain.upload(&gpu, pos, &mesh);
+        terrain.upload(&gpu, jbm_client::lod::CubeKey::lod0(pos), &mesh);
         meshes.insert(pos, mesh);
     }
     // Remove a quarter of the cubes.
     for &pos in positions.iter().skip(150) {
-        terrain.remove(&gpu, pos);
+        terrain.remove(&gpu, jbm_client::lod::CubeKey::lod0(pos));
         meshes.remove(&pos);
     }
     terrain.check_page_invariants();

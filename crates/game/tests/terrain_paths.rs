@@ -23,7 +23,7 @@ use jbm_client::render::texture_array::BlockTextures;
 use jbm_client::testing::screenshot::{assert_matches_golden, gpu_or_skip};
 use jbm_client::world::ClientWorld;
 use jbm_core::block::{BlockRegistry, BlockStateId, builtin};
-use jbm_core::coords::{BlockPos, CUBE_SIZE, CubePos};
+use jbm_core::coords::{BlockPos, CUBE_SIZE};
 use jbm_core::protocol::{ClientMsg, ServerMsg};
 use jbm_server::terrain::Generator;
 use jbm_server::{DEFAULT_SEED, ServerConfig};
@@ -47,6 +47,7 @@ fn server_config() -> ServerConfig {
     ServerConfig {
         seed: DEFAULT_SEED,
         streaming: true,
+        lod_levels: 0, // this scene predates LOD rings; 2.6 keeps it LOD0-only
         view_radius: 3,
         vertical_radius: 2,
         send_budget_per_tick: 64,
@@ -62,7 +63,11 @@ fn server_config() -> ServerConfig {
 fn streamed_scene(
     server: &mut HeadlessServer,
     edits: &[ClientMsg],
-) -> (ClientWorld, Vec<(CubePos, greedy::MeshOutput)>, DVec3) {
+) -> (
+    ClientWorld,
+    Vec<(jbm_client::lod::CubeKey, greedy::MeshOutput)>,
+    DVec3,
+) {
     let mut registry = BlockRegistry::new();
     builtin::Blocks::register(&mut registry);
     let appearance = BlockAppearance::new(&registry);
@@ -100,9 +105,9 @@ fn streamed_scene(
     }
 
     let dirty = world.take_dirty(usize::MAX, spawn);
-    let meshes: Vec<(CubePos, greedy::MeshOutput)> = dirty
+    let meshes: Vec<(jbm_client::lod::CubeKey, greedy::MeshOutput)> = dirty
         .into_iter()
-        .map(|(pos, _, input)| (pos, greedy::mesh(&input, &appearance)))
+        .map(|(key, _, input)| (key, greedy::mesh(&input, &appearance)))
         .collect();
     (world, meshes, spawn)
 }
@@ -216,7 +221,7 @@ fn render_frame(
 /// equality test). Prints which paths ran.
 fn render_all_paths(
     gpu: &jbm_client::gpu::Gpu,
-    meshes: &[(CubePos, greedy::MeshOutput)],
+    meshes: &[(jbm_client::lod::CubeKey, greedy::MeshOutput)],
     camera: &Camera,
     golden: &str,
 ) {
@@ -261,6 +266,19 @@ fn render_all_paths(
             render_frame(gpu, &mut renderer, &target, &depth, &mut terrain, camera);
         }
         let image = render_frame(gpu, &mut renderer, &target, &depth, &mut terrain, camera);
+        let st = terrain.read_cull_stats_blocking(gpu);
+        println!(
+            "PATHDBG {path:?} candidates {} frustum {} occluded {} drawn {} commands {} faces {} overflow {}",
+            st.candidates,
+            st.frustum_culled,
+            st.occluded,
+            st.drawn(),
+            st.commands,
+            st.faces,
+            st.region_overflow
+        );
+        let _ = std::fs::create_dir_all("target");
+        let _ = image.save(format!("target/pathdbg2_{golden}_{active:?}.png"));
         match &reference {
             None => reference = Some((active, image)),
             Some((reference_path, reference_image)) => {
@@ -688,7 +706,8 @@ fn terrain_spawn_stats_show_direction_skipping() {
     let total_drawn_faces: u64 = meshes
         .iter()
         .filter(|(_, mesh)| !mesh.is_empty())
-        .filter(|(pos, _)| {
+        .filter(|(key, _)| {
+            let pos = key.pos;
             let world_min = DVec3::new(
                 f64::from(pos.x) * f64::from(CUBE_SIZE),
                 f64::from(pos.y) * f64::from(CUBE_SIZE),

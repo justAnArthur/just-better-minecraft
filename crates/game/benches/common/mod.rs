@@ -248,6 +248,7 @@ impl Region {
         MeshInput {
             center: Arc::clone(&self.cubes[&pos]),
             neighbors,
+            level: 0,
         }
     }
 

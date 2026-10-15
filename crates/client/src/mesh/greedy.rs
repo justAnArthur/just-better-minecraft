@@ -1,7 +1,20 @@
 //! The greedy mesher: pure logic, no GPU. Builds a padded
-//! `(CUBE_SIZE + 2)^3` block view from a cube and its neighbors, then merges
-//! coplanar faces into maximal rectangles per direction. Rules are documented
-//! in crates/client/README.md.
+//! `(CUBE_SIZE + 2)^3` cell view from a cube and its same-level neighbors,
+//! then merges coplanar faces into maximal rectangles per direction. Rules
+//! are documented in crates/client/README.md.
+//!
+//! The same mesher serves every LOD level (task 2.6): cells are cells
+//! whatever their world size, so the face format is unchanged. Two rules
+//! switch on for level >= 1 (LOD0 output is bit-for-bit what it was):
+//!
+//! - **Octant-split merging.** Greedy rectangles never cross the cell
+//!   planes x, y or z = `CUBE_SIZE / 2`, so every face lies in exactly one
+//!   octant of its cube — which the renderer's octant masking needs. (In
+//!   mask space the halves stay `[0, half)` and `[half, size)` however the
+//!   u/v strides are signed, because the mask-to-world map is affine with
+//!   slope +-1 per axis.)
+//! - **Skirts** (side directions +-X/+-Z only), the crack hider at level
+//!   seams. See `SKIRT_NOTE` below.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -11,7 +24,7 @@ use jbm_core::coords::CUBE_SIZE;
 use jbm_core::cube::Cube;
 
 use crate::mesh::appearance::BlockAppearance;
-use crate::mesh::face::{DIRECTIONS, FaceFields, PackedFace, pack};
+use crate::mesh::face::{DIRECTIONS, Direction, FaceFields, PackedFace, pack};
 
 /// Side length of the padded array: the cube plus a one-block shell.
 pub const PAD: usize = CUBE_SIZE as usize + 2;
@@ -57,15 +70,27 @@ pub fn neighbor_index(dx: i32, dy: i32, dz: i32) -> usize {
 pub struct MeshInput {
     pub center: Arc<Cube>,
     pub neighbors: [Option<Arc<Cube>>; 26],
+    /// The LOD level being meshed: 0 for streamed world cubes, >= 1 for
+    /// ring cubes (cells are 2^level blocks per side).
+    pub level: u8,
 }
 
 impl MeshInput {
     /// A mesh input with no neighbors loaded (everything around is
-    /// "missing": culling-opaque, AO-open).
+    /// "missing": culling-opaque, AO-open) at level 0.
     pub fn isolated(center: Arc<Cube>) -> MeshInput {
         MeshInput {
             center,
             neighbors: std::array::from_fn(|_| None),
+            level: 0,
+        }
+    }
+
+    /// [`MeshInput::isolated`] at `level`.
+    pub fn isolated_at_level(center: Arc<Cube>, level: u8) -> MeshInput {
+        MeshInput {
+            level,
+            ..MeshInput::isolated(center)
         }
     }
 
@@ -80,6 +105,10 @@ impl MeshInput {
 pub struct MeshOutput {
     pub faces: Vec<PackedFace>,
     pub ranges: [Range<u32>; 6],
+    /// Faces emitted under the skirt rule (level >= 1 side directions):
+    /// the skirt overhead. They carry the skirt bit in their merge key, so
+    /// a counted face never merged with a non-skirt one.
+    pub skirts: u32,
 }
 
 impl MeshOutput {
@@ -107,7 +136,7 @@ pub fn mesh(input: &MeshInput, appearance: &BlockAppearance) -> MeshOutput {
         }
     }
     let padded = build_padded(input, appearance);
-    mesh_padded(&padded, appearance)
+    mesh_padded(&padded, appearance, input.level)
 }
 
 /// Whether all six face neighbors are present, uniform and opaque.
@@ -249,13 +278,17 @@ fn stride(axis: [i32; 3]) -> isize {
 }
 
 /// Sweeps the six directions and greedily merges coplanar faces with
-/// identical (layer, AO, light) into maximal rectangles.
-fn mesh_padded(pad: &[u32], appearance: &BlockAppearance) -> MeshOutput {
+/// identical (layer, AO, light) into maximal rectangles. At level >= 1,
+/// rectangles never cross an octant plane (see the module docs) and faces
+/// covered by the skirt rule are emitted with [`SKIRT_KEY_BIT`] set.
+fn mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u8) -> MeshOutput {
     let mut output = MeshOutput {
         faces: Vec::new(),
         ranges: std::array::from_fn(|_| 0u32..0),
+        skirts: 0,
     };
     let size = CUBE_SIZE as usize;
+    let half = size / 2;
     let mut mask = [0u32; MASK_LEN];
 
     for (dir_index, &direction) in DIRECTIONS.iter().enumerate() {
@@ -279,6 +312,11 @@ fn mesh_padded(pad: &[u32], appearance: &BlockAppearance) -> MeshOutput {
             layer_of_kind[state + 1] = appearance.get(BlockStateId(state as u32)).layers[dir_index];
         }
 
+        let side = matches!(
+            direction,
+            Direction::PosX | Direction::NegX | Direction::PosZ | Direction::NegZ
+        );
+
         let start = output.faces.len() as u32;
         for k in 0..CUBE_SIZE as isize {
             let a_row = corner + k * n_axis;
@@ -287,35 +325,50 @@ fn mesh_padded(pad: &[u32], appearance: &BlockAppearance) -> MeshOutput {
             // Build the mask of face keys for this slice.
             for vi in 0..CUBE_SIZE as isize {
                 for ui in 0..CUBE_SIZE as isize {
-                    let a = pad[(a_row + ui * u + vi * v) as usize];
-                    let b = pad[(b_row + ui * u + vi * v) as usize];
-                    let culled = a & (F_AIR << FLAGS_SHIFT) != 0
-                        || b & (F_OPAQUE_CULL << FLAGS_SHIFT) != 0
-                        || (a == b && a & (F_CUTOUT << FLAGS_SHIFT) != 0);
+                    let a_index = (a_row + ui * u + vi * v) as usize;
+                    let b_index = (b_row + ui * u + vi * v) as usize;
+                    let a = pad[a_index];
+                    let b = pad[b_index];
+                    let a_air = a & (F_AIR << FLAGS_SHIFT) != 0;
+                    let b_cull = b & (F_OPAQUE_CULL << FLAGS_SHIFT) != 0;
+                    let culled = a_air || b_cull || (a == b && a & (F_CUTOUT << FLAGS_SHIFT) != 0);
                     let key = if culled {
-                        0
+                        if level > 0 && side && !a_air && b_cull && skirt(pad, a_index, direction) {
+                            (1 << 31)
+                                | SKIRT_KEY_BIT
+                                | (u32::from(layer_of_kind[(a & 0xFFFF) as usize]) << 15)
+                                | (corner_ao(pad, b_index as isize, u, v) << 7)
+                                | LIGHT
+                        } else {
+                            0
+                        }
                     } else {
                         let layer = u32::from(layer_of_kind[(a & 0xFFFF) as usize]);
-                        let ao = corner_ao(pad, b_row + ui * u + vi * v, u, v);
+                        let ao = corner_ao(pad, b_index as isize, u, v);
                         (1 << 31) | (layer << 15) | (ao << 7) | LIGHT
                     };
                     mask[(vi * CUBE_SIZE as isize + ui) as usize] = key;
                 }
             }
 
-            // Greedy merge: extend along u first, then along v.
+            // Greedy merge: extend along u first, then along v. At
+            // level >= 1 the extents stop at the octant plane (mask
+            // indices [0, half) and [half, size) are the two world halves
+            // whatever the stride signs — see the module docs).
             for v0 in 0..size {
                 for u0 in 0..size {
                     let key = mask[v0 * size + u0];
                     if key == 0 {
                         continue;
                     }
+                    let u_limit = if level > 0 && u0 < half { half } else { size };
                     let mut w = 1usize;
-                    while u0 + w < size && mask[v0 * size + u0 + w] == key {
+                    while u0 + w < u_limit && mask[v0 * size + u0 + w] == key {
                         w += 1;
                     }
+                    let v_limit = if level > 0 && v0 < half { half } else { size };
                     let mut h = 1usize;
-                    'extend: while v0 + h < size {
+                    'extend: while v0 + h < v_limit {
                         let row = (v0 + h) * size;
                         for ui in u0..u0 + w {
                             if mask[row + ui] != key {
@@ -347,12 +400,80 @@ fn mesh_padded(pad: &[u32], appearance: &BlockAppearance) -> MeshOutput {
                         ao: [ao8 & 3, (ao8 >> 2) & 3, (ao8 >> 4) & 3, (ao8 >> 6) & 3],
                         light: key & 0xF,
                     }));
+                    output.skirts += u32::from(key & SKIRT_KEY_BIT != 0);
                 }
             }
         }
         output.ranges[dir_index] = start..output.faces.len() as u32;
     }
     output
+}
+
+/// Marks a face key emitted under the skirt rule (bit 30; bit 31 is the
+/// non-zero flag).
+const SKIRT_KEY_BIT: u32 = 1 << 30;
+
+/// The skirt rule (task 2.6), applied at level >= 1 in the side directions
+/// +-X/+-Z. A skirt stands in for a coarse cell's side wall at a level
+/// seam, hiding the crack where the neighboring volume is drawn by finer
+/// cubes whose surface sits lower (the downsampling rule leans solid, so a
+/// coarse surface can be up to 2^n - 1 blocks above the fine one):
+///
+/// ```text
+///      fine side (level n-1)      coarse side (level n, this cube)
+///                   air
+///        ..........______..........______
+///        grass    grass    ||  grass(grass)   <- top faces
+///        dirt     dirt     ||  dirt          <- coarse cell c, filled
+///        dirt     dirt     ||  dirt             the cell across the plane
+///        stone    stone    ||  stone            is filled (or its cube is
+///                                                 missing) -> normal rule
+///                                                 would cull c's side face
+/// ```
+///
+/// Emit c's face in direction d even though the cell across d is filled,
+/// when ALL of these hold:
+///
+/// - c is filled;
+/// - the cell across d lies in a different octant or a different cube (c
+///   sits at the octant plane or the cube border along d);
+/// - that cell is filled, or is in a missing neighbor cube;
+/// - c is one of the top two filled cells of its column run: the cell
+///   above c is air, or the cell two above is. At the cube's top row the
+///   two-above cell is outside the padded array and counts as filled.
+///
+/// The face hangs down 2 cells worth of cover, enough for the 2^n - 1 the
+/// rule leans solid. When the octant across is drawn by the same coarse
+/// cube (no finer level arrived there), the skirt sits inside terrain and
+/// is hidden by the neighbor's top face. Skirt faces are ordinary faces:
+/// same AO, same texture, greedy-merged within the octant rule.
+fn skirt(pad: &[u32], a_index: usize, direction: Direction) -> bool {
+    let size = CUBE_SIZE as usize;
+    let half = size / 2;
+    let x = (a_index % PAD) as i32 - 1;
+    let z = ((a_index / PAD_Z) % PAD) as i32 - 1;
+    let y = (a_index / PAD_Y) as i32 - 1;
+    // The cell across d lies in a different octant or a different cube.
+    let boundary = match direction {
+        Direction::PosX => x == half as i32 - 1 || x == size as i32 - 1,
+        Direction::NegX => x == 0 || x == half as i32,
+        Direction::PosZ => z == half as i32 - 1 || z == size as i32 - 1,
+        Direction::NegZ => z == 0 || z == half as i32,
+        Direction::PosY | Direction::NegY => false, // sides only
+    };
+    if !boundary {
+        return false;
+    }
+    // One of the top two filled cells of the column run: air directly
+    // above, or air two above (the top row's two-above cell is outside the
+    // padded array and counts as filled).
+    let air = |index: usize| pad[index] & (F_AIR << FLAGS_SHIFT) != 0;
+    let above = a_index + PAD_Y;
+    if air(above) {
+        return true;
+    }
+    let two_above = a_index + 2 * PAD_Y;
+    (y as usize) < size - 1 && air(two_above)
 }
 
 /// Light is always 15 until lighting exists (task 2.x).
@@ -760,6 +881,313 @@ mod tests {
             self.0 = x;
             x
         }
+    }
+
+    // ------------------------------------------------------------------
+    // LOD levels (task 2.6)
+
+    /// A mesh input at `level` with air above and beside, a missing cube
+    /// below (like a real terrain cube whose -Y neighbor never shows).
+    fn mesh_air_surrounded_at(cube: Cube, appearance: &BlockAppearance, level: u8) -> MeshOutput {
+        let air = Arc::new(Cube::default());
+        let mut input = MeshInput::isolated_at_level(Arc::new(cube), level);
+        for i in 0..26 {
+            if i != neighbor_index(0, -1, 0) {
+                input.neighbors[i] = Some(Arc::clone(&air));
+            }
+        }
+        mesh(&input, appearance)
+    }
+
+    /// Every cell a face covers, as cube-local cell coordinates.
+    fn face_cells(f: &FaceFields) -> Vec<(i32, i32, i32)> {
+        let u = f.direction.u_axis();
+        let v = f.direction.v_axis();
+        let mut cells = Vec::new();
+        for j in 0..f.height as i32 {
+            for i in 0..f.width as i32 {
+                cells.push((
+                    f.x as i32 + i * u[0] + j * v[0],
+                    f.y as i32 + i * u[1] + j * v[1],
+                    f.z as i32 + i * u[2] + j * v[2],
+                ));
+            }
+        }
+        cells
+    }
+
+    #[test]
+    fn lod_faces_never_cross_an_octant_plane() {
+        let (_, appearance, blocks) = setup();
+        let half = CUBE_SIZE / 2;
+        for case in 0..8u64 {
+            // Random-terrain cube (seeded), meshed at level 2.
+            let cube = Cube::from_fn(|p| {
+                let mut h = case ^ (p.index() as u64).wrapping_mul(0x9e37_79b9);
+                h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                h ^= h >> 31;
+                match h % 10 {
+                    0..=2 => blocks.stone,
+                    3 => blocks.dirt,
+                    _ => BlockStateId::AIR,
+                }
+            });
+            let output = mesh_air_surrounded_at(cube, &appearance, 2);
+            assert!(!output.faces.is_empty(), "case {case}: terrain has faces");
+            for &face in &output.faces {
+                let f = unpack(face);
+                let cells = face_cells(&f);
+                for &(x, y, z) in &cells {
+                    for &(ox, oy, oz) in &cells {
+                        assert_eq!(
+                            (ox < half, oy < half, oz < half),
+                            (x < half, y < half, z < half),
+                            "face {f:?} crosses an octant plane"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The pre-2.6 greedy sweep, copied verbatim (modulo the skirts
+    /// counter): level 0 output must match it byte for byte.
+    fn legacy_mesh_padded(pad: &[u32], appearance: &BlockAppearance) -> MeshOutput {
+        let mut output = MeshOutput {
+            faces: Vec::new(),
+            ranges: std::array::from_fn(|_| 0u32..0),
+            skirts: 0,
+        };
+        let size = CUBE_SIZE as usize;
+        let mut mask = [0u32; MASK_LEN];
+        for (dir_index, &direction) in DIRECTIONS.iter().enumerate() {
+            let n = stride(direction.normal());
+            let u = stride(direction.u_axis());
+            let v = stride(direction.v_axis());
+            let n_axis = n.abs();
+            let last = CUBE_SIZE as isize - 1;
+            let u_shift = if u < 0 { -last * u } else { 0 };
+            let v_shift = if v < 0 { -last * v } else { 0 };
+            let corner = ORIGIN as isize + u_shift + v_shift;
+            let mut layer_of_kind = vec![0u16; appearance.len() + 1];
+            for state in 0..appearance.len() {
+                layer_of_kind[state + 1] =
+                    appearance.get(BlockStateId(state as u32)).layers[dir_index];
+            }
+            let start = output.faces.len() as u32;
+            for k in 0..CUBE_SIZE as isize {
+                let a_row = corner + k * n_axis;
+                let b_row = a_row + n;
+                for vi in 0..CUBE_SIZE as isize {
+                    for ui in 0..CUBE_SIZE as isize {
+                        let a = pad[(a_row + ui * u + vi * v) as usize];
+                        let b = pad[(b_row + ui * u + vi * v) as usize];
+                        let culled = a & (F_AIR << FLAGS_SHIFT) != 0
+                            || b & (F_OPAQUE_CULL << FLAGS_SHIFT) != 0
+                            || (a == b && a & (F_CUTOUT << FLAGS_SHIFT) != 0);
+                        let key = if culled {
+                            0
+                        } else {
+                            let layer = u32::from(layer_of_kind[(a & 0xFFFF) as usize]);
+                            let ao = corner_ao(pad, b_row + ui * u + vi * v, u, v);
+                            (1 << 31) | (layer << 15) | (ao << 7) | LIGHT
+                        };
+                        mask[(vi * CUBE_SIZE as isize + ui) as usize] = key;
+                    }
+                }
+                for v0 in 0..size {
+                    for u0 in 0..size {
+                        let key = mask[v0 * size + u0];
+                        if key == 0 {
+                            continue;
+                        }
+                        let mut w = 1usize;
+                        while u0 + w < size && mask[v0 * size + u0 + w] == key {
+                            w += 1;
+                        }
+                        let mut h = 1usize;
+                        'extend: while v0 + h < size {
+                            let row = (v0 + h) * size;
+                            for ui in u0..u0 + w {
+                                if mask[row + ui] != key {
+                                    break 'extend;
+                                }
+                            }
+                            h += 1;
+                        }
+                        for vv in v0..v0 + h {
+                            for uu in u0..u0 + w {
+                                mask[vv * size + uu] = 0;
+                            }
+                        }
+                        let owner = (a_row + u0 as isize * u + v0 as isize * v) as usize;
+                        let x = (owner % PAD) as u32 - 1;
+                        let z = ((owner / PAD_Z) % PAD) as u32 - 1;
+                        let y = (owner / PAD_Y) as u32 - 1;
+                        let ao8 = (key >> 7) & 0xFF;
+                        output.faces.push(pack(&FaceFields {
+                            x,
+                            y,
+                            z,
+                            width: w as u32,
+                            height: h as u32,
+                            direction,
+                            layer: (key >> 15) & 0xFFFF,
+                            ao: [ao8 & 3, (ao8 >> 2) & 3, (ao8 >> 4) & 3, (ao8 >> 6) & 3],
+                            light: key & 0xF,
+                        }));
+                    }
+                }
+            }
+            output.ranges[dir_index] = start..output.faces.len() as u32;
+        }
+        output.skirts = 0;
+        output
+    }
+
+    #[test]
+    fn lod0_output_is_byte_identical_to_the_pre_change_mesher() {
+        let (_, appearance, blocks) = setup();
+        let states = [BlockStateId::AIR, blocks.stone, blocks.dirt, blocks.glass];
+        let mut rng = XorShift64(0x1234_5678_9abc_def0);
+        for case in 0..20u64 {
+            let fill = |seed: u64| {
+                Cube::from_fn(move |p| {
+                    let mut h = seed ^ (p.index() as u64).wrapping_mul(0x9e37_79b9);
+                    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                    h ^= h >> 31;
+                    states[(h % 100) as usize % states.len()]
+                })
+            };
+            let center = Arc::new(fill(case.wrapping_mul(0x1234_5678) ^ rng.next()));
+            let mut input = MeshInput::isolated(Arc::clone(&center));
+            for i in 0..26 {
+                if rng.next().is_multiple_of(3) {
+                    let cube = if rng.next().is_multiple_of(2) {
+                        Cube::filled(blocks.stone)
+                    } else {
+                        fill(rng.next())
+                    };
+                    input.neighbors[i] = Some(Arc::new(cube));
+                }
+            }
+            let padded = build_padded(&input, &appearance);
+            let got = mesh_padded(&padded, &appearance, 0);
+            let expected = legacy_mesh_padded(&padded, &appearance);
+            assert_eq!(
+                got.faces, expected.faces,
+                "case {case}: LOD0 output drifted"
+            );
+            assert_eq!(got.ranges, expected.ranges, "case {case}: ranges drifted");
+            assert_eq!(got.skirts, 0, "no skirts at level 0");
+        }
+    }
+
+    /// Faces of `direction` covering cell `(x, y, z)`, if any.
+    fn faces_covering(
+        output: &MeshOutput,
+        direction: Direction,
+        x: i32,
+        y: i32,
+        z: i32,
+    ) -> Vec<FaceFields> {
+        output
+            .faces
+            .iter()
+            .map(|&f| unpack(f))
+            .filter(|f| f.direction == direction && face_cells(f).contains(&(x, y, z)))
+            .collect()
+    }
+
+    #[test]
+    fn a_step_across_an_octant_plane_emits_the_skirt_two_cells_deep() {
+        let (_, appearance, blocks) = setup();
+        let half = CUBE_SIZE / 2;
+        // Left half surface at cell y = 10, right half one cell lower at
+        // y = 9: the surface drops by one cell across the octant plane.
+        let cube = Cube::from_fn(|p| {
+            let surface = if (p.x as i32) < half { 10 } else { 9 };
+            if (p.y as i32) <= surface {
+                blocks.stone
+            } else {
+                BlockStateId::AIR
+            }
+        });
+        let output = mesh_air_surrounded_at(cube, &appearance, 1);
+        // The higher side's border cell (x = half - 1) skirts toward +X,
+        // two cells deep (the top two filled cells of its column).
+        for y in [9, 10] {
+            assert!(
+                !faces_covering(&output, Direction::PosX, half - 1, y, 5).is_empty(),
+                "skirt missing at x = {}, y = {y}",
+                half - 1
+            );
+        }
+        // Below the two-cell band: no skirt (the rule keeps skirts near
+        // the surface).
+        assert!(faces_covering(&output, Direction::PosX, half - 1, 8, 5).is_empty());
+        assert!(faces_covering(&output, Direction::PosX, half - 1, 3, 5).is_empty());
+        assert!(output.skirts > 0);
+        // Interior columns (away from the plane) never skirt toward +X.
+        assert!(faces_covering(&output, Direction::PosX, half - 3, 10, 5).is_empty());
+    }
+
+    #[test]
+    fn a_flat_surface_across_the_plane_emits_hidden_skirts() {
+        let (_, appearance, blocks) = setup();
+        let half = CUBE_SIZE / 2;
+        let cube = Cube::from_fn(|p| {
+            if (p.y as i32) <= 10 {
+                blocks.stone
+            } else {
+                BlockStateId::AIR
+            }
+        });
+        let output = mesh_air_surrounded_at(cube, &appearance, 1);
+        // The skirt faces exist at the top two cells of the border
+        // columns on both sides of the plane — they sit flush inside the
+        // neighbor's terrain, under its top face at y = 10.
+        for (x, dir) in [(half - 1, Direction::PosX), (half, Direction::NegX)] {
+            for y in [9, 10] {
+                assert!(
+                    !faces_covering(&output, dir, x, y, 5).is_empty(),
+                    "skirt missing at x = {x}, y = {y}"
+                );
+            }
+        }
+        // An interior column of the flat surface has no +X faces at all:
+        // the neighbor cell is filled stone.
+        assert!(faces_covering(&output, Direction::PosX, half - 3, 10, 5).is_empty());
+    }
+
+    #[test]
+    fn a_missing_neighbor_cube_at_the_cube_border_gets_a_skirt() {
+        let (_, appearance, blocks) = setup();
+        let last = CUBE_SIZE - 1;
+        // Isolated input: every neighbor cube is missing. A surface
+        // column at the +X border skirts into the missing cube.
+        let make = || {
+            Cube::from_fn(|p| {
+                if (p.y as i32) <= 10 {
+                    blocks.stone
+                } else {
+                    BlockStateId::AIR
+                }
+            })
+        };
+        let input = MeshInput::isolated_at_level(Arc::new(make()), 1);
+        let output = mesh(&input, &appearance);
+        for y in [9, 10] {
+            assert!(
+                !faces_covering(&output, Direction::PosX, last, y, 5).is_empty(),
+                "border skirt missing at y = {y}"
+            );
+        }
+        // Level 0 has no skirts: the border column's +X faces toward the
+        // missing cube stay culled.
+        let input = MeshInput::isolated_at_level(Arc::new(make()), 0);
+        let output = mesh(&input, &appearance);
+        assert!(faces_covering(&output, Direction::PosX, last, 10, 5).is_empty());
     }
 
     #[test]
