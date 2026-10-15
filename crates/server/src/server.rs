@@ -532,13 +532,18 @@ impl Server {
     /// Phase 1: apply player inputs and channel messages. Connections are
     /// drained in join order, each connection's messages in arrival order,
     /// at most [`MESSAGES_PER_CONNECTION_PER_TICK`] per connection.
-    fn phase_messages(&mut self) {
+    /// Returns how many messages it handled (shutdown settling loops on it).
+    fn phase_messages(&mut self) -> usize {
+        let mut handled = 0;
         let mut dropped: Vec<usize> = Vec::new();
         for idx in 0..self.connections.len() {
             let mut remove = false;
             for _ in 0..MESSAGES_PER_CONNECTION_PER_TICK {
                 let msg = match self.connections[idx].link.try_recv() {
-                    Ok(Some(msg)) => msg,
+                    Ok(Some(msg)) => {
+                        handled += 1;
+                        msg
+                    }
                     Ok(None) => break,
                     Err(LinkClosed) => {
                         remove = true;
@@ -557,6 +562,32 @@ impl Server {
         // Remove back-to-front so the collected indices stay valid.
         for idx in dropped.into_iter().rev() {
             self.remove_connection(idx);
+        }
+        handled
+    }
+
+    /// Before the shutdown flush: handle every message the players already
+    /// sent (inputs and edits still in the links) and step every queued
+    /// input, so the saved world and positions match what the players last
+    /// saw rather than lagging by a tick or two. Bounded.
+    fn settle_received_input(&mut self) {
+        for _ in 0..64 {
+            let handled = self.phase_messages();
+            let Server {
+                connections,
+                world,
+                solid,
+                ..
+            } = self;
+            let shapes = ServerShapes { world, solid };
+            for conn in connections {
+                if let ConnectionState::Joined(player) = &mut conn.state {
+                    step_inputs(player, &shapes, usize::MAX);
+                }
+            }
+            if handled == 0 {
+                break;
+            }
         }
     }
 
@@ -856,10 +887,17 @@ impl Server {
     /// Removes a connection, remembering a joined player's record so the
     /// next save keeps where they left.
     fn remove_connection(&mut self, idx: usize) {
-        let conn = self.connections.remove(idx);
+        let mut conn = self.connections.remove(idx);
         if self.storage.is_some()
-            && let Some(player) = conn.joined_player()
+            && let ConnectionState::Joined(player) = &mut conn.state
         {
+            // Inputs that arrived before the disconnect still count: the
+            // player saw them applied, so the saved position includes them.
+            let shapes = ServerShapes {
+                world: &self.world,
+                solid: &self.solid,
+            };
+            step_inputs(player, &shapes, usize::MAX);
             self.departed.push((player.name.clone(), player.record()));
         }
     }
@@ -984,21 +1022,7 @@ impl Server {
             let ConnectionState::Joined(player) = &mut conn.state else {
                 continue;
             };
-            let mut processed = 0;
-            while processed < INPUTS_PER_TICK {
-                let Some((seq, input)) = player.input_queue.pop_front() else {
-                    break;
-                };
-                // Defensive: phase 1 already filters, but the cap rules can
-                // leave a stale seq behind after a burst.
-                if seq <= player.last_seq {
-                    continue;
-                }
-                player.state = physics::step(player.state, &input, &shapes);
-                player.last_seq = seq;
-                player.pending_ack = true;
-                processed += 1;
-            }
+            step_inputs(player, &shapes, INPUTS_PER_TICK);
         }
     }
 
@@ -1184,6 +1208,26 @@ impl Server {
     }
 }
 
+/// Steps up to `max` of `player`'s queued inputs, in seq order, through the
+/// shared physics.
+fn step_inputs(player: &mut Player, shapes: &ServerShapes<'_>, max: usize) {
+    let mut processed = 0;
+    while processed < max {
+        let Some((seq, input)) = player.input_queue.pop_front() else {
+            break;
+        };
+        // Defensive: phase 1 already filters, but the cap rules can leave a
+        // stale seq behind after a burst.
+        if seq <= player.last_seq {
+            continue;
+        }
+        player.state = physics::step(player.state, &input, shapes);
+        player.last_seq = seq;
+        player.pending_ack = true;
+        processed += 1;
+    }
+}
+
 /// A [`BlockShapes`] view of the server's world: a cube lookup per block,
 /// no clones. A missing cube reads as `None` (not loaded), which freezes
 /// players at the edge of generated terrain.
@@ -1303,7 +1347,11 @@ impl Drop for Server {
     fn drop(&mut self) {
         // Persist every accepted edit, then shut the saver down. A panic
         // unwinding through here still flushes what it can; a flush failure
-        // is logged by `flush` itself.
+        // is logged by `flush` itself. With persistence on, input already
+        // received is applied first so nothing the player saw is lost.
+        if self.storage.is_some() {
+            self.settle_received_input();
+        }
         self.flush();
         self.save_tx = None;
         if let Some(thread) = self.save_thread.take() {

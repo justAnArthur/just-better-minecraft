@@ -552,3 +552,70 @@ fn a_player_who_disconnects_first_is_still_remembered() {
     assert_eq!(back, position);
     assert_eq!((back_yaw, back_pitch, back_flying), (yaw, pitch, true));
 }
+
+/// Sends `n` eastward flight inputs without stepping the server, so they
+/// sit unprocessed (in the link, then the input queue) at shutdown.
+fn queue_flight(client: &mut TestClient, first_seq: u64, n: u64) {
+    for seq in first_seq..first_seq + n {
+        client.send(ClientMsg::PlayerInput {
+            seq,
+            input: MoveInput {
+                forward: 1,
+                sprint: true,
+                yaw: std::f32::consts::FRAC_PI_2,
+                ..MoveInput::IDLE
+            },
+            pitch: 0.1,
+        });
+    }
+}
+
+/// Where the player ends up when the server applies every queued input
+/// normally: the reference for the quit-right-away tests.
+fn reference_position(n: u64) -> [f64; 3] {
+    let dir = TempDir::new().unwrap();
+    let mut hs = HeadlessServer::with_config(persistent_config(&dir, Duration::from_secs(3600)));
+    let (mut client, _, _, _, _) = join(&mut hs, "alice");
+    wander(&mut hs, &mut client);
+    queue_flight(&mut client, 1000, n);
+    hs.step(10);
+    hs.server()
+        .players()
+        .next()
+        .unwrap()
+        .state
+        .position
+        .to_array()
+}
+
+#[test]
+fn quitting_right_after_moving_keeps_the_last_inputs() {
+    let expected = reference_position(6);
+    for client_leaves_first in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let config = || persistent_config(&dir, Duration::from_secs(3600));
+        let mut hs = HeadlessServer::with_config(config());
+        let (mut client, _, _, _, _) = join(&mut hs, "alice");
+        let (before, _, _) = wander(&mut hs, &mut client);
+        queue_flight(&mut client, 1000, 6);
+        if client_leaves_first {
+            // The server notices the closed link on its next tick, after
+            // reading the inputs still buffered in it.
+            drop(client);
+            hs.step(1);
+            drop(hs);
+        } else {
+            // The server stops before ever ticking those inputs.
+            drop(hs);
+            drop(client);
+        }
+        let mut hs = HeadlessServer::with_config(config());
+        let (_alice, back, _, pitch, _) = join(&mut hs, "alice");
+        assert_ne!(back, before, "client_leaves_first = {client_leaves_first}");
+        assert_eq!(
+            back, expected,
+            "client_leaves_first = {client_leaves_first}"
+        );
+        assert_eq!(pitch, 0.1);
+    }
+}

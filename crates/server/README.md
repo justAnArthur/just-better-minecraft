@@ -181,7 +181,11 @@ records of joined players and of players who left since the last one
 (`remove_connection` captures them, so a disconnect never loses the last
 position), written only when they differ from what was last committed and
 in the same transaction as that batch's cubes. `flush` saves them too and
-waits until every batch sent has been answered.
+waits until every batch sent has been answered. Nothing a player saw is
+lost to timing: a disconnecting player's queued inputs are stepped before
+their record is taken, and on shutdown (`Drop`, with persistence on) the
+server first handles every message already in the links — inputs and
+edits — and steps all queued inputs, then flushes.
 
 ### Dirty tracking and pinning
 
