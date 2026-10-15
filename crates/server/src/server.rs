@@ -542,9 +542,17 @@ impl Server {
         self.lod.request(level, pos);
     }
 
-    /// LOD jobs queued, running or finished-but-uncollected.
+    /// LOD jobs queued, running or finished-but-uncollected. The pyramid's
+    /// own (internal) jobs are excluded, as [`LodPyramid::in_flight`]
+    /// documents.
     pub fn lod_in_flight(&self) -> usize {
         self.lod.in_flight()
+    }
+
+    /// Internal (pending-propagation) LOD jobs the pyramid has queued in
+    /// total — the load-report number for the default view.
+    pub fn lod_internal_requests(&self) -> u64 {
+        self.lod.internal_requests()
     }
 
     /// How many `sample_lod` sampling runs the generator has done — the
@@ -996,10 +1004,14 @@ impl Server {
     }
 
     /// Snapshots every LOD cube the pyramid marked dirty (ready cubes whose
-    /// content changed) and not already in flight.
+    /// content changed) and not already in flight. A cube whose older save
+    /// is still in flight is kept dirty, so the interval after that save's
+    /// ack writes the newer content — dropping it here would lose it.
     fn collect_lod_dirty(&mut self, batch: &mut SaveBatch) {
-        for (level, pos) in self.lod.take_store_dirty() {
+        let dirty = self.lod.take_store_dirty();
+        for (level, pos) in dirty {
             if self.lod_pending_save.contains(&(level, pos)) {
+                self.lod.mark_store_dirty(&[(level, pos)]);
                 continue;
             }
             if let Some(lc) = self.lod.get(level, pos)
@@ -1088,7 +1100,12 @@ impl Server {
                 for pos in positions {
                     self.pending_save.remove(&pos);
                 }
-                self.lod_pending_save.clear();
+                // Only this batch's keys: other batches may still be in
+                // flight behind it, and forgetting theirs would let a later
+                // interval snapshot them again while their save still runs.
+                for key in &lod {
+                    self.lod_pending_save.remove(key);
+                }
                 self.lod.mark_store_dirty(&lod);
             }
         }

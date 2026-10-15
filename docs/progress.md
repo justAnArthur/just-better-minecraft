@@ -83,9 +83,8 @@ Baselines are bench worker runs on an otherwise idle machine. Run-to-run noise o
 - Without a world dir (`world_dir: None`, all tests by default) edited cubes stay pinned forever, as before 2.3. With persistence they unpin once saved.
 - server: `Drop for Server` joins `jbm-save` after `flush`'s 30 s timeout, so a hung commit can still block shutdown. Bound the join if it ever matters.
 - client: face pages are never freed or compacted; fragmentation grows with churn until a compaction task (2.6 or later).
-- LOD pyramid has no eviction until 2.6 (rings) and 2.7 (stored LOD); it grows with the explored area.
-- LOD ingest runs on the tick thread: ~0.6× the generation cost of a surface cube (~100 µs), ~40–60 ms total while the default view loads. Move the level-1 downsample to the gen pool workers if it shows up in 2.7's tick budget.
-- LOD octants whose child cube was never loaded read as air (`known` mask says which are real); 2.7 fills them from worldgen.
+- LOD pyramid has no in-memory eviction; it grows with the explored area. Stored LOD (2.7) means evicted cubes could be dropped and reloaded on request, but nothing evicts yet.
+- LOD ingest runs on the tick thread: ~0.7× the generation cost of a surface cube (~88 µs against 124 µs; the level-1 downsample itself moved to the gen pool workers in 2.7).
 - gpu-cull rebuilds a full-resolution Hi-Z pyramid every frame; start it at half resolution if gpu-cull becomes the default.
 - `worldgen::reference` (the 1.5 noise code) is kept only for equivalence tests; delete it once LOD sampling (2.7) has its own coverage.
 - Golden tolerance (0.5% of pixels differing) is larger than thin features such as the target outline (~40–140 px). Tests for thin features must also assert directly: `edit_screenshot` renders with and without the outline and requires a difference.

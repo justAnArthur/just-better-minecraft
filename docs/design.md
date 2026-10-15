@@ -89,7 +89,7 @@ LOD is a pyramid of the same 32³ cube format: at level *n*, each cell covers 2�
 
 **Two sources of LOD data:**
 
-1. **From worldgen, for terrain nobody has visited.** Worldgen is written as density and biome functions that can be sampled at any resolution. Sampling them every 2ⁿ blocks gives a LOD cube directly, without generating the full-detail terrain underneath. Distant mountains appear in seconds.
+1. **From worldgen, for terrain nobody has visited.** Worldgen is written as density and biome functions that can be sampled at any resolution. Sampling them every 2ⁿ blocks gives a LOD cube directly, without generating the full-detail terrain underneath. Distant mountains appear in seconds. Concretely (2.7): an octant with no real data is sampled on the level-(*n*−1) grid — 64³ density points at one child-cell stride, surface stage included — and those samples are downsampled with the same 2×2×2 rule as real data, so a worldgen octant and a later real octant of the same terrain agree cell for cell; at level 1 this makes the sample **exact**: it equals the downsample of the eight generated LOD0 cubes.
 2. **From the real world, for terrain that exists.** When a LOD0 cube is generated or edited, it is downsampled into its LOD1 parent, then up the pyramid. Player builds stay visible from far away, and they override the worldgen guess.
 
 **Worldgen is declarative.** Terrain shape is a graph of density functions (noise, splines, math) declared as data. The engine evaluates it natively at any resolution, which makes LOD sampling possible and keeps worldgen equally fast whatever language a mod uses. Code runs only for later stages such as trees, ores and structures.

@@ -622,13 +622,13 @@ fn run_property_ops(seed: u64, ops: u64) {
             // Drain the pipeline completely: every cube the chain needs is
             // ready, and every ready cube equals the reference.
             let mut spins = 0;
-            while pyramid.in_flight() > 0 {
+            while pyramid.in_flight_total() > 0 {
                 pyramid.poll();
                 spins += 1;
                 assert!(
                     spins < 10_000,
                     "drain stuck with {} jobs",
-                    pyramid.in_flight()
+                    pyramid.in_flight_total()
                 );
             }
             let rebuilt = LodPyramid::rebuild(
@@ -651,7 +651,7 @@ fn run_property_ops(seed: u64, ops: u64) {
                     }
                 }
                 let mut spins = 0;
-                while pyramid.in_flight() > 0 {
+                while pyramid.in_flight_total() > 0 {
                     pyramid.poll();
                     spins += 1;
                     assert!(spins < 10_000, "final drain stuck");
@@ -1224,19 +1224,20 @@ fn inline_pyramid(levels: u8, budget: usize) -> LodPyramid {
     )
 }
 
-/// Pops every queued job: after this the pyramid holds no pending work.
+/// Pops every queued job, internal (pending-propagation) ones included:
+/// after this the pyramid holds no pending work.
 fn drain_pyramid(pyramid: &mut LodPyramid) {
     let mut spins = 0;
     loop {
         pyramid.poll();
-        if pyramid.in_flight() == 0 {
+        if pyramid.in_flight_total() == 0 {
             break;
         }
         spins += 1;
         assert!(
             spins < 10_000,
             "drain stuck with {} jobs",
-            pyramid.in_flight()
+            pyramid.in_flight_total()
         );
     }
 }
@@ -1370,6 +1371,47 @@ fn ready_is_none_while_pending_and_changed_reports_only_ready_cubes() {
     for (level, cube_pos) in [(1, p1), (2, p2), (3, p3)] {
         assert!(pyramid.ready(level, cube_pos).is_some());
     }
+}
+
+#[test]
+fn internal_requests_never_consume_the_streaming_cap() {
+    // The pyramid's own fill requests (deferred propagations) do not count
+    // in `in_flight` — the number 2.6 caps its own requests with — so a
+    // burst of LOD0 ingest during exploration can never crowd streaming's
+    // requests out of their budget.
+    let generator = Generator::new(DEFAULT_SEED, blocks());
+    let mut pyramid = inline_pyramid(4, 64);
+    let y = (generator.surface_height(0, 0) >> 5) as i32;
+    // A 2×2 footprint of LOD0 cubes: every insert defers (the level-1
+    // parent is not ready) and queues an internal fill for it.
+    for dx in 0..2i32 {
+        for dz in 0..2i32 {
+            let pos = CubePos { x: dx, y, z: dz };
+            pyramid.insert_lod0(pos, &generator.generate(pos));
+        }
+    }
+    assert!(
+        pyramid.internal_requests() > 0,
+        "the inserts queued internal fills"
+    );
+    assert_eq!(
+        pyramid.in_flight(),
+        0,
+        "internal requests must not consume the streaming cap"
+    );
+    // An external request is still admitted at the cap, and the deferred
+    // work still runs to completion (the level-2 cube readies from its
+    // real level-1 child plus fills).
+    let level2 = CubePos {
+        x: 0,
+        y: y >> 2,
+        z: 0,
+    };
+    pyramid.request(2, level2);
+    assert_eq!(pyramid.in_flight(), 1);
+    drain_pyramid(&mut pyramid);
+    assert!(pyramid.ready(2, level2).is_some());
+    assert_eq!(pyramid.in_flight(), 0);
 }
 
 #[test]
@@ -1643,6 +1685,79 @@ fn stored_lod_reloads_without_sampling_and_unchanged() {
 }
 
 #[test]
+fn default_rings_ready_times_at_game_scale() {
+    // The report's timing numbers, threaded and at game scale: the default
+    // rings (a `lod_view_radius`/`lod_vertical_radius` disk at every
+    // level) around spawn ready from worldgen, then — after a flush and
+    // reopen — from storage alone.
+    let dir = tempfile::TempDir::new().unwrap();
+    let rings = ring_positions(&Generator::new(DEFAULT_SEED, blocks()));
+    assert!(rings.len() > 1_000, "{} ring cubes", rings.len());
+
+    let threaded = || {
+        Server::with_config(ServerConfig {
+            world_dir: Some(dir.path().to_owned()),
+            ..ServerConfig::default() // threaded pools, default rings
+        })
+    };
+    let from_worldgen = {
+        let mut server = threaded();
+        let start = Instant::now();
+        for &(level, pos) in &rings {
+            server.request_lod(level, pos);
+        }
+        let deadline = Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            server.tick();
+            // Yield: the workers, not this loop, do the filling.
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            if rings
+                .iter()
+                .all(|&(level, pos)| server.lod_ready(level, pos).is_some())
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the rings never readied");
+        }
+        let ready = start.elapsed();
+        println!(
+            "rings ready from worldgen, threaded: {ready:?} ({} cubes, {} samples)",
+            rings.len(),
+            server.lod_samples()
+        );
+        server.flush();
+        ready
+    };
+    let mut server = threaded();
+    let start = Instant::now();
+    for &(level, pos) in &rings {
+        server.request_lod(level, pos);
+    }
+    let deadline = Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        server.tick();
+        // Yield, as above: the workers do the loading.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        if rings
+            .iter()
+            .all(|&(level, pos)| server.lod_ready(level, pos).is_some())
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the stored rings never readied");
+    }
+    println!(
+        "rings ready from storage, threaded: {:?} ({} samples), pyramid heap {} bytes ({:.1} MiB)",
+        start.elapsed(),
+        server.lod_samples(),
+        server.lod_heap_bytes(),
+        server.lod_heap_bytes() as f64 / (1024.0 * 1024.0)
+    );
+    assert_eq!(server.lod_samples(), 0, "a reload must not sample");
+    assert!(from_worldgen > std::time::Duration::ZERO);
+}
+
+#[test]
 fn edits_survive_in_lod_without_the_lod0_cube_loaded() {
     // Edit a pillar, flush, reopen with no player (nothing loads LOD0),
     // and ask for the ancestors: the edit shows from the stored LOD.
@@ -1699,6 +1814,150 @@ fn edits_survive_in_lod_without_the_lod0_cube_loaded() {
         expected.get(cell1),
         "the edit must survive in the stored level-1 cube"
     );
+}
+
+#[test]
+fn a_lod_cube_changed_while_its_save_is_in_flight_is_saved_again() {
+    // The lost-save regression: a ready LOD cube whose content changes
+    // again while the save of its previous content is still in flight must
+    // stay dirty, so the interval after that save's ack stores the latest
+    // content. Dropping it from the dirty set (it was already pending)
+    // left the stale record on disk forever.
+    let dir = tempfile::TempDir::new().unwrap();
+    let glass = blocks().glass;
+    let (mut server, mut client) = settled_server(ServerConfig {
+        world_dir: Some(dir.path().to_owned()),
+        save_interval: std::time::Duration::from_millis(50), // every tick
+        gen_threads: 0,
+        ..streaming_config()
+    });
+    // Two 2×2×2 glass groups, each aligned inside one LOD1 cell of the same
+    // level-1 cube: placing a whole group flips its cell from air to glass
+    // (8 of 8), so each group is one observable content change.
+    let ground = surface_y(&server);
+    let y0 = {
+        let y = ground + 4;
+        y + (y & 1) // even, above the surface and the player's box
+    };
+    let (l1, cell_a) = lod_cell(1, 2, y0, 0);
+    let (l1_b, cell_b) = lod_cell(1, 3, y0 + 1, 3);
+    assert_eq!(l1, l1_b, "both groups share one level-1 cube");
+    assert_ne!(cell_a, cell_b);
+    let group = |z0: i64| {
+        (y0..y0 + 2)
+            .flat_map(|y| (2..4).map(move |x| (x, y)))
+            .flat_map(|(x, y)| (z0..z0 + 2).map(move |z| BlockPos { x, y, z }))
+            .collect::<Vec<_>>()
+    };
+    // All eight placements land in one tick, so the interval's snapshot
+    // holds the fully flipped cell (not a partial group).
+    let place_group = |server: &mut Server, client: &mut ClientLink, blocks: &[BlockPos]| {
+        for pos in blocks {
+            client
+                .send(ClientMsg::PlaceBlock {
+                    pos: *pos,
+                    state: glass,
+                })
+                .unwrap();
+        }
+        server.tick();
+        drain(client);
+        for pos in blocks {
+            assert_eq!(server.block(*pos), Some(glass), "place at {pos:?} rejected");
+        }
+    };
+
+    // v1: the cube over spawn is ready and its first save has committed.
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    while server
+        .storage()
+        .unwrap()
+        .load_lod(1, l1)
+        .expect("load_lod")
+        .is_none()
+    {
+        server.tick();
+        drain(&mut client);
+        assert!(
+            Instant::now() < deadline,
+            "the first LOD save never committed"
+        );
+    }
+    let stored_cell = |server: &Server, cell: LocalPos| {
+        server
+            .storage()
+            .unwrap()
+            .load_lod(1, l1)
+            .expect("load_lod")
+            .expect("the record exists")
+            .0
+            .get(cell)
+    };
+
+    // Hold the saver; v2 (group A) goes into a batch that never commits
+    // until released; v3 (group B) changes the cube again while that save
+    // is in flight.
+    let held = server.storage().expect("persistence on").clone();
+    held.hold_saves();
+    place_group(&mut server, &mut client, &group(0));
+    assert!(server.unanswered_batches() > 0, "the v2 batch is in flight");
+    // Let the saver take the held batch, as 2.3's test does.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    place_group(&mut server, &mut client, &group(2));
+    for _ in 0..3 {
+        server.tick(); // intervals snapshot (and skip) the pending key
+        drain(&mut client);
+    }
+
+    // Releasing one save commits v2 only; the record must show group A's
+    // glass and not group B's.
+    held.release_one_save();
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    while stored_cell(&server, cell_a) != glass {
+        server.tick();
+        drain(&mut client);
+        assert!(
+            Instant::now() < deadline,
+            "the held v2 batch never committed"
+        );
+    }
+    assert_ne!(
+        stored_cell(&server, cell_b),
+        glass,
+        "the v2 record must predate group B"
+    );
+
+    // The rest of the saver runs; the cube was changed during the save, so
+    // a later interval must store v3. With the lost-save bug the key was
+    // gone from the dirty set and this never happened.
+    held.release_saves();
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    while stored_cell(&server, cell_b) != glass {
+        server.tick();
+        drain(&mut client);
+        assert!(
+            Instant::now() < deadline,
+            "the change made during the save was never stored"
+        );
+    }
+
+    // And the stored record is exactly the live cube: flush, reopen, and
+    // load it back without a single worldgen sample. The held storage Arc
+    // goes first — it keeps the database file open.
+    let live = server.lod_ready(1, l1).expect("ready").clone();
+    drop(held);
+    drop(client);
+    server.flush();
+    drop(server);
+    let mut reopened = lod_server(dir.path());
+    reopened.request_lod(1, l1);
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    while reopened.lod_ready(1, l1).is_none() {
+        reopened.tick();
+        assert!(Instant::now() < deadline, "the reopened cube never readied");
+    }
+    assert_eq!(reopened.lod_ready(1, l1), Some(&live));
+    assert_eq!(reopened.lod_samples(), 0, "the reload must not sample");
 }
 
 #[test]
@@ -1872,7 +2131,7 @@ fn spawn_kill_child(dir: &std::path::Path) -> std::process::Child {
         .env(KILL_CHILD_VAR, "1")
         .env(KILL_DIR_VAR, dir)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::inherit()) // a child panic must be visible
         .spawn()
         .expect("spawning the kill child");
     {
@@ -1904,40 +2163,51 @@ fn spawn_kill_child(dir: &std::path::Path) -> std::process::Child {
 #[test]
 #[cfg(unix)]
 fn kill_during_save_leaves_lod_records_consistent_with_lod0() {
+    // As 2.3's crash test: several kills at different seeded delays, so
+    // some land mid-save. After every kill the world reopens, every stored
+    // LOD record decodes, and every real octant whose LOD0 cube is also
+    // stored agrees with its downsample.
     let dir = tempfile::TempDir::new().unwrap();
-    let mut child = spawn_kill_child(dir.path());
-    std::thread::sleep(std::time::Duration::from_millis(147));
-    child.kill().expect("SIGKILL the child");
-    let _ = child.wait();
+    let mut rng = XorShift64(0x4C4F_4453_4156_4573);
+    for round in 1..=10u32 {
+        let mut child = spawn_kill_child(dir.path());
+        let ms = 20 + rng.next() % 381;
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        child.kill().expect("SIGKILL the child");
+        let _ = child.wait();
 
-    // The world reopens, every stored LOD record decodes, and every real
-    // octant whose LOD0 cube is also stored agrees with its downsample.
-    let server = lod_server(dir.path());
-    let storage = server.storage().expect("persistence on");
-    let lod_keys = storage.lod_positions().expect("lod positions");
-    assert!(!lod_keys.is_empty(), "some LOD records were committed");
-    for (level, pos) in &lod_keys {
-        let (cube, _known) = storage
-            .load_lod(*level, *pos)
-            .unwrap_or_else(|e| panic!("LOD {level} {pos:?} failed to decode: {e}"))
-            .unwrap_or_else(|| panic!("LOD {level} {pos:?} vanished"));
-        if *level == 1 {
-            for octant in 0..8u8 {
-                let [dx, dy, dz] = octant_offset(octant).map(i32::from);
-                let child = CubePos {
-                    x: pos.x * 2 + dx,
-                    y: pos.y * 2 + dy,
-                    z: pos.z * 2 + dz,
-                };
-                if let Some(lod0) = storage.load(child).expect("lod0 load") {
-                    let mut expected = Cube::filled(BlockStateId::AIR);
-                    jbm_core::lod::downsample_octant(&lod0, &mut expected, octant);
-                    assert_octant_equals(
-                        &cube,
-                        octant,
-                        |cell| expected.get(cell),
-                        "stored LOD disagrees with stored LOD0",
-                    );
+        let server = lod_server(dir.path());
+        let storage = server.storage().expect("persistence on");
+        let lod_keys = storage.lod_positions().expect("lod positions");
+        assert!(
+            !lod_keys.is_empty(),
+            "round {round}: some LOD records were committed"
+        );
+        for (level, pos) in &lod_keys {
+            let (cube, _known) = storage
+                .load_lod(*level, *pos)
+                .unwrap_or_else(|e| {
+                    panic!("round {round}: LOD {level} {pos:?} failed to decode: {e}")
+                })
+                .unwrap_or_else(|| panic!("round {round}: LOD {level} {pos:?} vanished"));
+            if *level == 1 {
+                for octant in 0..8u8 {
+                    let [dx, dy, dz] = octant_offset(octant).map(i32::from);
+                    let child = CubePos {
+                        x: pos.x * 2 + dx,
+                        y: pos.y * 2 + dy,
+                        z: pos.z * 2 + dz,
+                    };
+                    if let Some(lod0) = storage.load(child).expect("lod0 load") {
+                        let mut expected = Cube::filled(BlockStateId::AIR);
+                        jbm_core::lod::downsample_octant(&lod0, &mut expected, octant);
+                        assert_octant_equals(
+                            &cube,
+                            octant,
+                            |cell| expected.get(cell),
+                            "round {round}: stored LOD disagrees with stored LOD0",
+                        );
+                    }
                 }
             }
         }
@@ -1974,12 +2244,20 @@ fn lod_kill_child() {
         server.tick();
         drain(&mut client);
     }
+    // One fresh edit per round, always within reach of the restored
+    // player: alternating break/place on the spawn surface block (its y
+    // from the generator, since the stored column top moves with the
+    // edits). A fixed deeper dig would walk out of reach round by round.
     let ground = BlockPos {
         x: 0,
-        y: surface_y(&server),
+        y: Generator::new(DEFAULT_SEED, blocks()).surface_height(0, 0),
         z: 0,
     };
-    break_block(&mut server, &mut client, ground);
+    if server.block(ground) == Some(BlockStateId::AIR) {
+        place(&mut server, &mut client, ground, blocks().glass);
+    } else {
+        break_block(&mut server, &mut client, ground);
+    }
     let generator = Generator::new(DEFAULT_SEED, blocks());
     let h = generator.surface_height(0, 0);
     for level in 1..=4u8 {

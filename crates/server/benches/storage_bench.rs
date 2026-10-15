@@ -91,6 +91,26 @@ fn bench(c: &mut Criterion) {
         b.iter(|| storage.load(mixed).unwrap().expect("stored"))
     });
 
+    // One stored surface LOD record (schema 2, task 2.7), decode included:
+    // the storage half of the fill pipeline's load-or-sample job. Mixed by
+    // construction, so the decode cost shows.
+    let lod_pos = CubePos {
+        x: 0,
+        y: (h >> 7) as i32,
+        z: 0,
+    };
+    let lod_cube = generator.sample_lod(2, lod_pos);
+    assert!(lod_cube.uniform().is_none(), "the LOD record must be mixed");
+    storage
+        .set_worldgen_fingerprint(jbm_server::worldgen::overworld().fingerprint())
+        .unwrap();
+    storage
+        .save_lod_batch(&[], &[(2, lod_pos, &lod_cube, 0)], &[])
+        .unwrap();
+    group.bench_function("load_lod", |b| {
+        b.iter(|| storage.load_lod(2, lod_pos).unwrap().expect("stored"))
+    });
+
     group.finish();
 }
 

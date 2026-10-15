@@ -52,7 +52,10 @@
 //! [`LodPyramid::poll`] merges finished jobs into the pyramid — real
 //! octants always win over the job's content — and completes the deferred
 //! propagations that became possible, recording every changed or newly
-//! ready cube for [`LodPyramid::take_changed`].
+//! ready cube for [`LodPyramid::take_changed`]. The pyramid's own requests
+//! (the deferred propagations' fills) are uncapped and excluded from
+//! [`LodPyramid::in_flight`], so they never consume the streaming budget
+//! that call reports.
 //!
 //! Eviction never touches the pyramid: LOD cubes outlive their LOD0
 //! children, so player builds stay visible from far away. The pyramid
@@ -189,8 +192,13 @@ pub struct LodPyramid {
     generator: Option<Arc<Generator>>,
     /// Stored LOD, when persistence is on.
     storage: Option<Arc<Storage>>,
-    /// Jobs queued, running or finished-but-uncollected.
-    in_flight: HashSet<Job>,
+    /// Jobs queued, running or finished-but-uncollected. The flag marks the
+    /// pyramid's own requests (pending propagations), which do not count
+    /// against the streaming cap [`LodPyramid::in_flight`] reports.
+    in_flight: HashMap<Job, bool>,
+    /// How many internal (pending-propagation) jobs were queued in total —
+    /// the load report number for the default view.
+    internal_requests: u64,
     /// Pending inline-mode jobs, in request order.
     inline_queue: VecDeque<Job>,
     /// `None` in inline mode.
@@ -243,7 +251,8 @@ impl LodPyramid {
             store_dirty: HashSet::new(),
             generator,
             storage,
-            in_flight: HashSet::new(),
+            in_flight: HashMap::new(),
+            internal_requests: 0,
             inline_queue: VecDeque::new(),
             job_tx: None,
             results_rx,
@@ -464,20 +473,24 @@ impl LodPyramid {
                 self.request_internal(level, child);
                 break;
             }
-            let child_cube = child_lc.cube.clone();
+            // The child is borrowed, not cloned: this runs per insert and
+            // per poll on the tick thread, and a clone would double the
+            // memory traffic of every level's downsample.
+            let (below, above) = self.levels.split_at_mut(level as usize);
             let (was_ready, was_known, changed) = {
-                let lc = self.entry(parent_level, pos);
+                let child_lc = &below[level as usize - 1][&child];
+                let lc = above[0].entry(pos).or_insert_with(LodCube::empty);
                 let was_ready = lc.ready();
                 let was_known = lc.known & bit != 0;
                 let changed = if was_known {
                     region.and_then(|region| {
-                        downsample_region(&child_cube, &mut lc.cube, octant, region)
+                        downsample_region(&child_lc.cube, &mut lc.cube, octant, region)
                     })
                 } else {
                     lc.pending &= !bit;
                     lc.filled &= !bit;
                     lc.known |= bit;
-                    downsample_octant(&child_cube, &mut lc.cube, octant)
+                    downsample_octant(&child_lc.cube, &mut lc.cube, octant)
                 };
                 (was_ready, was_known, changed)
             };
@@ -555,9 +568,12 @@ impl LodPyramid {
                 .collect();
             for child in children {
                 let (pos, octant) = parent(child);
-                let child_cube = pyramid.levels[level as usize - 2][&child].cube.clone();
-                let lc = pyramid.entry(level, pos);
-                downsample_octant(&child_cube, &mut lc.cube, octant);
+                // Borrow the child through a level split rather than
+                // cloning it (as `propagate` does).
+                let (below, above) = pyramid.levels.split_at_mut(level as usize - 1);
+                let child_lc = &below[level as usize - 2][&child];
+                let lc = above[0].entry(pos).or_insert_with(LodCube::empty);
+                downsample_octant(&child_lc.cube, &mut lc.cube, octant);
                 lc.known |= 1 << octant;
             }
             (min, max) = (parent(min).0, parent(max).0);
@@ -609,10 +625,10 @@ impl LodPyramid {
     /// cube whose only missing octants are pending (their content comes
     /// from the child, not from a job).
     pub fn request(&mut self, level: u8, pos: CubePos) {
-        self.request_checked(level, pos);
+        self.request_checked(level, pos, false);
     }
 
-    fn request_checked(&mut self, level: u8, pos: CubePos) -> bool {
+    fn request_checked(&mut self, level: u8, pos: CubePos, internal: bool) -> bool {
         if !self.enabled() || self.generator.is_none() {
             return false;
         }
@@ -629,8 +645,12 @@ impl LodPyramid {
             }
         }
         let job = Job { level, pos };
-        if !self.in_flight.insert(job) {
+        if self.in_flight.contains_key(&job) {
             return false;
+        }
+        self.in_flight.insert(job, internal);
+        if internal {
+            self.internal_requests += 1;
         }
         match &self.job_tx {
             Some(tx) => {
@@ -641,15 +661,38 @@ impl LodPyramid {
         true
     }
 
-    /// The pyramid's own requests (deferred propagations); they count in
-    /// [`LodPyramid::in_flight`] like any other.
+    /// The pyramid's own requests (deferred propagations). They are uncapped
+    /// and do not count in [`LodPyramid::in_flight`]: they are self-limiting
+    /// (at most one job per pyramid cube, deduplicated) and correctness-
+    /// bearing, so they must never consume — or wait behind — the streaming
+    /// budget; a burst of LOD0 ingest during exploration would otherwise
+    /// crowd streaming's own requests out of its cap for as long as it
+    /// lasts.
     fn request_internal(&mut self, level: u8, pos: CubePos) {
-        self.request_checked(level, pos);
+        self.request_checked(level, pos, true);
     }
 
-    /// Requests not yet ready. The caller caps its requests with this
-    /// (`ServerConfig::lod_max_in_flight`).
+    /// Streaming's requests not yet ready — the number the caller caps with
+    /// `ServerConfig::lod_max_in_flight`. The pyramid's own (internal,
+    /// pending-propagation) requests are excluded on purpose, so they can
+    /// never starve streaming's.
     pub fn in_flight(&self) -> usize {
+        self.in_flight
+            .values()
+            .filter(|internal| !**internal)
+            .count()
+    }
+
+    /// Internal (pending-propagation) requests queued in total. A load
+    /// report number: how much fill work the pyramid asks of itself.
+    pub fn internal_requests(&self) -> u64 {
+        self.internal_requests
+    }
+
+    /// All jobs queued, running or finished-but-uncollected, internal ones
+    /// included. The drain observable: zero means no fill work remains
+    /// anywhere in the pipeline.
+    pub fn in_flight_total(&self) -> usize {
         self.in_flight.len()
     }
 
