@@ -2,7 +2,7 @@
 
 ## Next up
 
-Stage 2 · Far view, wave C: 2.6 clipmap streaming of LOD rings with skirts at seams, 2.7 LOD sampled straight from worldgen plus stored LOD in redb. Specs not written yet. Wave B merged (2.4 LOD pyramid, 2.5 GPU culling).
+Stage 2 · Far view, wave C (in progress on `stage-2/wave-c`): 2.6 clipmap streaming of LOD rings with skirts at seams, 2.7 LOD sampled straight from worldgen plus stored LOD in redb. Specs in docs/tasks/2.6.md and 2.7.md; both run in parallel against the shared interface committed first (protocol v6 `LodCubeData`/`UnloadLodCube`, the `lod_*` ring config, `LodPyramid::{ready, request, in_flight, poll, take_changed}`). 2.7 merges first; the 2.6 fly test needs it. Wave B merged (2.4 LOD pyramid, 2.5 GPU culling).
 
 ## Benchmarks
 
