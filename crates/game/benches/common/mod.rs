@@ -13,6 +13,8 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
+pub mod rings;
+
 use jbm_client::mesh::appearance::BlockAppearance;
 use jbm_client::mesh::greedy::{MeshInput, neighbor_index};
 use jbm_core::block::BlockRegistry;

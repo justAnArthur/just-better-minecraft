@@ -333,4 +333,54 @@ fn main() {
     } else {
         row("cave gpu-cull", "unavailable on this adapter");
     }
+
+    // Task 2.6: the LOD rings scene at game scale, per path and per
+    // level.
+    println!("\nrings scene (task 2.6, default lod_view_radius, 4 levels)");
+    let mut registry = jbm_core::block::BlockRegistry::new();
+    let blocks = jbm_core::block::builtin::Blocks::register(&mut registry);
+    let generator = jbm_server::terrain::Generator::new(DEFAULT_SEED, blocks);
+    let rings = common::rings::RingsScene::new(&generator, &blocks, &region.appearance);
+    let mut coverage = jbm_client::lod::Coverage::default();
+    let upload_rings =
+        |frames: &mut Frames, coverage: &mut jbm_client::lod::Coverage| -> TerrainPass {
+            let mut pass = TerrainPass::new(
+                &frames.gpu,
+                target.format(),
+                frames.renderer.uniform_layout(),
+                &textures,
+            );
+            for (key, mesh) in &rings.meshes {
+                pass.upload(&frames.gpu, *key, mesh);
+                coverage.set_ready(*key, true);
+            }
+            for (key, drawn, mask) in coverage.take_changed() {
+                pass.set_draw_state(&frames.gpu, key, drawn, mask);
+            }
+            pass
+        };
+    let mut rings_pass = upload_rings(&mut frames, &mut coverage);
+    for stats in rings_pass.level_stats() {
+        println!(
+            "  level {}: resident {:>6} drawn {:>6} masked {:>5} faces {:>8} skirts {:>5} face bytes {:>10}",
+            stats.level,
+            stats.resident,
+            stats.drawn,
+            stats.masked_octants,
+            stats.faces,
+            stats.skirts,
+            stats.faces * 8
+        );
+    }
+    rings_pass.set_force_cpu_cull(true);
+    measure_path("rings", &mut frames, &mut rings_pass, &rings.camera);
+    if rings_pass.gpu_cull_available() {
+        rings_pass.set_force_cpu_cull(false);
+        rings_pass.set_prefer_gpu_cull(true);
+        assert_eq!(rings_pass.path(), TerrainPath::GpuCull);
+        measure_path("rings", &mut frames, &mut rings_pass, &rings.camera);
+        rings_pass.set_prefer_gpu_cull(false);
+    } else {
+        row("rings gpu-cull", "unavailable on this adapter");
+    }
 }

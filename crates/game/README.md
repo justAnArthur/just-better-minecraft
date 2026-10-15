@@ -76,6 +76,40 @@ they measure gpu-cull even though the game defaults to cpu-cull. To
 play on gpu-cull, run `JBM_GPU_CULL=1 cargo run -p jbm-game --release`
 (the overlay names the active path).
 
+**LOD rings (task 2.6).** `terrain_draw` adds `rings/cpu_cull` and
+`rings/gpu_cull`: the rings scene at game scale (default
+`lod_view_radius`, 4 levels) built in `benches/common/rings.rs` —
+levels 0–1 from the real generator (level 1 by the core downsampling
+rule over level-0 data), levels 2–3 sampled from the generator's
+surface at each level's resolution, every cube pre-meshed with
+same-level neighbors and uploaded through the real coverage rule.
+Setup asserts every level has resident **and** drawn cubes (the
+coverage rule accepted the rings). `examples/cube_size_metrics.rs`
+prints the same scene per path (cull counts, frame time) and per level
+(resident, drawn, masked octants, faces, skirt faces, face-page bytes).
+
+**Autopilot (task 2.6 gate).** `JBM_AUTOFLY=<blocks> cargo run -p
+jbm-game --release` turns the app into an autopilot: once spawned it
+toggles flying, climbs 40 blocks above spawn, flies straight at sprint
+speed for `<blocks>` blocks through the normal `PlayerInput` path
+(prediction and the server both see a real player), then exits,
+printing a frame-time summary (count, mean, p50, p95, p99, max, frames
+over 33 ms and over 50 ms).
+
+**LOD fly test (task 2.6).** `tests/lod_fly.rs` (GPU, `#[ignore]`d
+until 2.7's worldgen LOD fill merges — on this branch the far rings
+stay missing, so the zero-hole assertion cannot hold; run with `cargo
+test -p jbm-game --test lod_fly -- --ignored` after `stage-2/wave-c`)
+flies a real client against a threaded real server: 1.5 km straight,
+then a 90° turn for 300 m, 40 blocks above the terrain at pitch −15°.
+Every 100 blocks it waits (20 s cap) for the server's rings to be
+ready and sent and the client mesh queue to drain, then asserts **zero
+sentinel pixels** below the horizon margin; it also renders one frame
+*without* waiting at every stop and asserts those holes are zero
+within 512 blocks of the camera (farther counts are only reported).
+Screenshots land under `target/fly/`. The whole run is bounded by a
+10-minute timeout that fails the test instead of hanging it.
+
 `examples/cube_size_metrics.rs` prints the matching metrics table (cube
 count, uniform cubes, the old one-draw-per-non-empty-cube number, faces,
 mesh bytes, cube storage + a documented HashMap overhead estimate,

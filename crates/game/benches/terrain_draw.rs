@@ -21,6 +21,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use glam::DVec3;
 use jbm_client::camera::Camera;
 use jbm_client::gpu::Gpu;
+use jbm_client::lod::Coverage;
 use jbm_client::mesh::greedy;
 use jbm_client::render::chunks::{TerrainPass, TerrainPath};
 use jbm_client::render::offscreen::OffscreenTarget;
@@ -229,6 +230,56 @@ fn bench(c: &mut Criterion) {
         frames.bench(&mut group, "cave/gpu_cull", &mut cave_gpu, &cave.camera);
     } else {
         println!("skipping terrain_draw/cave/gpu_cull: adapter lacks the GPU cull path");
+    }
+
+    // Task 2.6: the LOD rings scene at game scale (default
+    // lod_view_radius, 4 levels), through the CPU-culled and GPU-culled
+    // paths. Every level must have drawn cubes (the coverage rule
+    // accepted the rings) — asserted at setup.
+    let region_for_rings = common::Region::new(DEFAULT_SEED);
+    let mut registry = jbm_core::block::BlockRegistry::new();
+    let blocks = jbm_core::block::builtin::Blocks::register(&mut registry);
+    let generator = jbm_server::terrain::Generator::new(DEFAULT_SEED, blocks);
+    let rings = common::rings::RingsScene::new(&generator, &blocks, &region_for_rings.appearance);
+    for (level, count) in rings.resident.iter().enumerate() {
+        assert!(
+            *count > 0,
+            "rings bench: level {level} has no resident cubes ({:?})",
+            rings.resident
+        );
+    }
+    let make_rings_pass =
+        |gpu: &jbm_client::gpu::Gpu, meshes: &[(jbm_client::lod::CubeKey, greedy::MeshOutput)]| {
+            let mut pass = TerrainPass::new(gpu, format, &uniform_layout, &textures);
+            let mut coverage = Coverage::default();
+            for (key, mesh) in meshes {
+                pass.upload(gpu, *key, mesh);
+                coverage.set_ready(*key, true);
+            }
+            for (key, drawn, mask) in coverage.take_changed() {
+                pass.set_draw_state(gpu, key, drawn, mask);
+            }
+            pass
+        };
+    {
+        let mut rings_pass = make_rings_pass(&frames.gpu, &rings.meshes);
+        let drawn_levels: Vec<_> = rings_pass.level_stats().iter().map(|s| s.drawn).collect();
+        for (level, drawn) in drawn_levels.iter().enumerate() {
+            assert!(
+                *drawn > 0,
+                "rings bench: level {level} has no drawn cubes ({drawn_levels:?})"
+            );
+        }
+        rings_pass.set_force_cpu_cull(true);
+        frames.bench(&mut group, "rings/cpu_cull", &mut rings_pass, &rings.camera);
+        if rings_pass.gpu_cull_available() {
+            rings_pass.set_force_cpu_cull(false);
+            rings_pass.set_prefer_gpu_cull(true);
+            assert_eq!(rings_pass.path(), TerrainPath::GpuCull);
+            frames.bench(&mut group, "rings/gpu_cull", &mut rings_pass, &rings.camera);
+        } else {
+            println!("skipping terrain_draw/rings/gpu_cull: adapter lacks the GPU cull path");
+        }
     }
 
     group.finish();

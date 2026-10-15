@@ -117,6 +117,8 @@ struct App {
     autofly: Option<Autofly>,
     /// Every frame's duration (seconds), for the autopilot summary.
     frame_times: Vec<f64>,
+    /// When the last presented frame rendered; spans skipped loops.
+    last_present: Option<Instant>,
 }
 
 /// The `JBM_AUTOFLY` autopilot state machine.
@@ -187,6 +189,7 @@ impl App {
             coverage: Coverage::default(),
             autofly: Autofly::from_env(),
             frame_times: Vec::new(),
+            last_present: None,
         }
     }
 
@@ -362,7 +365,8 @@ impl App {
                 fly_toggle,
                 ..jbm_core::physics::MoveInput::IDLE
             };
-            autofly.flown = (state.position - autofly.origin).truncate().length();
+            let delta = state.position - autofly.origin;
+            autofly.flown = delta.x.hypot(delta.z);
         }
         let mut message = predictor.tick(stepped, world);
         // Physics ignores pitch; the camera's goes along for the ride.
@@ -497,10 +501,17 @@ impl App {
             .replace(now)
             .map(|t| now - t)
             .unwrap_or(Duration::ZERO);
+        // Present-to-present time for the autopilot summary: `dt` above
+        // spans only since the previous loop iteration, which under an
+        // occluded window is a skipped (unpresented) frame.
+        let present_dt = self
+            .last_present
+            .replace(now)
+            .map(|t| now - t)
+            .unwrap_or(Duration::ZERO);
         self.stats.push(dt);
         let dt = Duration::from_secs_f32(dt.as_secs_f32().min(MAX_DT));
         self.frame_time += dt.as_secs_f64();
-        self.frame_times.push(dt.as_secs_f64());
 
         // Mouse look stays per frame; movement is sampled per sim tick.
         apply_mouse_look(&mut self.camera, &self.input);
@@ -661,6 +672,9 @@ impl App {
             },
         );
         w.gpu.queue.present(frame);
+        // Only presented frames count for the autopilot summary —
+        // Occluded-surface skips return before this point.
+        self.frame_times.push(present_dt.as_secs_f64());
         if !self.occluded {
             w.window.request_redraw();
         }
@@ -833,9 +847,11 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Occluded(occluded) => {
                 // Pause the loop while fully hidden (minimized, other
-                // space) instead of spinning on Occluded surfaces.
-                self.occluded = occluded;
-                if !occluded {
+                // space) instead of spinning on Occluded surfaces —
+                // except under the autopilot, which must finish
+                // unattended (a gate run's window may never be shown).
+                self.occluded = occluded && self.autofly.is_none();
+                if !self.occluded {
                     w.window.request_redraw();
                 }
             }
