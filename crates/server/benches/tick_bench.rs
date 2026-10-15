@@ -56,18 +56,24 @@ fn bench(c: &mut Criterion) {
         }
         // Process the hellos so all 8 clients are joined before measuring.
         server.tick();
+        for client in clients.iter_mut() {
+            client.try_recv_drain();
+        }
 
+        // Seqs must advance across measured ticks or the server ignores
+        // the inputs as stale.
+        let mut seq = 0u64;
         b.iter_batched(
             || {
                 // Untimed: drain last tick's replies, then queue one
                 // PlayerInput per client for the tick being measured.
-                for (i, client) in clients.iter_mut().enumerate() {
-                    while client.try_recv().unwrap().is_some() {}
+                seq += 1;
+                for client in clients.iter_mut() {
+                    client.try_recv_drain();
                     client
                         .send(ClientMsg::PlayerInput {
-                            client_tick: i as u64,
-                            position: [i as f64, 64.0, 0.0],
-                            yaw: 0.0,
+                            seq,
+                            input: jbm_core::physics::MoveInput::IDLE,
                             pitch: 0.0,
                         })
                         .unwrap();

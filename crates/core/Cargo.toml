@@ -15,6 +15,7 @@ workspace = true
 cube16 = []
 
 [dependencies]
+glam.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

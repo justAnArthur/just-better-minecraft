@@ -11,6 +11,6 @@ pub mod tick;
 
 pub use gen_pool::GenPool;
 pub use run::ServerHandle;
-pub use server::{DEFAULT_SEED, PlayerInput, PlayerView, Server, ServerConfig};
+pub use server::{DEFAULT_SEED, PlayerView, Server, ServerConfig};
 pub use terrain::Generator;
 pub use tick::TickClock;

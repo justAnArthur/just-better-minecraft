@@ -7,6 +7,7 @@ pub mod camera;
 pub mod gpu;
 pub mod input;
 pub mod mesh;
+pub mod predict;
 pub mod render;
 pub mod world;
 

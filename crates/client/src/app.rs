@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 
 use glam::DVec3;
 use jbm_core::block::{BlockRegistry, builtin};
+use jbm_core::coords::CUBE_SIZE;
 use jbm_core::link::ClientLink;
+use jbm_core::physics::TICK_DT;
 use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION, ServerMsg};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, ElementState, MouseButton, WindowEvent};
@@ -19,9 +21,10 @@ use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
 use crate::camera::Camera;
 use crate::gpu::Gpu;
-use crate::input::{FlyController, InputState, Key as MoveKey};
+use crate::input::{InputState, Key as MoveKey, apply_mouse_look, move_input};
 use crate::mesh::appearance::BlockAppearance;
 use crate::mesh::pool::MeshPool;
+use crate::predict::Predictor;
 use crate::render::chunks::TerrainPass;
 use crate::render::overlay::{FrameStats, OverlayText};
 use crate::render::renderer::{DepthTarget, Renderer};
@@ -29,11 +32,16 @@ use crate::render::texture_array::BlockTextures;
 use crate::world::ClientWorld;
 
 /// Frame dt is clamped so a pause (window drag, debugger) does not
-/// teleport the camera.
+/// teleport the camera — and, with the catch-up cap below, never
+/// accumulates more than one clamped frame's worth of sim ticks.
 const MAX_DT: f32 = 0.25;
 
-/// PlayerInput sends are rate-limited to 20 per second.
-const INPUT_PERIOD: Duration = Duration::from_millis(50);
+/// The fixed simulation period: 20 Hz, matching the physics tick.
+const SIM_PERIOD: Duration = Duration::from_millis(1000 / 20);
+
+/// Sim ticks run per frame at most; the rest of the accumulator is
+/// dropped (a stalled frame must not spiral into a catch-up burst).
+const MAX_SIM_TICKS_PER_FRAME: u32 = 5;
 
 /// Dirty cubes handed to the mesh pool per frame.
 const SUBMIT_BUDGET: usize = 16;
@@ -67,13 +75,18 @@ struct App {
     windowed: Option<Windowed>,
     camera: Camera,
     input: InputState,
-    controller: FlyController,
     stats: FrameStats,
     cursor_grabbed: bool,
     /// Set while the OS reports the window fully hidden; the redraw loop
     /// pauses until it is visible again.
     occluded: bool,
     last_frame: Option<Instant>,
+    /// Leftover simulation time: whole ticks are consumed by the fixed
+    /// 20 Hz sim loop below, the fraction becomes the render alpha.
+    accumulator: Duration,
+    /// The predicted player. `None` until the `Welcome` arrives — the
+    /// sim does not run before it.
+    predictor: Option<Predictor>,
     /// Server link; drained every frame without blocking.
     link: ClientLink,
     world: ClientWorld,
@@ -81,8 +94,6 @@ struct App {
     /// Mesh jobs submitted but not yet received back.
     in_flight: usize,
     joined: bool,
-    client_tick: u64,
-    last_input: Option<Instant>,
     /// Set when the server refused, disconnected or the link closed; the
     /// loop exits cleanly after the current frame.
     fatal: Option<String>,
@@ -108,18 +119,17 @@ impl App {
                 16.0 / 9.0,
             ),
             input: InputState::new(),
-            controller: FlyController::default(),
             stats: FrameStats::default(),
             cursor_grabbed: false,
             occluded: false,
             last_frame: None,
+            accumulator: Duration::ZERO,
+            predictor: None,
             link,
             world: ClientWorld::new(),
             pool: MeshPool::new(appearance, 0),
             in_flight: 0,
             joined: false,
-            client_tick: 0,
-            last_input: None,
             fatal: None,
         }
     }
@@ -200,8 +210,15 @@ impl App {
             match self.link.try_recv() {
                 Ok(Some(msg)) => match &msg {
                     ServerMsg::Welcome { spawn, .. } => {
-                        self.camera.position = DVec3::from(*spawn);
+                        // The spawn is the feet position; the predictor
+                        // interpolates the eye for rendering.
+                        self.predictor = Some(Predictor::new(DVec3::from(*spawn)));
                         self.joined = true;
+                    }
+                    ServerMsg::PlayerState { ack_seq, state } => {
+                        if let Some(predictor) = &mut self.predictor {
+                            predictor.on_server_state(*ack_seq, *state, &self.world);
+                        }
                     }
                     ServerMsg::Rejected { reason } => {
                         eprintln!("server rejected the connection: {reason}");
@@ -230,23 +247,31 @@ impl App {
         }
     }
 
-    /// Sends the camera state at most [`INPUT_PERIOD`].
-    fn send_input(&mut self) {
-        if !self.joined || self.last_input.is_some_and(|t| t.elapsed() < INPUT_PERIOD) {
+    /// One fixed 20 Hz simulation tick: sample the keys into a
+    /// `MoveInput`, step the prediction, send it. Does nothing before the
+    /// `Welcome` (there is no predictor yet).
+    fn sim_tick(&mut self) {
+        let App {
+            predictor,
+            input,
+            camera,
+            world,
+            link,
+            fatal,
+            ..
+        } = self;
+        let Some(predictor) = predictor else {
             return;
-        }
-        let p = self.camera.position;
-        let message = ClientMsg::PlayerInput {
-            client_tick: self.client_tick,
-            position: [p.x, p.y, p.z],
-            yaw: self.camera.yaw,
-            pitch: self.camera.pitch,
         };
-        self.client_tick += 1;
-        self.last_input = Some(Instant::now());
-        if let Err(err) = self.link.send(message) {
+        let fly_toggle = input.take_fly_toggle();
+        let mut message = predictor.tick(move_input(input, camera.yaw, fly_toggle), world);
+        // Physics ignores pitch; the camera's goes along for the ride.
+        if let ClientMsg::PlayerInput { pitch, .. } = &mut message {
+            *pitch = camera.pitch;
+        }
+        if let Err(err) = link.send(message) {
             eprintln!("cannot send input, server link closed: {err}");
-            self.fatal = Some(err.to_string());
+            *fatal = Some(err.to_string());
         }
     }
 
@@ -282,12 +307,30 @@ impl App {
             .map(|t| now - t)
             .unwrap_or(Duration::ZERO);
         self.stats.push(dt);
-        let dt = dt.as_secs_f32().min(MAX_DT);
+        let dt = Duration::from_secs_f32(dt.as_secs_f32().min(MAX_DT));
 
-        self.controller.update(&mut self.camera, &self.input, dt);
+        // Mouse look stays per frame; movement is sampled per sim tick.
+        apply_mouse_look(&mut self.camera, &self.input);
+
+        // Fixed 20 Hz sim: run every due tick (at most the catch-up cap,
+        // dropping the leftover accumulator), then render between the
+        // previous and current tick at the leftover fraction.
+        self.accumulator += dt;
+        let mut ticks = 0;
+        while self.accumulator >= SIM_PERIOD && ticks < MAX_SIM_TICKS_PER_FRAME {
+            self.sim_tick();
+            self.accumulator -= SIM_PERIOD;
+            ticks += 1;
+        }
+        if ticks == MAX_SIM_TICKS_PER_FRAME {
+            self.accumulator = Duration::ZERO;
+        }
+        let alpha = self.accumulator.as_secs_f64() / TICK_DT;
+        if let Some(predictor) = &self.predictor {
+            self.camera.position = predictor.render_position(alpha);
+        }
 
         self.pump_link(w);
-        self.send_input();
         self.pump_meshing(w);
 
         let mut overlay = OverlayText::new();
@@ -300,15 +343,34 @@ impl App {
         overlay.push(format!("XYZ {:.2} {:.2} {:.2}", p.x, p.y, p.z));
         overlay.push(format!(
             "CUBE {} {} {}",
-            (p.x / 32.0).floor() as i64,
-            (p.y / 32.0).floor() as i64,
-            (p.z / 32.0).floor() as i64
+            (p.x / f64::from(CUBE_SIZE)).floor() as i64,
+            (p.y / f64::from(CUBE_SIZE)).floor() as i64,
+            (p.z / f64::from(CUBE_SIZE)).floor() as i64
         ));
         overlay.push(format!(
             "YAW {:.1} PITCH {:.1}",
             self.camera.yaw.to_degrees(),
             self.camera.pitch.to_degrees()
         ));
+        if let Some(predictor) = &self.predictor {
+            let state = predictor.state();
+            overlay.push(format!(
+                "MODE {} GROUND {}",
+                if state.flying { "FLY" } else { "WALK" },
+                if state.on_ground { "YES" } else { "NO" }
+            ));
+            overlay.push(format!(
+                "VEL {:.2} {:.2} {:.2}",
+                state.velocity.x, state.velocity.y, state.velocity.z
+            ));
+            overlay.push(format!(
+                "PENDING {} CORRECTIONS {}",
+                predictor.pending_len(),
+                predictor.corrections()
+            ));
+        } else {
+            overlay.push("MODE --- (not joined)".to_string());
+        }
         let terrain_stats = w.terrain.stats();
         overlay.push(format!(
             "CUBES {} MESHED {} PENDING {}",
@@ -456,6 +518,11 @@ impl ApplicationHandler for App {
                         }
                     }
                     key => {
+                        // F toggles flying: one edge per press, consumed by
+                        // the next sim tick.
+                        if pressed && matches!(key, Key::Character(c) if c.to_lowercase() == "f") {
+                            self.input.press_fly_toggle();
+                        }
                         if let Some(mk) = map_key(key) {
                             self.input.set_key(mk, pressed);
                         }

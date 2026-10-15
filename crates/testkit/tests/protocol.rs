@@ -1,15 +1,15 @@
 //! Headless acceptance test: a client and the server exchange real
 //! protocol messages over 100 ticks of the simulation.
 
+use jbm_core::physics::MoveInput;
 use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION, ServerMsg};
 use jbm_testkit::HeadlessServer;
 
-/// The spec's placeholder input: position tracks the tick, pinned at y=64.
-fn input(client_tick: u64) -> ClientMsg {
+/// One idle movement input per tick; the physics steps but nothing moves.
+fn input(seq: u64) -> ClientMsg {
     ClientMsg::PlayerInput {
-        client_tick,
-        position: [client_tick as f64, 64.0, 0.0],
-        yaw: 0.0,
+        seq,
+        input: MoveInput::IDLE,
         pitch: 0.0,
     }
 }
@@ -27,28 +27,34 @@ fn hundred_tick_exchange_of_inputs_pings_and_ticks() {
 
     let mut expected_tick: Option<u64> = None;
     for i in 0..100u64 {
-        client.send(input(i));
+        client.send(input(i + 1));
         client.send(ClientMsg::Ping { nonce: i });
         server.step(1);
         let messages = client.drain();
         match messages.as_slice() {
-            [ServerMsg::Pong { nonce, .. }, ServerMsg::Tick { tick }] if *nonce == i => {
-                match expected_tick {
-                    None => expected_tick = Some(*tick),
-                    Some(prev) => {
-                        assert_eq!(*tick, prev + 1);
-                        expected_tick = Some(*tick);
-                    }
+            [
+                ServerMsg::Pong { nonce, .. },
+                ServerMsg::PlayerState { .. },
+                ServerMsg::Tick { tick },
+            ] if *nonce == i => match expected_tick {
+                None => expected_tick = Some(*tick),
+                Some(prev) => {
+                    assert_eq!(*tick, prev + 1);
+                    expected_tick = Some(*tick);
                 }
-            }
-            other => panic!("tick {i}: expected [Pong {{ nonce: {i} }}, Tick], got {other:?}"),
+            },
+            other => panic!("tick {i}: expected [Pong, PlayerState, Tick], got {other:?}"),
         }
     }
 
     let players: Vec<_> = server.server().players().collect();
     assert_eq!(players.len(), 1);
     assert_eq!(players[0].input_count, 100);
-    assert_eq!(players[0].latest_input.unwrap().position, [99.0, 64.0, 0.0]);
+    assert_eq!(players[0].last_seq, 100);
+    // Idle inputs on a protocol-only server (no cubes): the unloaded rule
+    // keeps the player exactly at spawn.
+    assert_eq!(players[0].state.position.x, 0.5);
+    assert_eq!(players[0].state.position.z, 0.5);
 }
 
 #[test]
