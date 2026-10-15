@@ -80,10 +80,13 @@ pub const META_LEVEL_SHIFT: u32 = 8;
 /// faces whose owning cell sits in a masked octant.
 pub const META_MASK_SHIFT: u32 = 16;
 
-/// Packs the level and octant mask into the flag word.
-fn meta_flags(active: bool, level: u8, mask: u8) -> u32 {
+/// Packs the level and octant mask into the flag word. `drawn && mask ==
+/// 0xFF` — a cube whose every octant a ready child replaces — reads
+/// inactive, so the cull pass skips it like any undrawn cube (its mesh,
+/// if any, is fully collapsed by the vertex shader anyway).
+fn meta_flags(drawn: bool, level: u8, mask: u8) -> u32 {
     let mut flags = u32::from(level) << META_LEVEL_SHIFT | u32::from(mask) << META_MASK_SHIFT;
-    if active {
+    if drawn && mask != 0xFF {
         flags |= META_ACTIVE;
     }
     flags
@@ -1582,14 +1585,32 @@ impl TerrainPass {
         let Some(slot) = mesh.slot else {
             return;
         };
-        let flags = meta_flags(drawn, key.level, mask);
-        // The flag word is start_flags.y; the rest of the slot is
-        // untouched.
-        gpu.queue.write_buffer(
-            &self.meta_buffer,
-            u64::from(slot) * std::mem::size_of::<CubeMeta>() as u64 + 16,
-            bytemuck::bytes_of(&flags),
-        );
+        let (page, start, ranges, skirts) = match &mesh.alloc {
+            Some((page, range)) => (
+                Some(*page),
+                Some(range.start),
+                mesh.ranges.clone(),
+                mesh.skirts,
+            ),
+            None => (None, None, mesh.ranges.clone(), mesh.skirts),
+        };
+        if let (Some(page), Some(start)) = (page, start) {
+            let meta = meta_for(key, page, start, &ranges, skirts, drawn, mask);
+            gpu.queue.write_buffer(
+                &self.meta_buffer,
+                u64::from(slot) * std::mem::size_of::<CubeMeta>() as u64,
+                bytemuck::bytes_of(&meta),
+            );
+        } else {
+            // No allocation (should not happen for a slot holder): write
+            // the flag word alone.
+            let flags = meta_flags(drawn, key.level, mask);
+            gpu.queue.write_buffer(
+                &self.meta_buffer,
+                u64::from(slot) * std::mem::size_of::<CubeMeta>() as u64 + 16,
+                bytemuck::bytes_of(&flags),
+            );
+        }
     }
 
     /// A freed slot must read inactive: the cull threads dispatch over the

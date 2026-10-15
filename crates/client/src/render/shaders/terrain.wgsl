@@ -82,6 +82,9 @@ fn cube_origin(pos: vec3i, level: u32) -> vec3f {
     return int_part - terrain.camera_frac.xyz;
 }
 
+// The outward quad expansion, in blocks (see vs_main).
+const EDGE_EXPAND_BLOCKS: f32 = 1.0 / 512.0;
+
 // The cell scale of a level: cell offsets and UVs multiply by 2^level,
 // since one cell spans 2^level blocks.
 fn cell_scale(level: u32) -> f32 {
@@ -168,10 +171,6 @@ fn vs_main(
         corner_ao = array<u32, 6>(ao1, ao2, ao3, ao1, ao3, ao0);
     }
     let corner_index = vertex % 6u;
-    // The cube's LOD level (meta flags, bits 8..12) scales every cell to
-    // 2^level blocks (task 2.6).
-    let level = (m.start_flags.y >> 8u) & 15u;
-    let scale = cell_scale(level);
     let c = corners[corner_index];
 
     let n = normals()[direction];
@@ -186,8 +185,25 @@ fn vs_main(
         + max(-ua, vec3i(0)) + max(-va, vec3i(0));
     let offset = ua * i32(c.x * width) + va * i32(c.y * height);
 
+    // The cube's LOD level (meta flags, bits 8..12) scales every cell
+    // to 2^level blocks (task 2.6).
+    let level = (m.start_flags.y >> 8u) & 15u;
+    let scale = cell_scale(level);
     let relative = cube_origin(m.pos_page.xyz, level)
         + vec3f(block + offset) * scale;
+    // Sub-pixel expansion (level >= 1 only): greedy merging leaves
+    // T-junctions where a merged quad's edge abuts smaller quads, and the
+    // two edges' interpolation can differ by ulps — a hairline crack the
+    // eye sees straight through (there is no face behind terrain).
+    // Pushing every corner ~1/512 block outward closes those cracks with
+    // an overlap that is invisible: coplanar neighbours carry the same
+    // texture, and the step-edge slivers are far below a pixel. LOD0
+    // skips it to keep the pre-LOD goldens bit-stable; its pinholes are
+    // single pixels and bounded by the hole tests instead.
+    let expand_blocks = select(0.0, EDGE_EXPAND_BLOCKS, level > 0u);
+    let expand = vec3f(ua) * ((c.x - 0.5) * 2.0 * expand_blocks)
+        + vec3f(va) * ((c.y - 0.5) * 2.0 * expand_blocks);
+    let relative_expanded = relative + expand;
 
     // v is world-up on side faces and texture v grows downward, so the
     // image's top row lands at the block's top. One texture tile per
@@ -214,7 +230,7 @@ fn vs_main(
 
     let ao_factor = array<f32, 4>(0.4, 0.6, 0.8, 1.0);
     var out: VsOut;
-    out.pos = u.view_proj * vec4f(relative, 1.0);
+    out.pos = u.view_proj * vec4f(relative_expanded, 1.0);
     out.uv = uv;
     out.layer = layer;
     out.shade = face_shade()[direction] * ao_factor[corner_ao[corner_index]];
