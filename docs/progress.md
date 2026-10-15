@@ -2,7 +2,7 @@
 
 ## Next up
 
-Stage 1 · Voxel sandbox, wave C: 1.6 collision + walk/fly + client prediction with server correction, 1.7 raycast + break/place + re-mesh on change (must pin edited cubes against server eviction), 1.8 16³ vs 32³ bench. Still pending from wave B: clean mesh/worldgen baselines on a truly idle machine (see Known issues).
+Stage 1 · Voxel sandbox, wave C: 1.6 collision + walk/fly + client prediction with server correction, 1.7 raycast + break/place + re-mesh on change (must pin edited cubes against server eviction), 1.8 16³ vs 32³ bench.
 
 ## Benchmarks
 
@@ -17,6 +17,13 @@ Stage 1 · Voxel sandbox, wave C: 1.6 collision + walk/fly + client prediction w
 | cube/compact_4096_to_16 | 96.57 µs | Apple M5 Pro (bench-1) | 2026-10-14 |
 | server/tick_8_clients | 292.53 ns | Apple M5 Pro (bench-1) | 2026-10-14 |
 | server/tick_streaming_idle | 53.63 ns | Apple M5 Pro (orchestrator; tick_8_clients 299 ns in the same run) | 2026-10-14 |
+| mesh/terrain_like | 220.77 µs | Apple M5 Pro (bench-2, idle) | 2026-10-15 |
+| mesh/checkerboard | 697.34 µs | Apple M5 Pro (bench-2, idle) | 2026-10-15 |
+| mesh/uniform_stone_air_neighbors | 218.93 µs | Apple M5 Pro (bench-2, idle) | 2026-10-15 |
+| mesh/padded_build | 20.21 µs | Apple M5 Pro (bench-2, idle) | 2026-10-15 |
+| worldgen/heightmap_32x32 | 20.22 µs | Apple M5 Pro (bench-2, idle) | 2026-10-15 |
+| worldgen/surface_cube | 92.40 µs | Apple M5 Pro (bench-2, idle) | 2026-10-15 |
+| worldgen/air_cube | 146.92 ns | Apple M5 Pro (bench-2, idle) | 2026-10-15 |
 
 Baselines are bench worker runs on an otherwise idle machine. Run-to-run noise on this Mac is ±10–15%; treat smaller deltas as noise. `iter()` is ~3× faster than per-block `get`, so the mesher should iterate. Compare only runs made without parallel builds (the implementer's 3.67 µs ran alongside other builds; ignore it).
 
@@ -42,7 +49,6 @@ Baselines are bench worker runs on an otherwise idle machine. Run-to-run noise o
 - Windowed app path has no automated test (workers' sandbox can't open a window). The orchestrator launches `cargo run -p jbm-game` before merging any wave that touches `client/src/app.rs`; this caught a redraw loop that stalled on macOS.
 - Server eviction drops cubes no player keeps; 1.7 must pin edited cubes until persistence (2.3), or edits are lost.
 - Reviewers passed 1.4 with three visible bugs (one-block face offset for +X/−Z, stale mesh race, magenta grass side). The orchestrator must keep inspecting goldens zoomed in, and golden cameras must be close enough to show per-block detail.
-- No clean mesh/worldgen baselines yet. Every run so far had competing load (Claude app, IDE): mesh/terrain_like measured 244 µs (implementer), 473–690 µs (orchestrator, load 5–13), all four mesh benches uniformly ~2× the README, while server/tick_8_clients matched its baseline in the same session. The mesher is unchanged since the implementer's run, so this is machine state, not a regression. Re-run `cargo bench -p jbm-client --bench mesh_bench` and `cargo bench -p jbm-server --bench worldgen_bench` with everything else closed before trusting the ≤300 µs target.
 - First release/bench build is slow (wgpu + thin LTO + codegen-units=1). Revisit profile if CI bench-smoke gets too slow.
 
 ## Log
@@ -61,3 +67,4 @@ Baselines are bench worker runs on an otherwise idle machine. Run-to-run noise o
 - Stage 1 wave B merged on branch stage-1/wave-b: 1.4 greedy mesher + mesh pool + packed faces + vertex pulling + client world + game wiring, 1.5 noise terrain + gen pool + cube streaming. Both reviewers: MERGE. Orchestrator fixed during review: quad corner offset for negative-u faces (sky through step corners), stale mesh versions on neighbor arrival, missing grass_side texture; moved golden cameras closer. Protocol v2 (CubeData, UnloadCube, Welcome.spawn) and content `PartialEq` on Cube landed on main first so both tasks shared it.
 - User played the merged build: terrain renders and streams.
 - Wave B follow-ups: workspace crates build at opt-level 1 in dev (client unit tests 32 s → 4 s, workspace suite ~8 s); end-to-end terrain screenshot (`crates/game/tests/terrain_screenshot.rs`, golden `terrain_spawn`, inspected: terraces, grass sides, sand, no holes). Mesh/worldgen baselines deferred: machine never idle.
+- bench-2: mesh/worldgen baselines from an idle run (user ran them with other apps closed). terrain_like 221 µs, inside the ≤300 µs target; the earlier 2× numbers were load.
