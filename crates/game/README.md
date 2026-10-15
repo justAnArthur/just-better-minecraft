@@ -45,7 +45,11 @@ outline and requires at least 20 pixels to differ.
 **Cube-size benchmark (task 1.8):** `benches/cube_size.rs` (group
 `cube_size`) measures the 128×96×128-block terrain region built in
 `benches/common/mod.rs` from `Generator::surface_height` and the 1.5
-layering — no server `generate` involved:
+layering — no server `generate` involved. The region's horizontal side is
+`JBM_REGION_SIDE` (blocks, centered on x = z = 64, a positive multiple of
+the cube size) when set — e.g. `JBM_REGION_SIDE=544` runs the benches and
+metrics over a game-sized 17×3×17-cube region at 32³ — and 128 otherwise;
+the metrics example's header prints the bounds actually used:
 
 - `mesh_region` — meshing every region cube serially;
 - `remesh_edit` — meshing the one cube holding block (64, h(64,64), 64),
@@ -74,14 +78,18 @@ streaming-granularity message count) plus, when an adapter exists, a GPU
 section per path **and scene** (surface view and the cave room): the cull
 counters (`drawn / frustum-culled / occluded`, `candidates / commands /
 faces`), the encoded indirect command-region slots including the
-zero-count tails (gpu-cull, both phases), draw calls / pages, and the
-mean frame time over 50 frames after a 3-frame warm-up. Both run at 32³
+zero-count tails (gpu-cull, both phases), draw calls / pages, the mean
+frame time over 50 frames after a 3-frame warm-up, and that mean split
+into CPU encode+submit vs the device-poll wait (where the GPU-side costs
+— the Hi-Z rebuild above all — show up). Both run at 32³
 and, with `--features cube16`, at 16³:
 
 ```bash
 cargo bench -p jbm-game --bench cube_size [--features cube16]
 cargo bench -p jbm-game --bench terrain_draw
 cargo run -p jbm-game --release --example cube_size_metrics [--features cube16]
+JBM_REGION_SIDE=544 cargo bench -p jbm-game --bench terrain_draw
+JBM_REGION_SIDE=544 cargo run -p jbm-game --release --example cube_size_metrics
 ```
 
 **Draw-path tests (tasks 2.2 + 2.5):** `tests/terrain_paths.rs` renders
@@ -99,7 +107,9 @@ on some frames — the anti-popping test; a cave test (camera in the
 closed room, 3 frames, ≥80% of frustum-passing cubes occlusion-culled,
 image equal to cpu-cull); an open-surface test (`occluded` stays small,
 image equal to cpu-cull); and an odd-resize test (333×217 keeps the
-paths identical). All print their cull counts. The room is carved by
+paths identical). Every blocking stats read also asserts
+`region_overflow == 0`: the CPU frustum bound must cover every command
+the GPU emits. All print their cull counts. The room is carved by
 applying `BlockChange` messages through the client world — the same edit
 path real block edits take.
 

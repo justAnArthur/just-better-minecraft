@@ -1,14 +1,16 @@
 //! Task 1.8 + 2.5 metrics: one aligned table describing the measured
-//! terrain region (x, z in [0, 128), y in [32, 128); see
-//! `benches/common/mod.rs`) at the compiled cube size, then the per-path
-//! GPU draw numbers for the surface view and a camera inside a carved
-//! closed room (task 2.5): cull counters, encoded indirect command slots
-//! (zero-count tails included) and the mean frame time over 50 frames.
-//! Run at both sizes and compare:
+//! terrain region (x, z in a square centered on x = z = 64 — 128 blocks
+//! per side by default, or `JBM_REGION_SIDE` for game-sized runs — and y
+//! in [32, 128); see `benches/common/mod.rs`) at the compiled cube size,
+//! then the per-path GPU draw numbers for the surface view and a camera
+//! inside a carved closed room (task 2.5): cull counters, encoded indirect
+//! command slots (zero-count tails included) and the mean frame time over
+//! 50 frames. Run at both sizes and compare:
 //!
 //! ```bash
 //! cargo run -p jbm-game --release --example cube_size_metrics
 //! cargo run -p jbm-game --release --example cube_size_metrics --features cube16
+//! JBM_REGION_SIDE=544 cargo run -p jbm-game --release --example cube_size_metrics
 //! ```
 
 #[path = "../benches/common/mod.rs"]
@@ -65,10 +67,13 @@ struct Frames {
     renderer: Renderer,
     view: wgpu::TextureView,
     depth: DepthTarget,
+    encode: std::time::Duration,
+    wait: std::time::Duration,
 }
 
 impl Frames {
     fn render(&mut self, terrain: &mut TerrainPass, camera: &Camera) {
+        let encode_start = Instant::now();
         self.renderer.render(
             &self.gpu,
             FrameInputs {
@@ -80,6 +85,8 @@ impl Frames {
                 overlay: None,
             },
         );
+        self.encode += encode_start.elapsed();
+        let wait_start = Instant::now();
         self.gpu
             .device
             .poll(wgpu::PollType::Wait {
@@ -87,6 +94,7 @@ impl Frames {
                 timeout: None,
             })
             .expect("device poll failed");
+        self.wait += wait_start.elapsed();
     }
 }
 
@@ -97,6 +105,10 @@ fn measure_path(label: &str, frames: &mut Frames, terrain: &mut TerrainPass, cam
         frames.render(terrain, camera);
     }
     let stats = terrain.read_cull_stats_blocking(&frames.gpu);
+    assert_eq!(
+        stats.region_overflow, 0,
+        "the CPU frustum bound must cover every GPU emission"
+    );
     row(
         &format!("{label} {}", terrain.path_name()),
         format!(
@@ -116,7 +128,7 @@ fn measure_path(label: &str, frames: &mut Frames, terrain: &mut TerrainPass, cam
     if terrain.path() == TerrainPath::GpuCull {
         row(
             &format!("{label} {} region slots (2 phases)", terrain.path_name()),
-            terrain.region_command_slots(),
+            terrain.region_command_slots(camera),
         );
     }
     row(
@@ -124,15 +136,23 @@ fn measure_path(label: &str, frames: &mut Frames, terrain: &mut TerrainPass, cam
         format!("{} / {}", terrain.stats().draw_calls, terrain.stats().pages),
     );
     let mut total = std::time::Duration::ZERO;
+    frames.encode = std::time::Duration::ZERO;
+    frames.wait = std::time::Duration::ZERO;
     for _ in 0..FRAMES {
         let start = Instant::now();
         frames.render(terrain, camera);
         total += start.elapsed();
     }
     let mean_ms = total.as_secs_f64() * 1000.0 / FRAMES as f64;
+    let encode_ms = frames.encode.as_secs_f64() * 1000.0 / FRAMES as f64;
+    let wait_ms = frames.wait.as_secs_f64() * 1000.0 / FRAMES as f64;
     row(
         &format!("{label} {} frame mean ({FRAMES})", terrain.path_name()),
         format!("{mean_ms:.3} ms"),
+    );
+    row(
+        &format!("{label} {} encode / poll-wait mean", terrain.path_name()),
+        format!("{encode_ms:.3} / {wait_ms:.3} ms"),
     );
 }
 
@@ -189,7 +209,11 @@ fn main() {
     let map_overhead =
         (map_entries as f64 * (size_of::<(CubePos, Arc<Cube>)>() + 1) as f64 / 0.875) as usize;
 
-    println!("Cube-size metrics: region x,z in [0,128), y in [32,128)");
+    let (x_range, y_range) = region.block_bounds();
+    println!(
+        "Cube-size metrics: region x,z in [{},{}), y in [{},{})",
+        x_range.start, x_range.end, y_range.start, y_range.end
+    );
     row("cube size (blocks)", CUBE_SIZE);
     row("region cubes", region.region_positions.len());
     row("uniform cubes (air/stone)", uniform);
@@ -266,6 +290,8 @@ fn main() {
         renderer,
         view: target.create_view(),
         depth,
+        encode: std::time::Duration::ZERO,
+        wait: std::time::Duration::ZERO,
     };
 
     // Surface view, every path that exists.

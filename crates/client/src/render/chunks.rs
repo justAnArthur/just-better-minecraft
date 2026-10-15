@@ -6,8 +6,11 @@
 //! - **gpu-cull** (default where available): a compute pass tests every
 //!   meta slot against the frustum and a Hi-Z occlusion pyramid
 //!   (render/hiz.rs) and writes the indirect commands into per-page
-//!   regions; two render phases draw them. The CPU touches no cube per
-//!   frame.
+//!   regions; two render phases draw them. The CPU's only per-cube work is
+//!   sizing the regions: a frustum pass over the resident meta slots that
+//!   bounds what the GPU can emit (Metal's multi_draw_indirect is a CPU
+//!   loop over the encoded commands, so the encoded count must come from
+//!   the CPU — see `MeshBookkeeping::frustum_page_bounds`).
 //! - **cpu-cull**: the 2.2 CPU frustum and direction tests, using the same
 //!   meta slots and the shared origin formula, drawn with one
 //!   multi_draw_indirect per page.
@@ -48,7 +51,8 @@ const META_CAPACITY: u32 = 4096;
 /// Indirect commands preallocated before the CPU indirect buffer is grown.
 const INDIRECT_CAPACITY: u64 = 1024;
 
-/// u32 words in the GPU stats buffer (7 counters, padded for clearing).
+/// u32 words in the GPU stats buffer: 7 counters plus the region-overflow
+/// counter (word 7, asserted zero by tests).
 const STATS_WORDS: usize = 8;
 const STATS_BYTES: u64 = STATS_WORDS as u64 * 4;
 
@@ -141,6 +145,11 @@ pub struct CullStats {
     pub commands: u32,
     /// Faces issued, counting only the non-skipped directions.
     pub faces: u32,
+    /// Commands the shader dropped because their command-region slot was
+    /// at or beyond the buffer capacity: a bound/capacity bug (the CPU
+    /// frustum bound must be >= what the GPU emits). Always zero; the
+    /// tests assert it.
+    pub region_overflow: u32,
 }
 
 impl CullStats {
@@ -153,6 +162,7 @@ impl CullStats {
             drawn_late: words[4],
             commands: words[5],
             faces: words[6],
+            region_overflow: words[7],
         }
     }
 
@@ -304,19 +314,55 @@ impl MeshBookkeeping {
         );
     }
 
-    /// The bound as a prefix sum: `region_base[page]`, in commands.
-    fn region_prefix(&self) -> Vec<u32> {
-        let mut base = Vec::with_capacity(self.page_dir_counts.len());
-        let mut acc = 0u32;
-        for &count in &self.page_dir_counts {
-            base.push(acc);
-            acc += count;
-        }
-        base
-    }
-
     fn total_dirs(&self) -> u32 {
         self.page_dir_counts.iter().sum()
+    }
+
+    /// The per-frame CPU frustum bound on each page's command region: for
+    /// every resident mesh that passes the same frustum test and
+    /// `visible_directions` rule the cpu-cull path uses (same origin
+    /// formula), the count of non-empty, non-skipped directions, summed
+    /// per page. Metal has no `draw_indirect_count` and emulates
+    /// `multi_draw_indirect` as a CPU loop of one indirect draw per
+    /// encoded command, so the encoded draw count must come from the CPU —
+    /// sizing the regions to what survives the frustum (instead of every
+    /// resident cube) keeps the zero-tail encode cost proportional to what
+    /// is actually visible.
+    ///
+    /// The GPU still runs its own frustum, occlusion and direction tests;
+    /// this only sizes the regions. The bound is >= what the GPU emits
+    /// because both sides use identical math (the same view-projection
+    /// rows, the same origin formula, the same comparisons): every command
+    /// the GPU writes is for a frustum-passing cube and a direction this
+    /// function counted. The shader's capacity clamp plus the
+    /// `region_overflow` counter (asserted zero by the tests) guard the
+    /// day that drifts.
+    fn frustum_page_bounds(
+        &self,
+        camera_cube: IVec3,
+        camera_frac: Vec3,
+        frustum: &Frustum,
+    ) -> Vec<u32> {
+        let mut bounds = vec![0u32; self.page_dir_counts.len()];
+        for (pos, mesh) in &self.meshes {
+            let Some((page, _)) = &mesh.alloc else {
+                continue;
+            };
+            let min = cube_origin(*pos, camera_cube, camera_frac);
+            let max = min + Vec3::splat(CUBE_SIZE as f32);
+            if !frustum.intersects_aabb(min, max) {
+                continue;
+            }
+            let dirs = visible_directions(min, max);
+            let kept = mesh
+                .ranges
+                .iter()
+                .enumerate()
+                .filter(|(d, range)| !range.is_empty() && dirs[*d])
+                .count() as u32;
+            bounds[*page] += kept;
+        }
+        bounds
     }
 
     /// The bound recounted from the meshes: the invariant the churn test
@@ -1149,6 +1195,8 @@ impl TerrainPass {
     /// The cull bind group: everything but the frame uniforms (group 0).
     /// Rebuilt whenever any of its resources is recreated (meta growth,
     /// command growth, region growth, pyramid recreation).
+    // The seven parameters are the bind group's own entries; a bundling
+    // struct would only be unwrapped again here.
     #[allow(clippy::too_many_arguments)]
     fn make_cull_bind_group(
         device: &wgpu::Device,
@@ -1518,10 +1566,18 @@ impl TerrainPass {
         self.book.page_dir_counts.clone()
     }
 
-    /// Command-region slots across both phases, including the zero-count
-    /// tails (the metrics example).
-    pub fn region_command_slots(&self) -> u64 {
-        u64::from(self.book.total_dirs()) * 2
+    /// Command-region slots encoded across both phases for `camera`,
+    /// including the zero-count tails (the metrics example): twice the
+    /// CPU frustum bound the frame draws with.
+    pub fn region_command_slots(&self, camera: &Camera) -> u64 {
+        let (camera_cube, camera_frac) = camera_split(camera.position);
+        let frustum = Frustum::from_view_proj(&camera.view_proj());
+        let total: u32 = self
+            .book
+            .frustum_page_bounds(camera_cube, camera_frac, &frustum)
+            .iter()
+            .sum();
+        u64::from(total) * 2
     }
 
     /// Total faces across all uploaded meshes.
@@ -1563,8 +1619,10 @@ impl TerrainPass {
         }
     }
 
-    /// The gpu-cull frame: the GPU tests, emits and draws; the CPU touches
-    /// no cube. Phase order: early cull/draw, Hi-Z build, late cull/draw.
+    /// The gpu-cull frame: the GPU tests, emits and draws; the CPU's only
+    /// per-cube work is the frustum pass that sizes the command regions.
+    /// Phase order: early cull/draw, then Hi-Z build and late cull in one
+    /// compute pass, then the late draw.
     fn draw_gpu_cull(
         &mut self,
         gpu: &Gpu,
@@ -1578,7 +1636,7 @@ impl TerrainPass {
         // and arm the maps for the slots copied last frame.
         self.stats_ring.begin_frame(gpu);
 
-        let total_dirs = self.book.total_dirs();
+        let resident_dirs = self.book.total_dirs();
         let mut stats = self.page_stats(TerrainStats {
             meshed: self.book.meshes.len(),
             drawn: 0,
@@ -1589,7 +1647,7 @@ impl TerrainPass {
             page_bytes: (self.pages.len() as u64) * u64::from(self.page_faces) * FACE_BYTES,
             used_faces: 0,
         });
-        if total_dirs == 0 {
+        if resident_dirs == 0 {
             self.stats = stats;
             self.last_cull = CullStats::default();
             return;
@@ -1631,8 +1689,18 @@ impl TerrainPass {
         }
 
         // Grow the command buffer when the bound outgrew it.
-        if 2 * total_dirs > self.commands_capacity {
-            self.commands_capacity = (2 * total_dirs).next_power_of_two();
+        let frustum = Frustum::from_view_proj(&camera.view_proj());
+        let page_bounds = self
+            .book
+            .frustum_page_bounds(camera_cube, camera_frac, &frustum);
+        let mut region_base = Vec::with_capacity(page_bounds.len());
+        let mut bound_total = 0u32;
+        for &bound in &page_bounds {
+            region_base.push(bound_total);
+            bound_total += bound;
+        }
+        if 2 * bound_total > self.commands_capacity {
+            self.commands_capacity = (2 * bound_total).next_power_of_two();
             self.commands_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("jbm terrain gpu commands"),
                 size: u64::from(self.commands_capacity) * CMD_BYTES,
@@ -1644,9 +1712,9 @@ impl TerrainPass {
             self.rebuild_cull_bind_group();
         }
 
-        // region_base: the prefix sum over pages, rewritten each frame (a
-        // tiny buffer; the CPU already knows the bound).
-        let region_base = self.book.region_prefix();
+        // region_base: the prefix sum over pages of this frame's CPU
+        // frustum bound, rewritten each frame (a tiny buffer; the CPU
+        // already knows the bound).
         let max_level = self.hiz.as_ref().expect("created above").max_level();
         gpu.queue.write_buffer(
             &self.params_buffer,
@@ -1656,7 +1724,7 @@ impl TerrainPass {
                 camera_frac: terrain_uniforms.camera_frac,
                 screen: [width, height, max_level, self.book.meta_len],
                 regions: [
-                    total_dirs,
+                    bound_total,
                     self.pages.len() as u32,
                     self.commands_capacity,
                     CUBE_SIZE as u32,
@@ -1670,11 +1738,19 @@ impl TerrainPass {
         );
 
         // Zero the counters, the stats and the command regions so a
-        // region's unused tail is zero-count draws. clear_buffer requires
-        // COPY_DST (see the buffer usages above).
+        // region's unused tail is zero-count draws. Only the prefix this
+        // frame's draws read needs clearing; slots past it are never
+        // referenced. clear_buffer requires COPY_DST (see the buffer
+        // usages above).
         encoder.clear_buffer(&self.region_counter_buffer, 0, None);
         encoder.clear_buffer(&self.stats_buffer, 0, None);
-        encoder.clear_buffer(&self.commands_buffer, 0, None);
+        if bound_total > 0 {
+            encoder.clear_buffer(
+                &self.commands_buffer,
+                0,
+                Some(u64::from(bound_total) * 2 * CMD_BYTES),
+            );
+        }
 
         // 1. Early cull: what was visible last frame and still passes the
         //    frustum.
@@ -1696,19 +1772,24 @@ impl TerrainPass {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, uniforms, &[]);
             pass.set_bind_group(2, &self.shared_bind_group, &[]);
-            draw_calls += self.draw_regions(&mut pass, &region_base, 0);
+            draw_calls += self.draw_regions(&mut pass, &region_base, &page_bounds, 0);
         }
 
-        // 3. The Hi-Z pyramid from the depth the early draw left.
-        self.hiz.as_ref().expect("created above").record(encoder);
-
-        // 4. Late cull: everything against the frustum and the pyramid;
-        //    writes the visible bits for next frame.
+        // 3+4. The Hi-Z pyramid from the depth the early draw left, then
+        //    the late cull against it, in one compute pass: dispatches
+        //    within a pass are ordered, and each dispatch is its own usage
+        //    scope (WebGPU spec §3.4.4: "In a compute pass, each dispatch
+        //    command is one usage scope"), so wgpu validates the mip k ->
+        //    mip k+1 write->read transitions per dispatch and inserts the
+        //    barrier between them; the pyramid dispatches ending in
+        //    storage writes then the cull dispatch sampling the whole
+        //    pyramid transition the same way.
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("jbm terrain late cull"),
+                label: Some("jbm terrain hiz + late cull"),
                 timestamp_writes: None,
             });
+            self.hiz.as_ref().expect("created above").record(&mut pass);
             pass.set_pipeline(&self.cull_late_pipeline);
             pass.set_bind_group(0, uniforms, &[]);
             pass.set_bind_group(1, &self.cull_bind_group, &[]);
@@ -1721,7 +1802,7 @@ impl TerrainPass {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, uniforms, &[]);
             pass.set_bind_group(2, &self.shared_bind_group, &[]);
-            draw_calls += self.draw_regions(&mut pass, &region_base, total_dirs);
+            draw_calls += self.draw_regions(&mut pass, &region_base, &page_bounds, bound_total);
         }
 
         // 6. The counters for the overlay, one or two frames late.
@@ -1778,17 +1859,20 @@ impl TerrainPass {
     }
 
     /// One multi_draw_indirect per page over its region of `phase_base`.
-    /// The count is the CPU-known bound: slots the shader did not fill
-    /// were cleared to zero-count draws, which are no-ops everywhere (the
-    /// reason `multi_draw_indirect_count` is not used; Metal lacks it).
+    /// The count is this frame's CPU frustum bound for the page: slots the
+    /// shader did not fill were cleared to zero-count draws, which are
+    /// no-ops everywhere (the reason `multi_draw_indirect_count` is not
+    /// used; Metal lacks it, and its MDI is a CPU loop over the encoded
+    /// count, so the count must come from the CPU anyway).
     fn draw_regions(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
         region_base: &[u32],
+        page_bounds: &[u32],
         phase_base: u32,
     ) -> u64 {
         let mut calls = 0u64;
-        for (page, &count) in self.book.page_dir_counts.iter().enumerate() {
+        for (page, &count) in page_bounds.iter().enumerate() {
             if count == 0 {
                 continue;
             }
@@ -1909,6 +1993,7 @@ impl TerrainPass {
             drawn_late: 0,
             commands: commands.len() as u32,
             faces: faces as u32,
+            region_overflow: 0,
         };
 
         if commands.is_empty() {
@@ -2179,6 +2264,70 @@ mod tests {
         assert_eq!(std::mem::offset_of!(CullParams, camera_frac), 16);
         assert_eq!(std::mem::offset_of!(CullParams, screen), 32);
         assert_eq!(std::mem::offset_of!(CullParams, regions), 48);
+    }
+
+    /// The frustum bound is exactly the cpu-cull path's command count: for
+    /// a camera, the per-page bounds count the (frustum-passing cube,
+    /// non-empty non-skipped direction) pairs, and never exceed the static
+    /// per-page totals.
+    #[test]
+    fn frustum_bound_counts_visible_directions_per_page() {
+        // Camera in the middle of cube (0,0,0), yaw 0 (looking toward -Z),
+        // every direction range non-empty in every mesh.
+        let cam = Camera::new(DVec3::splat(16.0), 70.0_f32.to_radians(), 1.0);
+        let (cube, frac) = camera_split(DVec3::splat(16.0));
+        let frustum = Frustum::from_view_proj(&cam.view_proj());
+        let six_ranges = || [0u32..3, 0u32..3, 0u32..3, 0u32..3, 0u32..3, 0u32..3];
+        let mut book = MeshBookkeeping::default();
+        book.page_added();
+        book.page_added();
+        // Ahead, fully in the (+,+,+) octant relative to the camera: only
+        // -X, -Y, +Z face it. Page 0.
+        book.commit(CubePos { x: 1, y: 1, z: -2 }, 0, 0..18, six_ranges(), None);
+        // Far outside the 70-degree fov on +X, ahead in z: dropped. Page 0.
+        book.commit(
+            CubePos { x: 12, y: 0, z: -1 },
+            0,
+            18..36,
+            six_ranges(),
+            None,
+        );
+        // Behind the camera (yaw 0). Page 1.
+        book.commit(CubePos { x: 0, y: 0, z: 2 }, 1, 36..54, six_ranges(), None);
+        // The cube containing the camera: all six directions, in any
+        // frustum. Page 1.
+        book.commit(CubePos { x: 0, y: 0, z: 0 }, 1, 54..72, six_ranges(), None);
+        let bounds = book.frustum_page_bounds(cube, frac, &frustum);
+        assert_eq!(bounds, vec![3, 6]);
+        assert!(
+            bounds
+                .iter()
+                .zip(&book.page_dir_counts)
+                .all(|(&bound, &total)| bound <= total),
+            "the frustum bound must not exceed the static bound"
+        );
+        book.check_invariants();
+
+        // Looking the other way (yaw pi): the ahead and out-of-fov cubes
+        // leave the frustum, the behind cube enters it (five kept
+        // directions — it straddles the camera's x and y) and the camera
+        // cube keeps its six.
+        let mut turned = Camera::new(DVec3::splat(16.0), 70.0_f32.to_radians(), 1.0);
+        turned.set_yaw(std::f32::consts::PI);
+        let bounds =
+            book.frustum_page_bounds(cube, frac, &Frustum::from_view_proj(&turned.view_proj()));
+        assert_eq!(bounds, vec![0, 11]);
+
+        // An empty direction range is never counted, even when visible.
+        let mut sparse = six_ranges();
+        sparse[0] = 0u32..0;
+        sparse[2] = 0u32..0;
+        let mut book = MeshBookkeeping::default();
+        book.page_added();
+        book.commit(CubePos { x: 0, y: 0, z: 0 }, 0, 0..6, sparse, None);
+        let bounds =
+            book.frustum_page_bounds(cube, frac, &Frustum::from_view_proj(&cam.view_proj()));
+        assert_eq!(bounds, vec![4], "only the four non-empty directions count");
     }
 
     #[test]

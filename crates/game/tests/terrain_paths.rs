@@ -417,6 +417,10 @@ fn nothing_pops_in_across_a_moving_camera() {
         // then cpu-cull on the identical camera: the reference.
         let gpu_image = render_frame(&gpu, &mut renderer, &target, &depth, &mut terrain, &camera);
         let stats = terrain.read_cull_stats_blocking(&gpu);
+        assert_eq!(
+            stats.region_overflow, 0,
+            "frame {index}: the CPU frustum bound must cover every GPU emission"
+        );
         if stats.occluded > 0 {
             frames_with_occlusion += 1;
         }
@@ -470,6 +474,10 @@ fn cave_culling_hides_the_buried_world() {
     }
     let gpu_image = render_frame(&gpu, &mut renderer, &target, &depth, &mut terrain, &camera);
     let stats = terrain.read_cull_stats_blocking(&gpu);
+    assert_eq!(
+        stats.region_overflow, 0,
+        "the CPU frustum bound must cover every GPU emission"
+    );
     let frustum_passing = stats.candidates - stats.frustum_culled;
     println!(
         "cave culling: candidates {} frustum-culled {} frustum-passing {} occluded {} drawn {}",
@@ -530,6 +538,10 @@ fn open_surface_view_stays_uncullled() {
     }
     let gpu_image = render_frame(&gpu, &mut renderer, &target, &depth, &mut terrain, &camera);
     let stats = terrain.read_cull_stats_blocking(&gpu);
+    assert_eq!(
+        stats.region_overflow, 0,
+        "the CPU frustum bound must cover every GPU emission"
+    );
     let frustum_passing = stats.candidates - stats.frustum_culled;
     println!(
         "open view: candidates {} frustum-culled {} frustum-passing {} occluded {} drawn {}",
@@ -618,6 +630,10 @@ fn terrain_spawn_stats_show_direction_skipping() {
     // On gpu-cull the drawn/faces/commands counters come back from the GPU;
     // the blocking read makes them exact for this frame.
     let cull = terrain.read_cull_stats_blocking(&gpu);
+    assert_eq!(
+        cull.region_overflow, 0,
+        "the CPU frustum bound must cover every GPU emission"
+    );
     let stats = terrain.stats();
     assert!(stats.drawn > 0);
     assert_eq!(u32::try_from(stats.drawn).unwrap(), cull.drawn());

@@ -247,26 +247,23 @@ impl HizPyramid {
         self.sizes.len() as u32 - 1
     }
 
-    /// Records the rebuild: the mip-0 fill, then one dispatch per reduction
-    /// step. Every dispatch is its own compute pass so wgpu inserts the
-    /// write->read barriers between mips.
-    pub fn record(&self, encoder: &mut wgpu::CommandEncoder) {
+    /// Records the rebuild into one compute pass: the mip-0 fill, then one
+    /// dispatch per reduction step (the late terrain cull rides the same
+    /// pass; see `TerrainPass::draw_gpu_cull`). Dispatches within one
+    /// compute pass are ordered, and each dispatch is its own usage scope
+    /// (WebGPU spec §3.4.4, "Synchronization": "In a compute pass, each
+    /// dispatch command (`dispatchWorkgroups()` or
+    /// `dispatchWorkgroupsIndirect()`) is one usage scope"), so wgpu
+    /// validates the mip k write vs mip k read per dispatch and inserts
+    /// the barrier at each transition — one pass costs one encoder
+    /// begin/end instead of one per mip.
+    pub fn record(&self, pass: &mut wgpu::ComputePass<'_>) {
         let (w, h) = self.sizes[0];
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("jbm hiz fill"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.fill_pipeline);
-            pass.set_bind_group(0, &self.fill_bind_group, &[]);
-            pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
-        }
+        pass.set_pipeline(&self.fill_pipeline);
+        pass.set_bind_group(0, &self.fill_bind_group, &[]);
+        pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
         for (i, bind_group) in self.reduce_bind_groups.iter().enumerate() {
             let (dw, dh) = self.sizes[i + 1];
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("jbm hiz reduce"),
-                timestamp_writes: None,
-            });
             pass.set_pipeline(&self.reduce_pipeline);
             pass.set_bind_group(0, bind_group, &[]);
             pass.dispatch_workgroups(dw.div_ceil(8), dh.div_ceil(8), 1);

@@ -1,6 +1,10 @@
 //! Shared terrain region for the task 1.8 cube-size bench and metrics
-//! example. The region is x, z in [0, 128) and y in [32, 128) world blocks
-//! (48 cubes at 32³, 384 at 16³), built locally with `Cube::from_fn` from
+//! example. The region spans y in [32, 128) world blocks and x, z in a
+//! square centered on x = z = 64: 128 blocks per side by default
+//! (`[0, 128)`, 48 cubes at 32³, 384 at 16³), or the positive multiple of
+//! the cube size given by `JBM_REGION_SIDE` so the benches and metrics can
+//! run game-sized regions (e.g. `JBM_REGION_SIDE=544` for 17x3x17 cubes at
+//! 32³). It is built locally with `Cube::from_fn` from
 //! `Generator::surface_height` and the 1.5 layering, so the server's own
 //! `generate` stays out of what gets measured. Cubes in the one-cube shell
 //! around the region are built the same way, so border faces are realistic.
@@ -52,6 +56,28 @@ pub struct Region {
     /// Positions of the cubes inside the region (the shell is not
     /// included), sorted by `(y, z, x)`.
     pub region_positions: Vec<CubePos>,
+    /// The x (and z) world-block range of the region.
+    // Read only by `block_bounds`, which only the metrics example calls.
+    #[allow(dead_code)]
+    x_range: Range<i64>,
+}
+
+/// The horizontal side of the region, in world blocks: 128 by default, or
+/// `JBM_REGION_SIDE` (a positive multiple of the cube size) so the metrics
+/// example and benches can run game-sized regions.
+fn region_side() -> i64 {
+    let Some(value) = std::env::var_os("JBM_REGION_SIDE") else {
+        return 128;
+    };
+    let side = value
+        .to_str()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or_else(|| panic!("JBM_REGION_SIDE must be an integer, got {value:?}"));
+    assert!(
+        side > 0 && side % i64::from(CUBE_SIZE) == 0,
+        "JBM_REGION_SIDE must be a positive multiple of the cube size ({CUBE_SIZE}), got {side}"
+    );
+    side
 }
 
 impl Region {
@@ -62,15 +88,26 @@ impl Region {
         let generator = Generator::new(seed, blocks);
 
         // Cube range covering the block bounds, plus the one-cube shell.
+        // The horizontal range is cube-aligned and centered (to the cube)
+        // on x = z = 64: 128 blocks per side reproduce [0, 128) exactly,
+        // and any positive multiple of the cube size keeps whole cubes.
         let size = i64::from(CUBE_SIZE);
-        let first = [0i64, 32, 0].map(|v| v / size);
-        let last = [128i64, 128, 128].map(|v| v / size);
+        let cubes_per_axis = region_side() / size;
+        let first_x = 64i64.div_euclid(size) - cubes_per_axis / 2;
+        let x_range = first_x * size..(first_x + cubes_per_axis) * size;
+        let first = [first_x, 32 / size, first_x];
+        let last = [
+            first_x + cubes_per_axis,
+            128 / size,
+            first_x + cubes_per_axis,
+        ];
         let mut region = Region {
             generator,
             blocks,
             appearance,
             cubes: HashMap::new(),
             region_positions: Vec::new(),
+            x_range,
         };
         for y in (first[1] - 1)..=(last[1] - 1) {
             for z in (first[2] - 1)..=(last[2] - 1) {
@@ -92,6 +129,15 @@ impl Region {
             }
         }
         region
+    }
+
+    /// The region's world-block bounds: x and z span the same range
+    /// (128 wide by default, `JBM_REGION_SIDE` wide when set, centered on
+    /// x = z = 64), y spans [32, 128).
+    // Example-only; the benches do not print the bounds.
+    #[allow(dead_code)]
+    pub fn block_bounds(&self) -> (Range<i64>, Range<i64>) {
+        (self.x_range.clone(), 32..128)
     }
 
     /// Surface height at world column `(x, z)`.

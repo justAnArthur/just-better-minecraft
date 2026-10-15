@@ -127,14 +127,19 @@ impl Frames {
             self.render(terrain, camera);
         }
         let stats = terrain.read_cull_stats_blocking(&self.gpu);
+        assert_eq!(
+            stats.region_overflow, 0,
+            "the CPU frustum bound must cover every GPU emission"
+        );
         println!(
-            "{name}: path {} candidates {} frustum-culled {} occluded {} drawn {} commands {}",
+            "{name}: path {} candidates {} frustum-culled {} occluded {} drawn {} commands {} overflow {}",
             terrain.path_name(),
             stats.candidates,
             stats.frustum_culled,
             stats.occluded,
             stats.drawn(),
             stats.commands,
+            stats.region_overflow,
         );
         group.bench_function(name, |b| {
             b.iter_custom(|iters| {

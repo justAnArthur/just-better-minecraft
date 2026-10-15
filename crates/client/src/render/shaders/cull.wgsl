@@ -15,13 +15,20 @@
 // Command emission: one command per non-empty, non-back-facing direction
 // (the visible_directions rule of render/chunks.rs, ported with the same
 // comparisons), appended into per-page regions with an atomicAdd on a
-// per-page counter. The CPU clears the counters and zeroes the whole
-// command buffer first, so a region's unused tail is zero-count draws:
-// multi_draw_indirect is issued for the region's full bound and the
-// zero-tail draws are no-ops. multi_draw_indirect_count would skip the
-// tails but Metal lacks it (see the client README); command order inside
-// a region is nondeterministic, which is fine for opaque depth-tested
-// terrain.
+// per-page counter. Each frame the CPU sizes every region with the same
+// frustum test and visible_directions rule (over the meta slots it
+// tracks), so the bound is >= what this shader emits into it — Metal has
+// no draw_indirect_count and emulates multi_draw_indirect as a CPU loop
+// of one indirect draw per encoded command, so the encoded count has to
+// come from the CPU anyway, and sizing to the frustum keeps the zero-tail
+// encode cost proportional to what is visible. The CPU also clears the
+// counters and zeroes the command prefix first, so a region's unused tail
+// is zero-count draws: multi_draw_indirect is issued for the region's
+// full bound and the zero-tail draws are no-ops. Should the GPU ever emit
+// past the buffer capacity, the idx < capacity clamp below drops the
+// write and counts it in the region_overflow stat (asserted zero by the
+// tests). Command order inside a region is nondeterministic, which is
+// fine for opaque depth-tested terrain.
 
 struct FrameUniforms {
     view_proj: mat4x4f,
@@ -63,6 +70,8 @@ const STAT_DRAWN_EARLY: u32 = 3u;
 const STAT_DRAWN_LATE: u32 = 4u;
 const STAT_COMMANDS: u32 = 5u;
 const STAT_FACES: u32 = 6u;
+// Commands dropped by the capacity clamp: a bound bug (must stay zero).
+const STAT_REGION_OVERFLOW: u32 = 7u;
 
 // The projection's near plane (camera.rs NEAR); w of a projected point is
 // -z_view, so w <= NEAR means at or behind the near plane.
@@ -154,8 +163,10 @@ fn dir_visible(dirs: VisibleDirs, d: u32) -> bool {
 
 // Appends one command per non-empty, non-skipped direction into this
 // phase's region for the cube's page. idx is bounds-checked against the
-// CPU's region bound (the bound is provably large enough; the check only
-// guards against a bug corrupting memory instead of a frame).
+// command capacity: the CPU's frustum bound (region_base) is provably
+// large enough for this shader's identical-math emission, so a drop here
+// is a bound bug — it is counted in region_overflow for the tests to
+// catch instead of corrupting memory.
 fn emit(m: CubeMeta, slot: u32, phase_base: u32, rel_min: vec3f, rel_max: vec3f) {
     let page = u32(m.pos_page.w);
     let dirs = visible_dirs(rel_min, rel_max);
@@ -169,6 +180,8 @@ fn emit(m: CubeMeta, slot: u32, phase_base: u32, rel_min: vec3f, rel_max: vec3f)
         let idx = phase_base + region_base[page] + atomicAdd(&region_counter[page], 1u);
         if (idx < params.regions.z) {
             commands[idx] = DrawCmd(cnt * 6u, 1u, (start + off) * 6u, slot);
+        } else {
+            atomicAdd(&stats[STAT_REGION_OVERFLOW], 1u);
         }
         atomicAdd(&stats[STAT_COMMANDS], 1u);
         atomicAdd(&stats[STAT_FACES], cnt);

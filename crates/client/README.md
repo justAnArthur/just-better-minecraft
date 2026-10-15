@@ -240,7 +240,8 @@ The path is chosen once at construction and logged once;
 `set_force_cpu_cull` / `set_force_fallback` exist for tests and benches.
 `path()` / `path_name()` report the choice.
 
-**gpu-cull, per frame** (the CPU touches no cube):
+**gpu-cull, per frame** (the CPU's only per-cube work is sizing the
+command regions — see "Per-page regions and zero tails" below):
 
 1. **Early cull** (compute): one thread per meta slot; slots that were
    visible last frame and pass the frustum test (the same plane test as
@@ -248,12 +249,12 @@ The path is chosen once at construction and logged once;
    their commands into the **early** half.
 2. **Early draw**: render pass 1 draws the early regions, loading color
    and depth after the sky.
-3. **Hi-Z build** from the depth the early draw left.
-4. **Late cull** (compute): every active slot is tested against the
-   frustum and the pyramid; `visible = frustum && !occluded` is written
-   back for next frame, and slots not emitted early emit into the
-   **late** half.
-5. **Late draw**: render pass 2 draws the late regions.
+3. **Hi-Z build + late cull** (one compute pass): the pyramid is rebuilt
+   from the depth the early draw left, then every active slot is tested
+   against the frustum and the pyramid; `visible = frustum && !occluded`
+   is written back for next frame, and slots not emitted early emit into
+   the **late** half.
+4. **Late draw**: render pass 2 draws the late regions.
 
 Drawing what was visible last frame first means the pyramid already
 contains the scene the player saw, so nothing pops in when the camera
@@ -278,8 +279,14 @@ means no mip-0 texel is ever skipped (the classic Hi-Z bug with
 floor-sized mips); every mip texel is the min over exactly the mip-0
 texels its footprint covers (unit-tested). Mip k is bound as sampled and
 mip k+1 as write-only storage in one dispatch — legal because wgpu
-tracks usage per subresource. One dispatch per mip; recreated together
-with the depth target.
+tracks usage per subresource. The whole chain is one compute pass: one
+fill dispatch plus one reduce dispatch per mip, then the late cull rides
+the same pass. That is sound because dispatches within a compute pass
+are ordered and each dispatch is its own usage scope (WebGPU spec §3.4.4
+"Synchronization": "In a compute pass, each dispatch command
+(`dispatchWorkgroups()` or `dispatchWorkgroupsIndirect()`) is one usage
+scope"), so wgpu inserts the write→read barrier at each mip transition.
+Recreated together with the depth target.
 
 **Occlusion test** (in `cull.wgsl`, conservative — it may keep an
 occluded cube but never drops a visible one): project the 8 AABB
@@ -291,17 +298,31 @@ texels, read the covering texels (clamped) — their min is the farthest
 occluder — and call the cube occluded iff `nearest < farthest`.
 
 **Per-page regions and zero tails:** GPU-emitted commands go into
-per-page regions of one command buffer (early and late halves). Each
-frame the CPU writes `region_base[page]` — a prefix sum over pages of
-the resident cubes' non-empty direction counts, a bound the CPU already
-knows from a running total updated on upload and remove — and the shader
-appends with `atomicAdd` on a per-page counter. The counters and both
-command halves are `clear_buffer`ed first, so a region's unused tail is
-**zero-count draws**: each page is drawn with one
+per-page regions of one command buffer (early and late halves). The
+shader appends with `atomicAdd` on a per-page counter, and each frame
+the CPU writes `region_base[page]` — the prefix sum of that frame's
+**CPU frustum bound**: a walk over the resident meta slots running the
+same frustum test and `visible_directions` rule as the cpu-cull path
+(same origin formula, same view-projection rows), counting each
+frustum-passing cube's non-empty, non-skipped directions per page. The
+GPU still does all the deciding (frustum, Hi-Z occlusion, directions);
+the bound only sizes the regions — and since both sides use identical
+math, the bound is always ≥ what the GPU emits. The counters and the
+frame's command prefix are `clear_buffer`ed first, so a region's unused
+tail is **zero-count draws**: each page is drawn with one
 `multi_draw_indirect(region_base, bound)` and the tail draws are no-ops
-everywhere. `multi_draw_indirect_count` would skip the tails but Metal
-lacks it (and emulates MDI itself as a CPU loop of indirect draws);
-adopting it on Vulkan/DX12 is a later optimization.
+everywhere. The bound exists because Metal has no
+`draw_indirect_count` and emulates `multi_draw_indirect` as a CPU loop
+of one indirect draw per *encoded* command — the encoded count must
+come from the CPU, and sizing it to the frustum-passing set (instead of
+every resident cube) keeps the encode loop proportional to what is
+visible. If the GPU ever emitted past the buffer capacity anyway, the
+shader clamps the write and counts it in the `region_overflow` stat,
+asserted zero by the path tests. A per-page running total (updated on
+upload and remove) still exists as the static worst-case bound and
+drives the command buffer's growth. `multi_draw_indirect_count` would
+skip the tails entirely but Metal lacks it; adopting it on Vulkan/DX12
+is a later optimization.
 
 **Drawing** (cpu-cull and fallback): CPU frustum culling tests each
 camera-relative cube AABB (from the same origin formula) against 5
@@ -326,13 +347,16 @@ loop; direct draws accept a first instance without the feature. Same
 image (proven pixel-identical by tests).
 
 **Stats and their latency:** `CullStats` (`candidates`, `frustum_culled`,
-`occluded`, `drawn_early`, `drawn_late`, `commands`, `faces`) is filled
+`occluded`, `drawn_early`, `drawn_late`, `commands`, `faces`,
+`region_overflow`) is filled
 by GPU atomics on the gpu-cull path and copied each frame into a ring of
 3 `MAP_READ` buffers whose maps complete without blocking — so
 `cull_stats()` (the overlay's `CULL DRAWN n FRUSTUM n OCCLUDED n` line)
 is **one or two frames late**. On the CPU paths the same fields are
 exact and immediate. `read_cull_stats_blocking(gpu)` waits out the
-current frame's counters (tests, benches, the metrics example).
+current frame's counters (tests, benches, the metrics example);
+`region_overflow` counts commands the capacity clamp dropped (a bound
+bug — zero, asserted by the path tests).
 
 **`TerrainStats`:** `meshed`, `drawn`, `faces` (only non-skipped
 directions), `commands` (indirect commands or fallback draws — one per
