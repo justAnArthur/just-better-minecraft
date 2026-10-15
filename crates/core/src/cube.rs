@@ -309,6 +309,9 @@ impl Cube {
         let mut used = vec![false; self.palette.len()];
         let palette_len = self.palette.len();
         self.for_each_index(|pi| used[pi] = true);
+        if used.iter().all(|&u| u) && self.bits == bits_for(palette_len) {
+            return; // every entry in use at the minimal width: nothing to do
+        }
         let mut remap = vec![0u16; palette_len];
         let mut new_palette = Vec::with_capacity(used.iter().filter(|u| **u).count());
         for (old, is_used) in used.iter().enumerate() {
@@ -1000,14 +1003,16 @@ mod tests {
             super::CubeDecodeError::Version(2)
         );
 
+        // Any cube size but this build's: one more bit than CUBE_BITS.
+        let other_bits = crate::coords::CUBE_BITS as u8 + 1;
         let bad_bits = {
             let mut b = bytes.clone();
-            b[1] = 4;
+            b[1] = other_bits;
             b
         };
         assert_eq!(
             Cube::decode_with(&bad_bits, |id| Some(BlockStateId(id))).unwrap_err(),
-            super::CubeDecodeError::CubeBits(4)
+            super::CubeDecodeError::CubeBits(other_bits)
         );
 
         // Zero palette length and one above the cube's cells.

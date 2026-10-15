@@ -18,6 +18,7 @@ use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION, PlayerId, ServerMsg};
 use jbm_core::raycast::REACH;
 
 use crate::gen_pool::GenPool;
+use crate::lod::LodPyramid;
 use crate::storage::{PlayerRecord, Storage, StorageError};
 use crate::streaming::{Offset, desired_offsets, in_keep, offset_pos};
 use crate::terrain::Generator;
@@ -112,6 +113,9 @@ pub struct ServerConfig {
     pub world_dir: Option<PathBuf>,
     /// How often dirty cubes are snapshotted to the save thread.
     pub save_interval: Duration,
+    /// Top LOD level the server keeps (4 keeps LOD1–LOD4). `0` disables
+    /// the pyramid entirely: no allocation, no work per cube or edit.
+    pub lod_levels: u8,
 }
 
 impl Default for ServerConfig {
@@ -128,6 +132,7 @@ impl Default for ServerConfig {
             max_in_flight: 512,
             world_dir: None,
             save_interval: Duration::from_secs(5),
+            lod_levels: 4,
         }
     }
 }
@@ -136,10 +141,12 @@ impl ServerConfig {
     /// Streaming off and no generation threads: a server that only speaks
     /// the handshake/ping/tick protocol. Tests and benches that assert
     /// exact message sequences use this so their meaning stays unchanged.
+    /// The LOD pyramid is off too.
     pub fn protocol_only() -> Self {
         Self {
             streaming: false,
             gen_threads: 0,
+            lod_levels: 0,
             ..Self::default()
         }
     }
@@ -319,6 +326,10 @@ pub struct Server {
     /// Joined players counted by the previous streaming pass, to spot joins
     /// and disconnects cheaply.
     joined_count: usize,
+    /// The LOD pyramid built from ingested and edited LOD0 cubes. Eviction
+    /// never touches it: LOD cubes outlive their LOD0 children, so builds
+    /// stay visible from far away.
+    lod: LodPyramid,
 }
 
 impl Server {
@@ -362,6 +373,7 @@ impl Server {
                 .spawn(move || save_loop(storage, save_rx, ack_tx))
                 .expect("spawning the jbm-save thread")
         });
+        let lod = LodPyramid::new(config.lod_levels);
 
         Ok(Self {
             clock: TickClock::new(),
@@ -391,6 +403,7 @@ impl Server {
             spawn,
             eviction_dirty: true,
             joined_count: 0,
+            lod,
         })
     }
 
@@ -462,6 +475,35 @@ impl Server {
     /// Cubes the server currently keeps in memory.
     pub fn world_cube_count(&self) -> usize {
         self.world.len()
+    }
+
+    /// The level-`level` LOD cube at `pos`, when the pyramid holds one
+    /// (levels are 1-based; `lod_levels` bounds the top).
+    pub fn lod_cube(&self, level: u8, pos: CubePos) -> Option<&jbm_core::cube::Cube> {
+        self.lod.get(level, pos).map(|lc| &lc.cube)
+    }
+
+    /// The known-octant mask of the level-`level` LOD cube at `pos`, when
+    /// the pyramid holds one.
+    pub fn lod_known(&self, level: u8, pos: CubePos) -> Option<u8> {
+        self.lod.get(level, pos).map(|lc| lc.known)
+    }
+
+    /// LOD cubes held across all levels.
+    pub fn lod_cube_count(&self) -> usize {
+        self.lod.total_cubes()
+    }
+
+    /// Approximate heap bytes of the LOD pyramid (see
+    /// [`LodPyramid::heap_bytes`]); diagnostic, used by the LOD bench's
+    /// default-view report.
+    pub fn lod_heap_bytes(&self) -> usize {
+        self.lod.heap_bytes()
+    }
+
+    /// The whole pyramid, for tests and diagnostics.
+    pub fn lod_pyramid(&self) -> &LodPyramid {
+        &self.lod
     }
 
     /// Cubes queued for generation, generating, or generated but not yet
@@ -792,13 +834,21 @@ impl Server {
         Outcome::Keep
     }
 
-    /// Applies an accepted edit: set the block, pin the cube against
-    /// eviction (bumping its edit version under persistence), and queue the
-    /// broadcast.
+    /// Applies an accepted edit: set the block, propagate it into the LOD
+    /// pyramid (one cell per level, stopping at the first unchanged
+    /// level), pin the cube against eviction (bumping its edit version
+    /// under persistence), and queue the broadcast.
     fn apply_edit(&mut self, pos: BlockPos, state: BlockStateId) {
         let (cube_pos, local) = pos.split();
-        if let Some(cube) = self.world.get_mut(&cube_pos) {
-            cube.set(local, state);
+        {
+            let lod_on = self.config.lod_levels > 0;
+            let Server { world, lod, .. } = self;
+            if let Some(cube) = world.get_mut(&cube_pos) {
+                cube.set(local, state);
+                if lod_on {
+                    lod.edit_lod0(pos, cube);
+                }
+            }
         }
         match &self.storage {
             Some(_) => {
@@ -1120,22 +1170,38 @@ impl Server {
         //    whatever the workers finished (bounded by max_in_flight).
         //    Collection never overwrites: an edited cube may already be
         //    back in the world (pinned), so the stale generated copy is
-        //    dropped.
+        //    dropped — and must not touch the LOD pyramid either.
         let mut collected = false;
-        if self.config.gen_threads == 0 {
-            for _ in 0..self.config.gen_budget_per_tick {
-                match self.pool.try_recv() {
+        let lod_on = self.config.lod_levels > 0;
+        let inline = self.config.gen_threads == 0;
+        let budget = self.config.gen_budget_per_tick;
+        let Server {
+            world, lod, pool, ..
+        } = self;
+        if inline {
+            for _ in 0..budget {
+                match pool.try_recv() {
                     Some((pos, cube)) => {
                         collected = true;
-                        self.world.entry(pos).or_insert(cube);
+                        if let std::collections::hash_map::Entry::Vacant(slot) = world.entry(pos) {
+                            let inserted = slot.insert(cube);
+                            if lod_on {
+                                lod.insert_lod0(pos, inserted);
+                            }
+                        }
                     }
                     None => break,
                 }
             }
         } else {
-            while let Some((pos, cube)) = self.pool.try_recv() {
+            while let Some((pos, cube)) = pool.try_recv() {
                 collected = true;
-                self.world.entry(pos).or_insert(cube);
+                if let std::collections::hash_map::Entry::Vacant(slot) = world.entry(pos) {
+                    let inserted = slot.insert(cube);
+                    if lod_on {
+                        lod.insert_lod0(pos, inserted);
+                    }
+                }
             }
         }
 

@@ -3,6 +3,7 @@
 //! protocol messages.
 
 pub mod gen_pool;
+pub mod lod;
 pub mod run;
 pub mod server;
 pub mod storage;
@@ -12,6 +13,7 @@ pub mod tick;
 pub mod worldgen;
 
 pub use gen_pool::GenPool;
+pub use lod::{LodChanges, LodCube, LodPyramid};
 pub use run::ServerHandle;
 pub use server::{DEFAULT_SEED, PlayerView, Server, ServerConfig};
 pub use storage::{PlayerRecord, Storage, StorageError};

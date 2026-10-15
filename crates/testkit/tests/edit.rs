@@ -22,6 +22,7 @@ fn config() -> ServerConfig {
         max_in_flight: 512,
         world_dir: None,
         save_interval: std::time::Duration::from_secs(5),
+        lod_levels: 4,
     }
 }
 

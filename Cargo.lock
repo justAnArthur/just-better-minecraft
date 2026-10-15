@@ -845,6 +845,7 @@ version = "0.0.0"
 dependencies = [
  "criterion",
  "glam",
+ "image",
  "jbm-client",
  "jbm-core",
  "jbm-server",

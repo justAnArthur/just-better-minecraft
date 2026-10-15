@@ -4,6 +4,7 @@
 pub mod block;
 pub mod coords;
 pub mod cube;
+pub mod lod;
 pub mod physics;
 pub mod raycast;
 
