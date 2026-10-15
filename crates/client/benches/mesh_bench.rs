@@ -1,4 +1,5 @@
-//! Criterion benches for the mesher, group `mesh`. Cases:
+//! Criterion benches for the mesher (group `mesh`) and the face-page
+//! suballocator (group `suballoc`). Mesh cases:
 //!
 //! - `terrain_like`: a heightmap-filled cube (stone below, dirt layers,
 //!   grass top, height 4..28) with air above, stone neighbors below and
@@ -6,6 +7,10 @@
 //! - `checkerboard`: the worst case (16384 x 6 faces, no merging).
 //! - `uniform_stone_air_neighbors`: the non-fast uniform path.
 //! - `padded_build`: only the padded 34^3 build from 27 cubes.
+//!
+//! Suballoc case:
+//! - `churn_10k`: the seeded 10,000-operation alloc/free churn from the
+//!   suballocator unit tests, without the invariant checks.
 
 use std::hint::black_box;
 use std::sync::Arc;
@@ -13,6 +18,7 @@ use std::sync::Arc;
 use criterion::{Criterion, criterion_group, criterion_main};
 use jbm_client::mesh::appearance::BlockAppearance;
 use jbm_client::mesh::greedy::{self, MeshInput, neighbor_index};
+use jbm_client::render::suballoc;
 use jbm_core::block::{BlockRegistry, BlockStateId, builtin};
 use jbm_core::cube::Cube;
 
@@ -125,6 +131,12 @@ fn bench(c: &mut Criterion) {
                 black_box(&appearance),
             ))
         })
+    });
+    group.finish();
+
+    let mut group = c.benchmark_group("suballoc");
+    group.bench_function("churn_10k", |b| {
+        b.iter(|| suballoc::churn(black_box(4096), 0x0123_4567_89ab_cdef, 10_000, false))
     });
     group.finish();
 }

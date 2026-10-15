@@ -1,16 +1,23 @@
-// Terrain pass: vertex pulling. Each cube owns a storage buffer of packed
-// faces; the vertex shader expands face (vertex_index / 6) into a quad and
-// the fragment shader samples the block texture array. The bit layout
-// mirrors the comment block in crates/client/src/mesh/face.rs — keep the
-// two files in sync.
+// Terrain pass: vertex pulling. All cube meshes share a few large face
+// "pages" (storage buffers; render/suballoc.rs hands out face ranges) and
+// group 1 binds the page the current draw reads from. The vertex shader
+// expands face (vertex_index / 6) into a quad and the fragment shader
+// samples the block texture array. The bit layout mirrors the comment
+// block in crates/client/src/mesh/face.rs — keep the two files in sync.
 //
 // Bind groups:
 //   0: shared frame uniforms (same layout as sky.wgsl)
-//   1: per-cube faces storage buffer (array<vec2u>, one vec2 per face)
+//   1: the face page's storage buffer (array<vec2u>, one vec2 per face)
 //   2: shared terrain resources: origins, textures, sampler
 //
-// Each draw covers one cube: face_count * 6 vertices, one instance, with
-// first_instance set to the cube's slot in the origins buffer. Origins are
+// Each draw covers one cube and one face direction: vertex_count faces * 6
+// vertices, one instance, with first_vertex = (page range start + direction
+// range start) * 6 and first_instance = the cube's slot in the origins
+// buffer. vertex_index includes first_vertex — WebGPU sets vertexIndex to
+// firstVertex + i for a non-indexed draw (WGSL @builtin(vertex_index)),
+// and wgpu passes the draw range start straight through — so
+// faces[vertex / 6] indexes page-local faces. instance_index likewise
+// includes first_instance, selecting the cube's origin. Origins are
 // camera-relative (world cube corner - camera position, computed in f64 on
 // the CPU), so no absolute world coordinate ever reaches f32.
 

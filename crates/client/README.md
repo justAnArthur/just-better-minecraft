@@ -34,8 +34,12 @@ coordinates and cfg-gated off under the crate's own `cube16` passthrough;
   target, so the window surface and the offscreen test target share the
   code.
 - `render::renderer::DepthTarget` — `Depth32Float` attachment with resize.
-- `render::chunks::TerrainPass` — the terrain pass: per-cube face storage
-  buffers, camera-relative origins, CPU frustum culling.
+- `render::chunks::TerrainPass` — the terrain pass: paged face storage,
+  camera-relative origins, CPU frustum culling + per-direction back-face
+  skipping, one `multi_draw_indirect` per page (or a direct-draw fallback;
+  see "Terrain rendering" below).
+- `render::suballoc::Suballocator` — the CPU-side free-list suballocator
+  behind the pages (pure logic, no wgpu).
 - `render::overlay` — debug overlay (`OverlayText`, `OverlayRenderer`,
   `FrameStats`).
 - `render::texture_array::BlockTextures` + `placeholder_layers(n)` —
@@ -180,20 +184,66 @@ in `edit.rs`, winit-free and unit-tested.
 
 ### Terrain rendering
 
-Per meshed cube: one storage buffer of `PackedFace`s, one bind group, one
-draw of `face_count × 6` vertices — no vertex buffer, no index buffer
-(vertex pulling; the shader expands each face into a quad). Empty meshes
-allocate nothing. Cube origins are camera-relative: each frame
-`cube_min_world − camera.position` is computed in f64, cast to f32 and
-written into **one** origins storage buffer (rewritten per frame, grown
-only when visible cubes exceed capacity); the draw uses
-`first_instance = slot` so `instance_index` selects the origin. Absolute
-world coordinates never reach f32.
+All cube meshes live in a few large face **pages**: one `STORAGE |
+COPY_DST` buffer of 8-byte `PackedFace`s (default 4M faces = 32 MiB,
+clamped to `max_storage_buffer_binding_size` / `max_buffer_size`, never
+below one worst-case cube mesh — `6 · CUBE_SIZE³ / 2` faces) plus one
+CPU-side `Suballocator` and one bind group per page. No vertex buffer, no
+index buffer (vertex pulling; the shader expands each face into a quad).
+A re-mesh frees the cube's old range and allocates a new slot
+(first-fit over the pages, new page only when none fits) — it never
+creates a buffer per cube. Empty meshes keep an entry with no allocation.
+Freed ranges are reused immediately: wgpu's `Queue::write_buffer` docs
+promise staged writes "begin GPU execution only on the next call to
+`Queue::submit()`, just before the explicitly submitted commands", so a
+this-frame write cannot race earlier frames' draws. The cube's six
+per-direction sub-ranges from `MeshOutput::ranges` ride along so drawing
+can skip directions.
+
+**Known limit:** pages are never freed or compacted in this task;
+fragmentation grows until a later compaction task (2.6).
+
+**Drawing** (per frame): CPU frustum culling tests each camera-relative
+cube AABB against 5 planes as before, then, in sorted `CubePos` order,
+one indirect command is emitted per visible cube **and face direction**
+with a non-empty range, skipping back-facing directions
+(`visible_directions`: +X is skipped when the whole cube is at
+`rel_min.x ≥ 0` — every +X face plane is then at or beyond the camera's
+x and faces away — and symmetrically for −X, ±Y, ±Z; back-face culling
+discarded those faces anyway, so the image is unchanged). Each command
+carries `first_vertex = (page range start + direction range start) · 6`
+and `first_instance = slot`; `vertex_index` includes `first_vertex` for
+non-indexed draws, so `faces[vertex / 6]` still indexes page-local faces.
+The slot selects the camera-relative origin (as before: origins are
+rewritten per frame into one storage buffer, grown only when visible
+cubes exceed capacity; absolute world coordinates never reach f32).
+
+Two paths issue the same commands over the same buffers:
+
+- **MDI** (`multi_draw_indirect`), used when the adapter reports
+  `DownlevelFlags::INDIRECT_EXECUTION` and the device was created with
+  `Features::INDIRECT_FIRST_INSTANCE` (requested in `gpu.rs` only when
+  the adapter supports it — device creation never fails over it). One
+  `multi_draw_indirect` per non-empty page over that page's contiguous
+  command block: **one draw call per page** instead of one per cube.
+- **Fallback**: the same commands as `pass.draw(first_vertex..
+  first_vertex + count, slot..slot + 1)` in a loop; direct draws accept
+  a first instance without the feature. Same image (proven
+  pixel-identical by tests).
+
+Selection is automatic, forced off with `JBM_NO_MDI=1` or
+`TerrainPass::set_force_fallback(true)` (tests and benches), and the
+chosen path is logged once at startup.
+
+**`TerrainStats`:** `meshed`, `drawn`, `faces` (only non-skipped
+directions), `commands` (indirect commands or fallback draws — one per
+visible cube and kept direction), `draw_calls` (render-pass draw API
+calls: 1 per non-empty page on MDI), `pages`, `page_bytes`,
+`used_faces`.
 
 **Upload budget:** at most 32 mesh uploads per frame (leftover results
 stay queued), plus at most 16 dirty-cube submissions — streaming never
-hitches a frame. CPU frustum culling tests each cube AABB against the
-camera-relative frustum (5 planes; far plane is at infinity).
+hitches a frame.
 
 Terrain pipeline: depth `Greater` with reverse-Z, back-face culling,
 samples `BlockTextures` (nearest, linear mips, repeat addressing so
@@ -215,7 +265,8 @@ fraction, drains the link into `ClientWorld` and the `Predictor`
 (`PlayerState` → `on_server_state`), submits dirty cubes, receives and
 uploads meshes within the budgets above. The overlay adds
 `CUBES <loaded> MESHED <n> PENDING <dirty + in flight>`,
-`FACES <total> DRAWS <n>`, and the prediction lines
+`FACES <drawn, after direction skipping> PAGES <p> CMDS <c> DRAWS <d>
+<MDI|FALLBACK>`, and the prediction lines
 `MODE <WALK/FLY> GROUND <YES/NO>`, `VEL <x y z>` and
 `PENDING <n> CORRECTIONS <n>`.
 
@@ -313,7 +364,8 @@ semi-transparent dark box per line. `FrameStats` averages FPS / frame ms
 over a sliding 0.5 s window (pure logic, unit-tested). The app fills the
 lines `FPS`, `XYZ` (2 decimals), `CUBE` (32-block cube coordinates),
 `YAW`/`PITCH` in degrees, `CUBES`/`MESHED`/`PENDING`,
-`FACES`/`DRAWS`, `TARGET` (block position and state name) and `HOTBAR`.
+`FACES`/`PAGES`/`CMDS`/`DRAWS` (+ draw path), `TARGET` (block position
+and state name) and `HOTBAR`.
 Whenever an overlay is drawn, a centered crosshair (white with a dark
 outline) is drawn too.
 
@@ -358,3 +410,9 @@ pyramid with AO in the inner corners), `mesh_cube_border` (a building
 crossing the boundary between two cubes — no seam),
 `mesh_far_origin` (the `mesh_ao` scene ~10⁹ blocks out; matches the same
 `mesh_ao` golden, proving camera-relative rendering).
+
+`tests/terrain_pages.rs` (task 2.2) has no golden of its own: it churns
+200 cubes through tiny face pages (re-uploads that reuse freed slots,
+removals) and requires the result to be **pixel-identical** to a freshly
+built pass holding only the final meshes, with every page's suballocator
+passing `check_invariants`. Cube-size agnostic.

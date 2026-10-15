@@ -469,9 +469,16 @@ impl App {
             self.world.dirty_count() + self.in_flight
         ));
         overlay.push(format!(
-            "FACES {} DRAWS {}",
-            w.terrain.total_faces(),
-            terrain_stats.draws
+            "FACES {} PAGES {} CMDS {} DRAWS {} {}",
+            terrain_stats.faces,
+            terrain_stats.pages,
+            terrain_stats.commands,
+            terrain_stats.draw_calls,
+            if w.terrain.uses_mdi() {
+                "MDI"
+            } else {
+                "FALLBACK"
+            }
         ));
 
         // Every skipped frame still asks for the next one: the first frames

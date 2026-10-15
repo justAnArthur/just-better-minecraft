@@ -59,9 +59,22 @@ impl Gpu {
             apply_limit_buckets: Default::default(),
         }))
         .map_err(|_| GpuError::NoAdapter)?;
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-                .map_err(|e| GpuError::RequestDevice(e.to_string()))?;
+        // Request non-zero `first_instance` for indirect draws when the
+        // adapter supports it; never fail device creation over it — the
+        // renderer falls back to direct draws without the feature.
+        let mut required_features = wgpu::Features::default();
+        if adapter
+            .features()
+            .contains(wgpu::Features::INDIRECT_FIRST_INSTANCE)
+        {
+            required_features |= wgpu::Features::INDIRECT_FIRST_INSTANCE;
+        }
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("jbm device"),
+            required_features,
+            ..Default::default()
+        }))
+        .map_err(|e| GpuError::RequestDevice(e.to_string()))?;
         Ok(Gpu {
             instance,
             adapter,

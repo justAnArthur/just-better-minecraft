@@ -44,16 +44,36 @@ layering — no server `generate` involved:
   neighbor dirtying);
 - `build_region` — building the region's cubes with `Cube::from_fn`.
 
+**Terrain draw benchmark (task 2.2):** `benches/terrain_draw.rs` (group
+`terrain_draw`, same region, GPU required) records and submits one
+offscreen frame followed by a device poll wait, through each draw path:
+`mdi` (multi-draw indirect; skipped with a printed line when the adapter
+lacks it) and `fallback` (the forced direct-draw loop). Without a GPU
+adapter the bench prints a skip line and passes, so the CI bench smoke
+run stays green.
+
 `examples/cube_size_metrics.rs` prints the matching metrics table (cube
-count, uniform cubes, draw calls, faces, mesh bytes, cube storage + a
-documented HashMap overhead estimate, streaming-granularity message count,
-and a GPU frame time when an adapter exists). Both run at 32³ and, with
-`--features cube16`, at 16³:
+count, uniform cubes, the old one-draw-per-non-empty-cube number, faces,
+mesh bytes, cube storage + a documented HashMap overhead estimate,
+streaming-granularity message count) plus, when an adapter exists, a GPU
+section per draw path: `draws / commands`, faces drawn after direction
+skipping (next to the region's total), pages / page bytes, and the mean
+frame time over 50 frames. Both run at 32³ and, with `--features cube16`,
+at 16³:
 
 ```bash
 cargo bench -p jbm-game --bench cube_size [--features cube16]
+cargo bench -p jbm-game --bench terrain_draw
 cargo run -p jbm-game --release --example cube_size_metrics [--features cube16]
 ```
+
+**Draw-path tests (task 2.2):** `tests/terrain_paths.rs` renders the
+streamed `terrain_spawn` and `edit_spawn` scenes through the MDI path and
+the forced fallback and requires **pixel-identical** images (exact, not
+the golden tolerance; without adapter MDI it checks the fallback against
+the golden instead), and asserts the terrain stats on `terrain_spawn`
+(draw calls ≤ pages on MDI, one to six commands per drawn cube, faces
+below the drawn cubes' total — directions really are skipped).
 
 **Invariants**
 
