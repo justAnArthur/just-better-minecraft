@@ -239,7 +239,13 @@ fn occluded(rel_min: vec3f, rel_max: vec3f) -> bool {
 
     // The texels covering the rect at that level, clamped to the texture.
     let scale = f32(1u << level);
-    let mip_size = vec2i(textureDimensions(pyramid, i32(level)));
+    // The mip size comes from the depth size, not textureDimensions: the
+    // pyramid's floor-halved chain (render/hiz.rs) is exactly
+    // max(1, size >> level), and lavapipe's textureDimensions(t, level)
+    // reported a mip larger than 1x1 at the top level, so the clamp let
+    // reads run past the mip, returned 0 (= infinitely far in reverse-Z)
+    // and silently disabled occlusion for those cubes.
+    let mip_size = max(vec2i(1), vec2i(params.screen.xy >> vec2u(level)));
     let mlo = clamp(vec2i(floor(lo / scale)), vec2i(0), mip_size - vec2i(1));
     let mhi = clamp(vec2i(floor(hi / scale)), vec2i(0), mip_size - vec2i(1));
 
