@@ -30,14 +30,20 @@ coordinates and cfg-gated off under the crate's own `cube16` passthrough;
 - `mesh::pool::MeshPool` — the mesh worker pool.
 - `world::ClientWorld` — cubes from the server plus dirty/version state.
 - `render::renderer::Renderer` — the frame renderer (sky + terrain +
-  overlay dispatch). One `Renderer` per color format; works against any
+  outline + overlay dispatch), taking its per-frame inputs as one
+  `render::renderer::FrameInputs` struct (target, depth, camera, terrain,
+  outline, overlay). One `Renderer` per color format; works against any
   target, so the window surface and the offscreen test target share the
   code.
-- `render::renderer::DepthTarget` — `Depth32Float` attachment with resize.
+- `render::renderer::DepthTarget` — `Depth32Float` attachment with resize;
+  `TEXTURE_BINDING` usage so the Hi-Z pass can sample it.
 - `render::chunks::TerrainPass` — the terrain pass: paged face storage,
-  camera-relative origins, CPU frustum culling + per-direction back-face
-  skipping, one `multi_draw_indirect` per page (or a direct-draw fallback;
-  see "Terrain rendering" below).
+  persistent meta slots, and three draw paths — GPU compute culling
+  (frustum + Hi-Z occlusion, two-phase), CPU culling with
+  `multi_draw_indirect`, or a direct-draw fallback (see "Terrain
+  rendering" below).
+- `render::hiz::HizPyramid` — the hierarchical-Z depth pyramid the GPU
+  cull tests occlusion against.
 - `render::suballoc::Suballocator` — the CPU-side free-list suballocator
   behind the pages (pure logic, no wgpu).
 - `render::overlay` — debug overlay (`OverlayText`, `OverlayRenderer`,
@@ -203,43 +209,186 @@ can skip directions.
 **Known limit:** pages are never freed or compacted in this task;
 fragmentation grows until a later compaction task (2.6).
 
-**Drawing** (per frame): CPU frustum culling tests each camera-relative
-cube AABB against 5 planes as before, then, in sorted `CubePos` order,
-one indirect command is emitted per visible cube **and face direction**
-with a non-empty range, skipping back-facing directions
-(`visible_directions`: +X is skipped when the whole cube is at
-`rel_min.x ≥ 0` — every +X face plane is then at or beyond the camera's
-x and faces away — and symmetrically for −X, ±Y, ±Z; back-face culling
-discarded those faces anyway, so the image is unchanged). Each command
-carries `first_vertex = (page range start + direction range start) · 6`
-and `first_instance = slot`; `vertex_index` includes `first_vertex` for
+**Meta slots (task 2.5):** every resident cube with a non-empty mesh
+holds a slot in one persistent `cube_meta` storage buffer (80-byte
+`CubeMeta`: cube position + page, face-range start + flags, the six
+per-direction `(offset, count)` pairs; mirrored in `terrain.wgsl` and
+`cull.wgsl`, pinned by a layout test). Slots come from a free list;
+upload writes one, `remove` zeroes it, a re-mesh rewrites it in place
+with the visible bit reset. **`first_instance` is the meta slot on every
+path** — nothing per-cube is rewritten per frame.
+
+**The one origin formula:** the vertex shader computes each cube's
+camera-relative origin itself: `origin = (pos − camera_cube) · CUBE_SIZE
+− camera_frac`, where `camera_cube = floor(camera / CUBE_SIZE)` and
+`camera_frac = camera − camera_cube · CUBE_SIZE` (f64 on the CPU, rounded
+to f32 once). The integer part is exact; the only rounding is the final
+f32 subtract, so no absolute world coordinate reaches f32. Both values
+ride in a terrain-only uniform (group 2 — sky, outline and overlay share
+just `FrameUniforms`), and the CPU paths use the same Rust function
+(`cube_origin`), so CPU and GPU cull on the same numbers.
+
+### Three paths (task 2.5)
+
+| Path | When | Culling | Draw |
+|---|---|---|---|
+| `cpu-cull` (default) | MDI available | 2.2's CPU frustum + directions over the same meta slots | `multi_draw_indirect` per page |
+| `gpu-cull` (opt-in) | MDI **and** `DownlevelFlags::COMPUTE_SHADERS` + R32Float storage textures, **and** `JBM_GPU_CULL=1` or `set_prefer_gpu_cull(true)` | compute: frustum, Hi-Z, directions | `multi_draw_indirect` per page, two phases |
+| `fallback` | no MDI, or `JBM_NO_MDI=1`, or `set_force_fallback(true)` | as `cpu-cull` | direct draws |
+
+The path is chosen once at construction (`select_path`, a pure,
+exhaustively tested function) and logged once; a gpu-capable adapter
+also logs "gpu-cull available (JBM_GPU_CULL=1)". `set_prefer_gpu_cull`,
+`set_force_cpu_cull` and `set_force_fallback` exist for tests and
+benches; the force flags win over the preference. `path()` /
+`path_name()` report the choice.
+
+**Why gpu-cull is opt-in.** On the only hardware measured so far (Apple
+Silicon, Metal) it is slower than cpu-cull in every scene, caves
+included. Game-sized region (`JBM_REGION_SIDE=544`: 867 cubes, 430
+meshes, 1280×720), frame mean including the GPU wait:
+
+| Scene | gpu-cull | cpu-cull | gpu-cull commands / encoded slots | cpu-cull commands |
+|---|---|---|---|---|
+| surface | 0.80–1.07 ms | 0.43–0.61 ms | 928 / 1856 | 928 |
+| cave (closed room) | 0.41–0.71 ms | 0.27–0.46 ms | 15 / 640 | 320 |
+
+Where the time goes: on Metal `multi_draw_indirect` is a CPU loop of
+one indirect draw per command and `draw_indirect_count` is missing, so
+every region slot is encoded even when the GPU wrote a zero-count draw
+(the CPU frustum bound keeps that to 2× the cpu-cull count, one region
+per phase); the per-frame Hi-Z rebuild at 1280×720 costs about 0.18 ms;
+the second render pass and the cull dispatches are the rest. In these
+scenes the faces saved by occlusion cost less to raster than that.
+cpu-cull stays the default until gpu-cull wins a measurement. Levers,
+in order: re-measure with the LOD rings of 2.6 (far more geometry);
+start the pyramid at half resolution, reducing straight from the depth
+target; `multi_draw_indirect_count` on Vulkan/DX12.
+
+**gpu-cull, per frame** (the CPU's only per-cube work is sizing the
+command regions — see "Per-page regions and zero tails" below):
+
+1. **Early cull** (compute): one thread per meta slot; slots that were
+   visible last frame and pass the frustum test (the same plane test as
+   the CPU `Frustum`, ported to WGSL with the same comparisons) emit
+   their commands into the **early** half.
+2. **Early draw**: render pass 1 draws the early regions, loading color
+   and depth after the sky.
+3. **Hi-Z build + late cull** (one compute pass): the pyramid is rebuilt
+   from the depth the early draw left, then every active slot is tested
+   against the frustum and the pyramid; `visible = frustum && !occluded`
+   is written back for next frame, and slots not emitted early emit into
+   the **late** half.
+4. **Late draw**: render pass 2 draws the late regions.
+
+Drawing what was visible last frame first means the pyramid already
+contains the scene the player saw, so nothing pops in when the camera
+moves; caves under the player cost almost nothing from the second frame
+of a view on. New and re-meshed cubes start with `visible = 0`, so the
+late pass picks them up the same frame (a fresh pass renders correctly
+on its first frame; occlusion takes effect from the second frame).
+Command order inside a region is nondeterministic (atomics), which is
+fine for opaque, depth-tested terrain — the path-equality tests prove
+the images are pixel-identical.
+
+**The Hi-Z pyramid** (`render/hiz.rs` + `shaders/hiz.wgsl`): an
+`R32Float` texture with a full floor-halved mip chain over the depth
+target (mip 0 is a compute copy — depth textures are sampleable, not
+storable). Every reduction is a 2×2 **min**, because in reverse-Z the
+smaller depth is the farther surface and occlusion needs the farthest
+one. Reduction rule (mirrored by the unit-tested `reduce_step`): each
+dst texel is the min over its 2-texel pair of src texels, and the
+**last** dst texel of an axis takes the remainder — so with an odd 5-texel
+source, `dst 0` covers `{0,1}` and `dst 1` covers `{2,3,4}`. The fold
+means no mip-0 texel is ever skipped (the classic Hi-Z bug with
+floor-sized mips); every mip texel is the min over exactly the mip-0
+texels its footprint covers (unit-tested). Mip k is bound as sampled and
+mip k+1 as write-only storage in one dispatch — legal because wgpu
+tracks usage per subresource. The whole chain is one compute pass: one
+fill dispatch plus one reduce dispatch per mip, then the late cull rides
+the same pass. That is sound because dispatches within a compute pass
+are ordered and each dispatch is its own usage scope (WebGPU spec §3.4.4
+"Synchronization": "In a compute pass, each dispatch command
+(`dispatchWorkgroups()` or `dispatchWorkgroupsIndirect()`) is one usage
+scope"), so wgpu inserts the write→read barrier at each mip transition.
+Recreated together with the depth target.
+
+**Occlusion test** (in `cull.wgsl`, conservative — it may keep an
+occluded cube but never drops a visible one): project the 8 AABB
+corners; if any corner has `w ≤` the near plane or the AABB contains
+the camera, the cube is visible. Otherwise take the screen rectangle in
+mip-0 texels (expanded a texel) and the cube's nearest depth (`max z/w`
+in reverse-Z), pick the mip level where the rect spans at most 2×2
+texels, read the covering texels (clamped) — their min is the farthest
+occluder — and call the cube occluded iff `nearest < farthest`.
+
+**Per-page regions and zero tails:** GPU-emitted commands go into
+per-page regions of one command buffer (early and late halves). The
+shader appends with `atomicAdd` on a per-page counter, and each frame
+the CPU writes `region_base[page]` — the prefix sum of that frame's
+**CPU frustum bound**: a walk over the resident meta slots running the
+same frustum test and `visible_directions` rule as the cpu-cull path
+(same origin formula, same view-projection rows), counting each
+frustum-passing cube's non-empty, non-skipped directions per page. The
+GPU still does all the deciding (frustum, Hi-Z occlusion, directions);
+the bound only sizes the regions — and since both sides use identical
+math, the bound is always ≥ what the GPU emits. The counters and the
+frame's command prefix are `clear_buffer`ed first, so a region's unused
+tail is **zero-count draws**: each page is drawn with one
+`multi_draw_indirect(region_base, bound)` and the tail draws are no-ops
+everywhere. The bound exists because Metal has no
+`draw_indirect_count` and emulates `multi_draw_indirect` as a CPU loop
+of one indirect draw per *encoded* command — the encoded count must
+come from the CPU, and sizing it to the frustum-passing set (instead of
+every resident cube) keeps the encode loop proportional to what is
+visible. If the GPU ever emitted past the buffer capacity anyway, the
+shader clamps the write and counts it in the `region_overflow` stat,
+asserted zero by the path tests. A per-page running total (updated on
+upload and remove) still exists as the static worst-case bound and
+drives the command buffer's growth. `multi_draw_indirect_count` would
+skip the tails entirely but Metal lacks it; adopting it on Vulkan/DX12
+is a later optimization.
+
+**Drawing** (cpu-cull and fallback): CPU frustum culling tests each
+camera-relative cube AABB (from the same origin formula) against 5
+planes, then, in sorted `CubePos` order, one indirect command is emitted
+per visible cube **and face direction** with a non-empty range, skipping
+back-facing directions (`visible_directions`: +X is skipped when the
+whole cube is at `rel_min.x ≥ 0` — every +X face plane is then at or
+beyond the camera's x and faces away — and symmetrically for −X, ±Y,
+±Z; back-face culling discarded those faces anyway, so the image is
+unchanged; the GPU path ports the same rule). Each command carries
+`first_vertex = (page range start + direction range start) · 6` and
+`first_instance = slot`; `vertex_index` includes `first_vertex` for
 non-indexed draws, so `faces[vertex / 6]` still indexes page-local faces.
-The slot selects the camera-relative origin (as before: origins are
-rewritten per frame into one storage buffer, grown only when visible
-cubes exceed capacity; absolute world coordinates never reach f32).
 
-Two paths issue the same commands over the same buffers:
+MDI is used when the adapter reports `DownlevelFlags::INDIRECT_EXECUTION`
+and the device was created with `Features::INDIRECT_FIRST_INSTANCE`
+(requested in `gpu.rs` only when the adapter supports it — device
+creation never fails over it): **one draw call per page (and phase)**
+instead of one per cube. The fallback issues the same commands as
+`pass.draw(first_vertex..first_vertex + count, slot..slot + 1)` in a
+loop; direct draws accept a first instance without the feature. Same
+image (proven pixel-identical by tests).
 
-- **MDI** (`multi_draw_indirect`), used when the adapter reports
-  `DownlevelFlags::INDIRECT_EXECUTION` and the device was created with
-  `Features::INDIRECT_FIRST_INSTANCE` (requested in `gpu.rs` only when
-  the adapter supports it — device creation never fails over it). One
-  `multi_draw_indirect` per non-empty page over that page's contiguous
-  command block: **one draw call per page** instead of one per cube.
-- **Fallback**: the same commands as `pass.draw(first_vertex..
-  first_vertex + count, slot..slot + 1)` in a loop; direct draws accept
-  a first instance without the feature. Same image (proven
-  pixel-identical by tests).
-
-Selection is automatic, forced off with `JBM_NO_MDI=1` or
-`TerrainPass::set_force_fallback(true)` (tests and benches), and the
-chosen path is logged once at startup.
+**Stats and their latency:** `CullStats` (`candidates`, `frustum_culled`,
+`occluded`, `drawn_early`, `drawn_late`, `commands`, `faces`,
+`region_overflow`) is filled
+by GPU atomics on the gpu-cull path and copied each frame into a ring of
+3 `MAP_READ` buffers whose maps complete without blocking — so
+`cull_stats()` (the overlay's `CULL DRAWN n FRUSTUM n OCCLUDED n` line)
+is **one or two frames late**. On the CPU paths the same fields are
+exact and immediate. `read_cull_stats_blocking(gpu)` waits out the
+current frame's counters (tests, benches, the metrics example);
+`region_overflow` counts commands the capacity clamp dropped (a bound
+bug — zero, asserted by the path tests).
 
 **`TerrainStats`:** `meshed`, `drawn`, `faces` (only non-skipped
 directions), `commands` (indirect commands or fallback draws — one per
-visible cube and kept direction), `draw_calls` (render-pass draw API
-calls: 1 per non-empty page on MDI), `pages`, `page_bytes`,
-`used_faces`.
+visible cube and kept direction; on gpu-cull from the GPU counters, one
+or two frames late), `draw_calls` (render-pass draw API calls: 1 per
+non-empty page and phase with MDI), `pages`, `page_bytes`, `used_faces`
+(the CPU-known fields stay exact on every path).
 
 **Upload budget:** at most 32 mesh uploads per frame (leftover results
 stay queued), plus at most 16 dirty-cube submissions — streaming never
@@ -266,7 +415,8 @@ fraction, drains the link into `ClientWorld` and the `Predictor`
 uploads meshes within the budgets above. The overlay adds
 `CUBES <loaded> MESHED <n> PENDING <dirty + in flight>`,
 `FACES <drawn, after direction skipping> PAGES <p> CMDS <c> DRAWS <d>
-<MDI|FALLBACK>`, and the prediction lines
+<path name>`, `CULL DRAWN <n> FRUSTUM <n> OCCLUDED <n>` (the GPU
+counters, one or two frames late), and the prediction lines
 `MODE <WALK/FLY> GROUND <YES/NO>`, `VEL <x y z>` and
 `PENDING <n> CORRECTIONS <n>`.
 
@@ -411,8 +561,18 @@ crossing the boundary between two cubes — no seam),
 `mesh_far_origin` (the `mesh_ao` scene ~10⁹ blocks out; matches the same
 `mesh_ao` golden, proving camera-relative rendering).
 
-`tests/terrain_pages.rs` (task 2.2) has no golden of its own: it churns
-200 cubes through tiny face pages (re-uploads that reuse freed slots,
-removals) and requires the result to be **pixel-identical** to a freshly
-built pass holding only the final meshes, with every page's suballocator
-passing `check_invariants`. Cube-size agnostic.
+`tests/terrain_pages.rs` (task 2.2, extended by 2.5) has no golden of
+its own: it churns 200 cubes through tiny face pages (re-uploads that
+reuse freed slots, removals) and requires the result to be
+**pixel-identical** to a freshly built pass holding only the final
+meshes, on the cpu-cull path and — when the adapter allows — the gpu-cull
+path, with every page's suballocator and the meta-slot / region-bound
+invariants passing `check_invariants`. Cube-size agnostic.
+
+Path-level GPU tests live in `crates/game/tests/terrain_paths.rs` (task
+2.5): the three paths must render `terrain_spawn` and `edit_spawn`
+pixel-identically, a 60-frame moving camera (through a carved room and
+back out) must never differ between gpu-cull and cpu-cull, a camera in
+the closed room must leave ≥80% of frustum-passing cubes
+occlusion-culled, the open surface view stays nearly uncullled, and an
+odd resize (333×217) keeps the paths identical.

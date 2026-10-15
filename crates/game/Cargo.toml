@@ -27,6 +27,8 @@ criterion.workspace = true
 glam.workspace = true
 # The cube-size metrics example polls the device between timed frames.
 wgpu.workspace = true
+# Path-equality tests compare offscreen frames pixel by pixel.
+image.workspace = true
 
 [[bin]]
 name = "jbm"

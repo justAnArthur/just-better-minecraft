@@ -11,7 +11,7 @@ use jbm_client::mesh::greedy;
 use jbm_client::render::chunks::TerrainPass;
 use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::overlay::OverlayText;
-use jbm_client::render::renderer::{DepthTarget, Renderer};
+use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
 use jbm_client::render::texture_array::BlockTextures;
 use jbm_client::testing::screenshot::{assert_matches_golden, gpu_or_skip};
 use jbm_client::world::ClientWorld;
@@ -196,12 +196,14 @@ fn edited_spawn_scene_matches_golden() {
     let overlay = OverlayText::new();
     renderer.render(
         &gpu,
-        &target.create_view(),
-        depth.view(),
-        &camera,
-        Some(&overlay),
-        Some(&mut terrain),
-        Some(outlined),
+        FrameInputs {
+            target: &target.create_view(),
+            depth: &depth,
+            camera: &camera,
+            terrain: Some(&mut terrain),
+            outline: Some(outlined),
+            overlay: Some(&overlay),
+        },
     );
     let with_outline = target.read_rgba(&gpu);
     assert_matches_golden("edit_spawn", &with_outline);
@@ -211,12 +213,14 @@ fn edited_spawn_scene_matches_golden() {
     // outline. Render again without it and require a visible difference.
     renderer.render(
         &gpu,
-        &target.create_view(),
-        depth.view(),
-        &camera,
-        Some(&overlay),
-        Some(&mut terrain),
-        None,
+        FrameInputs {
+            target: &target.create_view(),
+            depth: &depth,
+            camera: &camera,
+            terrain: Some(&mut terrain),
+            outline: None,
+            overlay: Some(&overlay),
+        },
     );
     let without = target.read_rgba(&gpu);
     let outline_pixels = with_outline
