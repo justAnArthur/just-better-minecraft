@@ -1,6 +1,7 @@
-//! The greedy mesher: pure logic, no GPU. Builds a padded 34^3 block view
-//! from a cube and its neighbors, then merges coplanar faces into maximal
-//! rectangles per direction. Rules are documented in crates/client/README.md.
+//! The greedy mesher: pure logic, no GPU. Builds a padded
+//! `(CUBE_SIZE + 2)^3` block view from a cube and its neighbors, then merges
+//! coplanar faces into maximal rectangles per direction. Rules are documented
+//! in crates/client/README.md.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -193,16 +194,17 @@ pub fn build_padded(input: &MeshInput, appearance: &BlockAppearance) -> Vec<u32>
                 let (ys, ye) = axis_span(dy);
                 let (zs, ze) = axis_span(dz);
                 let (xs, _xe) = axis_span(dx);
-                // Padded x is fixed at -1 or 32 for side neighbors; the
-                // matching local x in the neighbor cube is 31 or 0.
+                // Padded x is fixed at -1 or CUBE_SIZE for side neighbors;
+                // the matching local x in the neighbor cube is
+                // CUBE_SIZE - 1 or 0.
                 let px = (xs + 1) as usize; // padded column within the row
-                let lx = (xs - 32 * dx) as usize; // local x in the neighbor
+                let lx = (xs - CUBE_SIZE * dx) as usize; // local x in the neighbor
                 for py in ys..=ye {
                     let y_base = PAD_Y * ((py + 1) as usize);
-                    let ly = py - 32 * dy;
+                    let ly = py - CUBE_SIZE * dy;
                     for pz in zs..=ze {
                         let z_base = y_base + PAD_Z * ((pz + 1) as usize);
-                        let lz = pz - 32 * dz;
+                        let lz = pz - CUBE_SIZE * dz;
                         if let Some(cell) = uniform_cell {
                             if xs == 0 {
                                 cells[z_base + 1..z_base + 1 + CUBE_SIZE as usize].fill(cell);
@@ -211,7 +213,7 @@ pub fn build_padded(input: &MeshInput, appearance: &BlockAppearance) -> Vec<u32>
                             }
                             continue;
                         }
-                        let row = ((ly * 32 + lz) * 32) as usize;
+                        let row = ((ly * CUBE_SIZE + lz) * CUBE_SIZE) as usize;
                         if xs == 0 {
                             for x in 0..CUBE_SIZE as usize {
                                 let state = cube.get_index(row + x);
@@ -230,12 +232,13 @@ pub fn build_padded(input: &MeshInput, appearance: &BlockAppearance) -> Vec<u32>
 }
 
 /// Padded-coordinate span for one axis of a neighbor offset: a fixed shell
-/// coordinate (−1 or 32) for nonzero offsets, the full 0..=31 for zero.
+/// coordinate (−1 or `CUBE_SIZE`) for nonzero offsets, the full
+/// `0..=CUBE_SIZE - 1` for zero.
 fn axis_span(offset: i32) -> (i32, i32) {
     match offset {
         -1 => (-1, -1),
-        1 => (32, 32),
-        _ => (0, 31),
+        1 => (CUBE_SIZE, CUBE_SIZE),
+        _ => (0, CUBE_SIZE - 1),
     }
 }
 
@@ -252,7 +255,8 @@ fn mesh_padded(pad: &[u32], appearance: &BlockAppearance) -> MeshOutput {
         faces: Vec::new(),
         ranges: std::array::from_fn(|_| 0u32..0),
     };
-    let mut mask = [0u32; 1024];
+    let size = CUBE_SIZE as usize;
+    let mut mask = [0u32; MASK_LEN];
 
     for (dir_index, &direction) in DIRECTIONS.iter().enumerate() {
         let n = stride(direction.normal());
@@ -262,9 +266,11 @@ fn mesh_padded(pad: &[u32], appearance: &BlockAppearance) -> MeshOutput {
         // only B = A + n moves along the signed normal.
         let n_axis = n.abs();
         // Walk u and v from the block corner where both strides are
-        // positive, so negative-stride axes still cover blocks 0..31.
-        let u_shift = if u < 0 { -31 * u } else { 0 };
-        let v_shift = if v < 0 { -31 * v } else { 0 };
+        // positive, so negative-stride axes still cover blocks
+        // 0..CUBE_SIZE - 1.
+        let last = CUBE_SIZE as isize - 1;
+        let u_shift = if u < 0 { -last * u } else { 0 };
+        let v_shift = if v < 0 { -last * v } else { 0 };
         let corner = ORIGIN as isize + u_shift + v_shift;
 
         // layer-of-kind lookup for this direction (kind = state id + 1).
@@ -279,8 +285,8 @@ fn mesh_padded(pad: &[u32], appearance: &BlockAppearance) -> MeshOutput {
             let b_row = a_row + n;
 
             // Build the mask of face keys for this slice.
-            for vi in 0..32isize {
-                for ui in 0..32isize {
+            for vi in 0..CUBE_SIZE as isize {
+                for ui in 0..CUBE_SIZE as isize {
                     let a = pad[(a_row + ui * u + vi * v) as usize];
                     let b = pad[(b_row + ui * u + vi * v) as usize];
                     let culled = a & (F_AIR << FLAGS_SHIFT) != 0
@@ -293,24 +299,24 @@ fn mesh_padded(pad: &[u32], appearance: &BlockAppearance) -> MeshOutput {
                         let ao = corner_ao(pad, b_row + ui * u + vi * v, u, v);
                         (1 << 31) | (layer << 15) | (ao << 7) | LIGHT
                     };
-                    mask[(vi * 32 + ui) as usize] = key;
+                    mask[(vi * CUBE_SIZE as isize + ui) as usize] = key;
                 }
             }
 
             // Greedy merge: extend along u first, then along v.
-            for v0 in 0..32usize {
-                for u0 in 0..32usize {
-                    let key = mask[v0 * 32 + u0];
+            for v0 in 0..size {
+                for u0 in 0..size {
+                    let key = mask[v0 * size + u0];
                     if key == 0 {
                         continue;
                     }
                     let mut w = 1usize;
-                    while u0 + w < 32 && mask[v0 * 32 + u0 + w] == key {
+                    while u0 + w < size && mask[v0 * size + u0 + w] == key {
                         w += 1;
                     }
                     let mut h = 1usize;
-                    'extend: while v0 + h < 32 {
-                        let row = (v0 + h) * 32;
+                    'extend: while v0 + h < size {
+                        let row = (v0 + h) * size;
                         for ui in u0..u0 + w {
                             if mask[row + ui] != key {
                                 break 'extend;
@@ -320,7 +326,7 @@ fn mesh_padded(pad: &[u32], appearance: &BlockAppearance) -> MeshOutput {
                     }
                     for vv in v0..v0 + h {
                         for uu in u0..u0 + w {
-                            mask[vv * 32 + uu] = 0;
+                            mask[vv * size + uu] = 0;
                         }
                     }
 
@@ -351,6 +357,9 @@ fn mesh_padded(pad: &[u32], appearance: &BlockAppearance) -> MeshOutput {
 
 /// Light is always 15 until lighting exists (task 2.x).
 const LIGHT: u32 = 15;
+
+/// Cells in one u/v slice mask (`CUBE_SIZE²`).
+const MASK_LEN: usize = (CUBE_SIZE as usize) * (CUBE_SIZE as usize);
 
 /// AO of one unit face whose front block sits at padded index `front`,
 /// with face strides `u` and `v`. Returns the four corner values packed
@@ -385,6 +394,7 @@ mod tests {
     use super::*;
     use crate::mesh::face::{Direction, unpack};
     use jbm_core::block::builtin;
+    use jbm_core::coords::CUBE_VOLUME;
 
     fn setup() -> (
         jbm_core::block::BlockRegistry,
@@ -470,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn full_stone_cube_with_air_neighbors_gives_six_32x32_faces() {
+    fn full_stone_cube_with_air_neighbors_gives_six_max_faces() {
         let (_, appearance, blocks) = setup();
         let air = Arc::new(Cube::default());
         let mut input = MeshInput::isolated(Arc::new(Cube::filled(blocks.stone)));
@@ -482,14 +492,17 @@ mod tests {
         for direction in DIRECTIONS {
             let faces = faces_of(&output, direction);
             assert_eq!(faces.len(), 1, "{direction:?}");
-            assert_eq!((faces[0].width, faces[0].height), (32, 32));
+            assert_eq!(
+                (faces[0].width, faces[0].height),
+                (CUBE_SIZE as u32, CUBE_SIZE as u32)
+            );
             // Every face is fully open: AO 3 on all corners.
             assert_eq!(faces[0].ao, [3, 3, 3, 3]);
         }
     }
 
     #[test]
-    fn checkerboard_worst_case_is_16384_times_6_faces() {
+    fn checkerboard_worst_case_is_half_volume_times_6_faces() {
         let (_, appearance, blocks) = setup();
         let cube = Cube::from_fn(|p| {
             if (p.x + p.y + p.z) % 2 == 0 {
@@ -504,9 +517,9 @@ mod tests {
             input.neighbors[i] = Some(Arc::clone(&air));
         }
         let output = mesh(&input, &appearance);
-        assert_eq!(output.face_count(), 16384 * 6);
+        assert_eq!(output.face_count(), CUBE_VOLUME / 2 * 6);
         for direction in DIRECTIONS {
-            assert_eq!(output.ranges[direction as usize].len(), 16384);
+            assert_eq!(output.ranges[direction as usize].len(), CUBE_VOLUME / 2);
         }
     }
 
@@ -516,7 +529,7 @@ mod tests {
         // One floor row: air, glass x1..=4, stone x5..=8, air. Glass and
         // stone touch at x=4 | x=5.
         let cube = Cube::from_fn(|p| {
-            if p.y != 0 || p.z != 16 {
+            if p.y != 0 || p.z != CUBE_SIZE as u8 / 2 {
                 return BlockStateId::AIR;
             }
             match p.x {
@@ -533,7 +546,9 @@ mod tests {
             .filter(|f| f.layer == crate::mesh::appearance::LAYER_STONE as u32)
             .collect();
         assert!(
-            stone_nx.iter().any(|f| f.x == 5 && f.z == 16 && f.y == 0),
+            stone_nx
+                .iter()
+                .any(|f| f.x == 5 && f.z == CUBE_SIZE as u32 / 2 && f.y == 0),
             "stone face toward glass exists, got {stone_nx:?}"
         );
         // Glass shows no face toward the opaque stone...
@@ -606,7 +621,7 @@ mod tests {
         let (_, appearance, blocks) = setup();
         // Center: one stone block at the +X border, air elsewhere.
         let center = Arc::new(Cube::from_fn(|p| {
-            if p.y == 0 && p.z == 0 && p.x == 31 {
+            if p.y == 0 && p.z == 0 && p.x == CUBE_SIZE as u8 - 1 {
                 blocks.stone
             } else {
                 BlockStateId::AIR
@@ -628,7 +643,7 @@ mod tests {
         // No +X face: the neighbor block against ours is opaque.
         assert_eq!(faces_of(&output, Direction::PosX).len(), 0);
         // The +Z face of our border block exists and its corners read the
-        // neighbor: the neighbor stone at (32, 0, 1) world occludes.
+        // neighbor: the neighbor stone at (CUBE_SIZE, 0, 1) world occludes.
         let pos_z = faces_of(&output, Direction::PosZ);
         assert_eq!(pos_z.len(), 1);
         assert!(
@@ -656,7 +671,7 @@ mod tests {
             let clamp = |c: i32| {
                 if c < 0 {
                     -1
-                } else if c > 31 {
+                } else if c >= CUBE_SIZE {
                     1
                 } else {
                     0
@@ -669,15 +684,15 @@ mod tests {
                 input.neighbor(dx, dy, dz)?.as_ref()
             };
             Some(cube.get(jbm_core::coords::LocalPos {
-                x: (x - dx * 32) as u8,
-                y: (y - dy * 32) as u8,
-                z: (z - dz * 32) as u8,
+                x: (x - dx * CUBE_SIZE) as u8,
+                y: (y - dy * CUBE_SIZE) as u8,
+                z: (z - dz * CUBE_SIZE) as u8,
             }))
         };
-        for y in 0..32 {
-            for z in 0..32 {
-                for x in 0..32 {
-                    let a = state_at(x, y, z).expect("center covers 0..31");
+        for y in 0..CUBE_SIZE {
+            for z in 0..CUBE_SIZE {
+                for x in 0..CUBE_SIZE {
+                    let a = state_at(x, y, z).expect("center covers its local range");
                     let app_a = appearance.get(a);
                     if app_a.air {
                         continue;

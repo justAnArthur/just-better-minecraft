@@ -4,23 +4,44 @@ Shared types for the whole engine: coordinates, block states and the block
 registry, paletted cube storage, and the protocol messages the client and
 server exchange.
 
+## The `cube16` feature
+
+`cube16` is a compile-time benchmark feature (task 1.8) that shrinks cubes
+from 32³ to 16³: `CUBE_BITS` becomes 4 and `CUBE_SIZE`, `CUBE_VOLUME` and
+every mask/shift in `coords` derive from it. Everything in this crate and
+in the client mesher derives from those constants, so both compile and their
+unit tests pass at either size. Limits:
+
+- **The server is not supported under `cube16`.** It compiles, but its
+  behavior (streaming radii, terrain assumptions, tests) is only defined at
+  32³. Do not run the game binary or the end-to-end tests with it.
+- CI never enables it. Only the task 1.8 bench
+  (`cargo bench -p jbm-game --bench cube_size`) and example
+  (`cargo run -p jbm-game --release --example cube_size_metrics`) use it,
+  via the passthrough features on `jbm-client` and `jbm-game`.
+- Client goldens and hand-placed scene tests are 32³-only and cfg-gated off.
+- Changing the default cube size is an orchestrator decision, recorded in
+  docs/progress.md; this feature only measures the trade-off.
+
 ## Modules
 
 ### `coords` — positions across the ±2³¹-cube world
 
-- `CUBE_SIZE = 32`, `CUBE_BITS = 5`, `CUBE_VOLUME = 32768`.
+- `CUBE_BITS = 5` (4 under `cube16`), `CUBE_SIZE = 1 << CUBE_BITS`,
+  `CUBE_VOLUME = CUBE_SIZE³`, `CUBE_MASK = CUBE_SIZE - 1`.
 - `CubePos { x, y, z: i32 }` — which cube a block is in; totally ordered by
   `(x, y, z)`.
 - `BlockPos { x, y, z: i64 }` — world block position. `i64` because
-  `i32::MIN * 32` overflows `i32`.
-- `LocalPos` — a block inside a cube, `0..32` on each axis (fields are `u8`).
-  `LocalPos::new -> Option<Self>` validates; `new_unchecked` only
+  `i32::MIN * CUBE_SIZE` overflows `i32`.
+- `LocalPos` — a block inside a cube, `0..CUBE_SIZE` on each axis (fields
+  are `u8`). `LocalPos::new -> Option<Self>` validates; `new_unchecked` only
   debug-asserts.
-- **Index order:** `LocalPos::index() = (y * 32 + z) * 32 + x` — x fastest,
-  then z, then y. Every cube array in the engine uses this order;
-  `LocalPos::from_index` inverts it.
-- Conversions are floor arithmetic (`>> 5` and `& 31` on `i64`), so block -1
-  splits to cube -1, local 31: `BlockPos::split`, `CubePos::block`.
+- **Index order:** `LocalPos::index() = (y * CUBE_SIZE + z) * CUBE_SIZE + x`
+  — x fastest, then z, then y. Every cube array in the engine uses this
+  order; `LocalPos::from_index` inverts it.
+- Conversions are floor arithmetic (`>> CUBE_BITS` and `& CUBE_MASK` on
+  `i64`), so block -1 splits to cube -1, local `CUBE_SIZE - 1`:
+  `BlockPos::split`, `CubePos::block`.
 
 ### `block` — block states and the registry
 
@@ -43,14 +64,14 @@ server exchange.
 
 ### `cube` — paletted, bit-packed storage
 
-- A `Cube` is 32³ block states as a palette (`Vec<BlockStateId>`, unique
-  entries) plus palette indices bit-packed into `Vec<u64>` words.
+- A `Cube` is `CUBE_SIZE³` block states as a palette (`Vec<BlockStateId>`,
+  unique entries) plus palette indices bit-packed into `Vec<u64>` words.
 - **Packing rules:** entries never straddle a word —
   `entries_per_word = 64 / bits` with the tail bits of each word unused;
-  `bits = max(1, ceil(log2(palette_len)))`, at most 15 (a palette can never
-  exceed the 32768 cells). A uniform cube (single palette entry) has **no
-  index array at all**; `bits_per_entry()` is 0 and `heap_bytes()` is a few
-  bytes.
+  `bits = max(1, ceil(log2(palette_len)))`, at most `ceil(log2(CUBE_VOLUME))`
+  (a palette can never exceed the cube's cells). A uniform cube (single
+  palette entry) has **no index array at all**; `bits_per_entry()` is 0 and
+  `heap_bytes()` is a few bytes.
 - **Growth:** setting a state absent from the palette appends it; when the
   palette outgrows the width, all entries repack at the new width. Setting a
   block to the state it already has does not touch the palette. Palette

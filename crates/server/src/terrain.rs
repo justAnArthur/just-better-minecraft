@@ -461,7 +461,8 @@ impl Generator {
         if let Some(map) = self.height_cache.lock().unwrap().get(&(cx, cz)) {
             return Arc::clone(map);
         }
-        let mut map: Box<[i64; 1024]> = Box::new([0; 1024]);
+        let mut map: Box<[i64; (CUBE_SIZE * CUBE_SIZE) as usize]> =
+            Box::new([0; (CUBE_SIZE * CUBE_SIZE) as usize]);
         let base_x = i64::from(cx) * i64::from(CUBE_SIZE);
         let base_z = i64::from(cz) * i64::from(CUBE_SIZE);
         for z in 0..CUBE_SIZE {

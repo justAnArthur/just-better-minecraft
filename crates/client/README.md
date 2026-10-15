@@ -3,6 +3,13 @@
 The player-facing side: renderer, UI, input, audio, and client-side
 prediction. Talks to the server only through `jbm-core` protocol messages.
 
+**Cube size:** all mesher and renderer dimensions derive from
+`jbm_core::coords::CUBE_SIZE`, so the crate compiles and its unit tests
+pass under `jbm-core`'s `cube16` feature (16³ cubes; see jbm-core's
+README). The terrain-scene goldens are hand-placed at 32³-local
+coordinates and cfg-gated off under the crate's own `cube16` passthrough;
+`app.rs` camera-cube math is 32³-only (out of task 1.8's scope).
+
 **Public API**
 
 - `gpu::Gpu` / `gpu::GpuError` — GPU acquisition. `Gpu::headless()` for
@@ -109,10 +116,10 @@ occlude; cutout and air do not.
 
 ### Greedy merge
 
-The mesher first builds a padded 34³ array (center via `Cube::iter()`,
-which is ~3× faster than per-block `get`; neighbor shells via bounded
-loops — uniform neighbors fill, non-uniform use `get_index` on just the
-~1k border cells). Per direction and slice, coplanar faces with identical
+The mesher first builds a padded `(CUBE_SIZE + 2)³` array (center via
+`Cube::iter()`, which is ~3× faster than per-block `get`; neighbor shells
+via bounded loops — uniform neighbors fill, non-uniform use `get_index` on
+just the border cells). Per direction and slice, coplanar faces with identical
 (texture layer, AO pattern, light) merge into maximal rectangles: extend
 along u first, then along v. Faces never span outside the cube. Output is
 grouped by direction (`ranges`) so 2.2 can skip back-facing directions.

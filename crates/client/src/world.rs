@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use glam::DVec3;
-use jbm_core::coords::CubePos;
+use jbm_core::coords::{CUBE_SIZE, CubePos};
 use jbm_core::cube::Cube;
 use jbm_core::protocol::ServerMsg;
 
@@ -175,10 +175,11 @@ impl ClientWorld {
 
 /// World-space center of a cube, for distance ordering.
 fn cube_center(pos: CubePos) -> DVec3 {
+    let size = f64::from(CUBE_SIZE);
     DVec3::new(
-        f64::from(pos.x) * 32.0 + 16.0,
-        f64::from(pos.y) * 32.0 + 16.0,
-        f64::from(pos.z) * 32.0 + 16.0,
+        f64::from(pos.x) * size + size / 2.0,
+        f64::from(pos.y) * size + size / 2.0,
+        f64::from(pos.z) * size + size / 2.0,
     )
 }
 

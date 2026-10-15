@@ -1,23 +1,13 @@
 //! Screenshot tests: 256x256 offscreen renders compared against committed
 //! goldens. Each scene pins its camera so the image is reproducible.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use glam::DVec3;
 use jbm_client::camera::Camera;
-use jbm_client::mesh::appearance::BlockAppearance;
-use jbm_client::mesh::greedy::{self, MeshInput};
-use jbm_client::render::chunks::TerrainPass;
 use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::overlay::OverlayText;
 use jbm_client::render::renderer::{DepthTarget, Renderer};
-use jbm_client::render::texture_array::BlockTextures;
 use jbm_client::render::triangle;
 use jbm_client::testing::screenshot::{assert_matches_golden, gpu_or_skip};
-use jbm_core::block::{BlockRegistry, BlockStateId, builtin};
-use jbm_core::coords::CubePos;
-use jbm_core::cube::Cube;
 
 /// The sky_horizon camera: at (0, 80, 0), yaw 0, pitch `pitch_deg`, fov 70.
 fn sky_camera(pitch_deg: f32) -> Camera {
@@ -82,8 +72,29 @@ fn debug_overlay_matches_golden() {
 
 // ---------------------------------------------------------------------------
 // Terrain scenes: built from Cube::from_fn, meshed synchronously (no pool),
-// uploaded and rendered with pinned cameras.
+// uploaded and rendered with pinned cameras. The scenes place blocks by hand
+// at 32³-local coordinates and the goldens match them, so everything below
+// only runs at the default cube size (16³ would need new scenes + goldens).
+#[cfg(not(feature = "cube16"))]
+use jbm_client::mesh::appearance::BlockAppearance;
+#[cfg(not(feature = "cube16"))]
+use jbm_client::mesh::greedy::{self, MeshInput};
+#[cfg(not(feature = "cube16"))]
+use jbm_client::render::chunks::TerrainPass;
+#[cfg(not(feature = "cube16"))]
+use jbm_client::render::texture_array::BlockTextures;
+#[cfg(not(feature = "cube16"))]
+use jbm_core::block::{BlockRegistry, BlockStateId, builtin};
+#[cfg(not(feature = "cube16"))]
+use jbm_core::coords::CubePos;
+#[cfg(not(feature = "cube16"))]
+use jbm_core::cube::Cube;
+#[cfg(not(feature = "cube16"))]
+use std::collections::HashMap;
+#[cfg(not(feature = "cube16"))]
+use std::sync::Arc;
 
+#[cfg(not(feature = "cube16"))] // 32³-only golden
 fn test_setup() -> (BlockRegistry, BlockAppearance, builtin::Blocks) {
     let mut registry = BlockRegistry::new();
     let blocks = builtin::Blocks::register(&mut registry);
@@ -92,6 +103,7 @@ fn test_setup() -> (BlockRegistry, BlockAppearance, builtin::Blocks) {
 }
 
 /// Renders a scene of cubes against `golden_name`.
+#[cfg(not(feature = "cube16"))] // 32³-only golden
 fn render_scene(golden_name: &str, scene: &[(CubePos, Cube)], camera: &Camera) {
     let Some(gpu) = gpu_or_skip() else {
         return;
@@ -146,6 +158,7 @@ fn render_scene(golden_name: &str, scene: &[(CubePos, Cube)], camera: &Camera) {
 }
 
 /// A camera at `eye` looking at `look_at`.
+#[cfg(not(feature = "cube16"))] // 32³-only golden
 fn looking_at(eye: (f64, f64, f64), look_at: (f64, f64, f64)) -> Camera {
     let eye = DVec3::from(eye);
     let look_at = DVec3::from(look_at);
@@ -161,6 +174,7 @@ fn looking_at(eye: (f64, f64, f64), look_at: (f64, f64, f64)) -> Camera {
 
 /// The mesh_blocks scene: a 12x12 stone floor with one of each builtin
 /// block standing on it in a row. Returns the cube holding it.
+#[cfg(not(feature = "cube16"))] // 32³-only golden
 fn mesh_blocks_scene(blocks: &builtin::Blocks) -> Cube {
     Cube::from_fn(|p| {
         if p.y == 0 && (2..14).contains(&p.x) && (2..14).contains(&p.z) {
@@ -185,6 +199,7 @@ fn mesh_blocks_scene(blocks: &builtin::Blocks) -> Cube {
 }
 
 #[test]
+#[cfg(not(feature = "cube16"))] // 32³-only golden
 fn mesh_blocks_matches_golden() {
     let (_, _, blocks) = test_setup();
     let cube = mesh_blocks_scene(&blocks);
@@ -199,6 +214,7 @@ fn mesh_blocks_matches_golden() {
 
 /// The mesh_ao scene: a stepped pyramid whose inner step corners show AO
 /// darkening. Local to one cube.
+#[cfg(not(feature = "cube16"))] // 32³-only golden
 fn mesh_ao_scene(blocks: &builtin::Blocks) -> Cube {
     Cube::from_fn(|p| {
         let step = p.y as i32;
@@ -218,6 +234,7 @@ fn mesh_ao_scene(blocks: &builtin::Blocks) -> Cube {
 }
 
 #[test]
+#[cfg(not(feature = "cube16"))] // 32³-only golden
 fn mesh_ao_matches_golden() {
     let (_, _, blocks) = test_setup();
     let cube = mesh_ao_scene(&blocks);
@@ -226,6 +243,7 @@ fn mesh_ao_matches_golden() {
 }
 
 #[test]
+#[cfg(not(feature = "cube16"))] // 32³-only golden
 fn mesh_cube_border_matches_golden() {
     let (_, _, blocks) = test_setup();
     // A building crossing the x=32 boundary between cubes (0,0,0) and
@@ -251,6 +269,7 @@ fn mesh_cube_border_matches_golden() {
 }
 
 #[test]
+#[cfg(not(feature = "cube16"))] // 32³-only golden
 fn mesh_far_origin_matches_the_same_golden_as_mesh_ao() {
     let (_, _, blocks) = test_setup();
     let cube = mesh_ao_scene(&blocks);
