@@ -1,6 +1,7 @@
-//! Criterion benches for the terrain generator: a 32×32 heightmap patch, a
-//! cube intersecting the surface, and a cube that hits the all-air fast
-//! path.
+//! Criterion benches for the worldgen graph generator: a 32×32 heightmap
+//! patch, a cube intersecting the surface, a cube that hits the all-air
+//! fast path, the reference (task 1.5) generator those are compared
+//! against, grid sampling at several LOD steps, and compilation.
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use jbm_core::block::BlockRegistry;
@@ -8,6 +9,9 @@ use jbm_core::block::builtin::Blocks;
 use jbm_core::coords::CubePos;
 use jbm_server::DEFAULT_SEED;
 use jbm_server::terrain::Generator;
+use jbm_server::worldgen::reference::ReferenceGenerator;
+use jbm_server::worldgen::{self, GRID_VOLUME, compile};
+use std::hint::black_box;
 
 fn generator() -> Generator {
     let mut registry = BlockRegistry::new();
@@ -15,12 +19,28 @@ fn generator() -> Generator {
     Generator::new(DEFAULT_SEED, blocks)
 }
 
+fn reference_generator() -> ReferenceGenerator {
+    let mut registry = BlockRegistry::new();
+    let blocks = Blocks::register(&mut registry);
+    ReferenceGenerator::new(DEFAULT_SEED, blocks)
+}
+
+/// A cube position whose column intersects the surface near the origin.
+fn surface_pos(generator: &Generator) -> CubePos {
+    let h = generator.surface_height(0, 0);
+    CubePos {
+        x: 0,
+        y: (h >> 5) as i32,
+        z: 0,
+    }
+}
+
 fn bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("worldgen");
 
     group.bench_function("heightmap_32x32", |b| {
         let generator = generator();
-        // surface_height bypasses the height cache, so this measures
+        // surface_height bypasses the column cache, so this measures
         // computing a 32×32 patch of surface heights from scratch.
         b.iter(|| {
             let mut min = i64::MAX;
@@ -37,23 +57,58 @@ fn bench(c: &mut Criterion) {
     group.bench_function("surface_cube", |b| {
         let generator = generator();
         // A cube whose column intersects the surface near the origin: the
-        // mixed-path cost, heightmap cached after the first iteration.
-        let h = generator.surface_height(0, 0);
-        let pos = CubePos {
-            x: 0,
-            y: (h >> 5) as i32,
-            z: 0,
-        };
-        b.iter(|| generator.generate(pos))
+        // mixed-path cost, column stage cached after the first iteration.
+        let pos = surface_pos(&generator);
+        b.iter(|| generator.generate(black_box(pos)))
     });
 
     group.bench_function("air_cube", |b| {
         let generator = generator();
         // Far above every possible surface: the uniform-air fast path.
         let pos = CubePos { x: 0, y: 100, z: 0 };
-        b.iter(|| generator.generate(pos))
+        b.iter(|| generator.generate(black_box(pos)))
     });
 
+    group.bench_function("reference_surface_cube", |b| {
+        let generator = reference_generator();
+        // The task 1.5 generator on the same cube: the baseline the graph
+        // path must stay within 2× of (task 2.1 spec).
+        let h = generator.surface_height(0, 0);
+        let pos = CubePos {
+            x: 0,
+            y: (h >> 5) as i32,
+            z: 0,
+        };
+        b.iter(|| generator.generate(black_box(pos)))
+    });
+
+    group.bench_function("compile_overworld", |b| {
+        b.iter(|| {
+            let graph = worldgen::Graph::from_json(worldgen::OVERWORLD_JSON).unwrap();
+            compile(&graph).unwrap()
+        })
+    });
+
+    group.finish();
+
+    let mut group = c.benchmark_group("worldgen/sample_grid");
+    // One 32³ grid near the surface per step. Step 32 spans 1,024 blocks,
+    // so every column is a cache miss — the worst case.
+    for step in [1u32, 2, 4, 8, 32] {
+        group.bench_function(format!("{step}"), |b| {
+            let graph = worldgen::overworld();
+            let bottom = (generator().surface_height(0, 0) >> 5) * 32;
+            let mut out = Box::new([0.0; GRID_VOLUME]);
+            b.iter(|| {
+                graph.sample_grid(
+                    DEFAULT_SEED,
+                    black_box([0, bottom, 0]),
+                    black_box(step),
+                    &mut out,
+                )
+            })
+        });
+    }
     group.finish();
 }
 
