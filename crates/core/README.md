@@ -118,6 +118,58 @@ so decode validates them and keeps them as the cube's data (re-packing via
 32³ including zstd (`storage/decode_surface_cube`); encode is ≈ 9 µs. Round trips are exact for uniform, two-state, full-palette and
 random cubes.
 
+### `lod` — the downsampling rule and octant helpers (task 2.4)
+
+Pure logic: no I/O, no registry data. A level-*n+1* cell covers a 2×2×2
+group of level-*n* "children", indexed `c = dx + 2·dz + 4·dy` — the same
+axis order as `LocalPos::index`.
+
+**The rule** (`downsample_cell(children: [BlockStateId; 8]) -> BlockStateId`):
+
+- **Occupancy:** a child is *filled* when it is not air (water and every
+  other non-air state count; block properties are never consulted). The
+  cell is filled when **at least 2 of 8** children are filled, else air.
+  A one-block wall (4 of 8) and a 1×1 pillar (2 of 8) survive every
+  level; a single floating block vanishes at LOD1 — expected behavior.
+  The rule leans solid: surfaces can rise by up to 2ⁿ − 1 blocks and
+  tunnels narrower than 2ⁿ can close (skirts, 2.6, hide the first; the
+  second is invisible from LOD distance).
+- **Material**, for a filled cell, is "what you see from above": the
+  candidates are the topmost filled child of each of the four `(dx, dz)`
+  columns of the group; pick the most common candidate, ties going to
+  the state at the highest `dy`, then to the smallest `BlockStateId`.
+
+Worked examples: (1) dirt below and grass above — a one-step slope or
+flat ground aligned either way — gives one grass candidate per column,
+so the cell is grass; even with one column's grass sitting above the
+group (dirt at both its `dy`), grass wins the vote 3 to 1. (2) A planks
+wall one block thick beside stone ground: the wall's columns nominate
+planks at the higher `dy`, the ground's nominate stone lower, so the
+count tie goes to planks — a wall keeps its own material.
+
+The rule looks only at the eight children, never at neighbours, so one
+edit changes at most one cell per level — that locality is what makes
+edit propagation exact. A later refinement may use registry data but
+must stay local.
+
+**Octants:** a child cube fills one octant (`CUBE_SIZE/2` cube of cells)
+of its parent. `parent(pos) -> (CubePos, u8)` gives the parent position
+(`div_euclid(2)` per axis, so negative coordinates nest exactly) and the
+octant index (`dx + 2·dz + 4·dy` over `rem_euclid(2)` per axis);
+`octant_offset(octant) -> [u8; 3]` inverts the octant half.
+
+**Region API:** `CellBox { min, max: [u8; 3] }` (inclusive min, exclusive
+max) with `single(LocalPos)` and `union`. `downsample_region(child,
+parent, octant, region) -> Option<CellBox>` recomputes every parent cell
+whose group overlaps `region` (a box of child cells) and returns the box
+of parent cells that actually changed — the next level's input, so
+propagation stays proportional to what changed; `None` means no change.
+`downsample_octant(child, parent, octant)` is the whole-cube case with
+fast paths: a uniform child fills its octant with its own state, and a
+parent already uniform and equal to that fill is never unpacked. Both
+call `Cube::compact` after a write, so a parent that went uniform again
+returns to its cheapest storage (that cost is in the `lod/*` benches).
+
 ### `physics` — the one shared player step (task 1.6)
 
 Units are blocks and seconds, f64. The step is fixed:
@@ -240,8 +292,9 @@ To add a case, add a function to `benches/core_bench.rs` inside a
 reports read `<area>/<case>` (e.g. `sample/fill_32cubed`, `cube/get_all_16_states`).
 Current cases include `physics/step_walk_flat` (median ≈ 12 ns on this
 Mac against a trivial flat-floor world) and `physics/step_fall_terminal`
-(≈ 13 ns, fall at terminal speed over loaded air), and
-`raycast/reach_5_diagonal` (≈ 58 ns).
+(≈ 13 ns, fall at terminal speed over loaded air),
+`raycast/reach_5_diagonal` (≈ 58 ns), and the task 2.4 LOD cases
+`lod/downsample_octant/{surface,uniform}` and `lod/edit_cell`.
 `criterion` is a dev-dependency via `[workspace.dependencies]` only — never a
 runtime dep.
 

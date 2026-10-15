@@ -251,6 +251,7 @@ one tick, `update(elapsed) -> u32` feeds the clock and runs every due tick. Read
 | `max_in_flight: usize` | 512 | queued + generating + uncollected |
 | `world_dir: Option<PathBuf>` | `None` | persistence; `None` = today's behavior |
 | `save_interval: Duration` | 5 s | snapshot cadence for the save thread |
+| `lod_levels: u8` | 4 | top LOD level kept; 0 disables the pyramid |
 
 `ServerConfig::protocol_only()` turns streaming off with no generation
 threads — what exact-message-sequence tests and benches use.
@@ -356,6 +357,52 @@ never stale. Test reads: `pinned_count()`, `block(pos)`.
 **Disconnect:** the player's sent-set is freed and its cubes are evicted
 on the next tick unless another player keeps them.
 
+## LOD pyramid (`lod`, task 2.4)
+
+`LodPyramid` keeps levels `1..=lod_levels`, each a map of `LodCube { cube:
+Cube, known: u8 }`, built from the real world by the core's
+`jbm_core::lod` downsampling rule. A level-*n* cube covers the same
+volume as a 2×2×2 group of level-(*n*−1) cubes; nothing is streamed or
+rendered yet (2.6), and LOD from worldgen sampling is 2.7.
+
+- **`known`** is an octant bitmask: bit *o* is set once that octant's
+  child has been downsampled into the cube at least once. Octants never
+  written read as air, so `known` says which octants hold real data and
+  **nothing else may be assumed about the unknown ones** — their air is
+  placeholder, not measured emptiness. An inserted cube marks its whole
+  ancestor chain known; a partially known child propagates its
+  placeholder air for its own unknown octants (a deliberate
+  simplification for 2.7 to revisit).
+- **Ingest:** `insert_lod0(pos, &Cube) -> LodChanges` downsamples a cube
+  entering the world into its level-1 parent (created as uniform air if
+  absent) and propagates the changed region up until a level reports no
+  change. The server calls it in the streaming pass only when
+  `entry().or_insert` actually inserts — a stale generated copy dropped
+  because an edited cube is present never touches the pyramid.
+- **Edits:** `edit_lod0(BlockPos, &Cube) -> LodChanges` recomputes the
+  one affected cell per level (`downsample_region` on a single cell) and
+  stops at the first unchanged level. The server calls it from
+  `apply_edit` after setting the block.
+- **`LodChanges`** lists the `(level, CubePos)` cubes whose content
+  changed, in level order — 2.6 will stream exactly these.
+- **Eviction never touches the pyramid.** LOD cubes outlive their LOD0
+  children, so player builds stay visible from far away; re-inserting a
+  regenerated or reloaded cube reports no changes. The cost: the pyramid
+  grows with the explored area until 2.6 (clipmap rings) and 2.7 (stored
+  LOD) give it bounds.
+- `LodPyramid::rebuild(max_levels, lod0)` rebuilds every level bottom-up
+  from scratch — the reference the incremental paths are tested against
+  (they must match cell for cell and `known` for `known`). Accessors:
+  `get(level, pos)`, `len(level)`, `total_cubes()`, `heap_bytes()`.
+
+`lod_levels: u8` (default 4 = LOD1–LOD4) tops the pyramid; **0 disables
+it entirely** — no allocation, no per-cube or per-edit work
+(`protocol_only()` uses 0). `insert_lod0` runs on the tick thread for
+every collected cube; its cost is bounded by the `lod/insert_lod0/*`
+and `lod/edit` benches in `benches/lod_bench.rs`. Server read accessors:
+`lod_cube(level, pos)`, `lod_known(level, pos)`, `lod_cube_count()`,
+`lod_heap_bytes()`.
+
 ## Run loop (`run`)
 
 `run::spawn(Server) -> ServerHandle` starts one thread named
@@ -421,6 +468,10 @@ Current cases:
   surface cube's record is 199 bytes against 8.2 kB of heap storage (air
   and uniform-stone records are 18 bytes), and one flush-sized commit of
   1,000 cubes takes ≈ 24 ms.
+- `lod/insert_lod0/{surface,air}` (task 2.4, `lod_bench.rs`) — a
+  generated surface cube (mixed, asserted) or an air cube inserted into
+  an existing 4-level pyramid.
+- `lod/edit` — one edit propagated through all levels.
 
 **Invariants**
 

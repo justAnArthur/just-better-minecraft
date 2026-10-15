@@ -22,6 +22,10 @@ criterion.workspace = true
 tempfile.workspace = true
 
 [[bench]]
+name = "lod_bench"
+harness = false
+
+[[bench]]
 name = "tick_bench"
 harness = false
 
