@@ -125,9 +125,12 @@ fn main() {
         format!("R={r} V={v} -> {messages} CubeData"),
     );
 
-    // GPU: every region mesh uploaded, one offscreen frame from above the
-    // region center looking down 45 degrees, timed as the mean of 50 frames
-    // each followed by a device poll wait.
+    // GPU: every region mesh uploaded into paged face storage, then one
+    // offscreen frame from above the region center looking down 45 degrees
+    // per draw path (MDI and the forced fallback), each timed as the mean
+    // of 50 frames followed by a device poll wait. The draw-call row next
+    // to "non-empty meshes (draw calls)" above shows the drop from one
+    // draw per non-empty cube to one per page.
     let Some(gpu) = gpu_or_skip() else {
         println!("GPU: none");
         return;
@@ -158,9 +161,13 @@ fn main() {
     camera.set_pitch(pitch);
 
     let view = target.create_view();
-    let mut total = std::time::Duration::ZERO;
-    for _ in 0..FRAMES {
-        let start = Instant::now();
+    let hw_mdi = terrain.uses_mdi();
+    for (path, force_fallback) in [("mdi", false), ("fallback", true)] {
+        if path == "mdi" && !hw_mdi {
+            row("GPU mdi path", "unavailable on this adapter");
+            continue;
+        }
+        terrain.set_force_fallback(force_fallback);
         renderer.render(
             &gpu,
             &view,
@@ -176,11 +183,43 @@ fn main() {
                 timeout: None,
             })
             .expect("device poll failed");
-        total += start.elapsed();
+        let stats = terrain.stats();
+        row(
+            &format!("GPU {path} draws / commands"),
+            format!("{} / {}", stats.draw_calls, stats.commands),
+        );
+        row(
+            &format!("GPU {path} faces drawn (of {total_faces})"),
+            stats.faces,
+        );
+        row(
+            &format!("GPU {path} pages / page bytes"),
+            format!("{} / {}", stats.pages, stats.page_bytes),
+        );
+        let mut total = std::time::Duration::ZERO;
+        for _ in 0..FRAMES {
+            let start = Instant::now();
+            renderer.render(
+                &gpu,
+                &view,
+                depth.view(),
+                &camera,
+                None,
+                Some(&mut terrain),
+                None,
+            );
+            gpu.device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                })
+                .expect("device poll failed");
+            total += start.elapsed();
+        }
+        let mean_ms = total.as_secs_f64() * 1000.0 / FRAMES as f64;
+        row(
+            &format!("GPU {path} frame {WIDTH}x{HEIGHT}, {FRAMES} mean"),
+            format!("{mean_ms:.3} ms"),
+        );
     }
-    let mean_ms = total.as_secs_f64() * 1000.0 / FRAMES as f64;
-    row(
-        &format!("GPU frame {WIDTH}x720, 50 mean"),
-        format!("{mean_ms:.3} ms"),
-    );
 }
