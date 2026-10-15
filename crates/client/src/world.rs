@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use glam::DVec3;
-use jbm_core::block::{BlockRegistry, BlockStateId, builtin};
+use jbm_core::block::{BlockRegistry, builtin};
 use jbm_core::coords::{BlockPos, CUBE_SIZE, CubePos};
 use jbm_core::cube::Cube;
 use jbm_core::physics::{BlockShapes, SolidTable};
@@ -199,7 +199,7 @@ impl ClientWorld {
             return;
         };
         let mut replacement = cube.as_ref().clone();
-        replacement.set(local, BlockStateId::AIR);
+        replacement.set(local, jbm_core::block::BlockStateId::AIR);
         self.cubes.insert(cube_pos, Arc::new(replacement));
         self.mark_dirty(cube_pos);
     }
