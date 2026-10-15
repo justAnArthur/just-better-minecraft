@@ -1,11 +1,17 @@
-//! Fly-camera input: a winit-independent key set plus accumulated mouse
-//! motion, and the controller that turns them into camera motion.
+//! Input: a winit-independent key set, accumulated mouse motion, and the
+//! mapping from held keys onto the physics [`MoveInput`]. Mouse look is
+//! applied per frame; movement is sampled per simulation tick.
 
 use std::cell::Cell;
 
-use glam::{DVec3, Vec2};
+use glam::Vec2;
+
+use jbm_core::physics::MoveInput;
 
 use crate::camera::Camera;
+
+/// Mouse sensitivity in radians per pixel.
+pub const MOUSE_SENSITIVITY: f32 = 0.002;
 
 /// A movement input, decoupled from winit types so the logic stays
 /// unit-testable. The app layer maps physical keys onto these.
@@ -28,12 +34,13 @@ impl Key {
 
 /// Held movement keys and accumulated, not-yet-consumed mouse motion.
 ///
-/// Mouse deltas live in a `Cell` so [`FlyController::update`] can consume
-/// them through a shared reference, matching the app's event flow.
+/// Mouse deltas and the fly-toggle edge live in `Cell`s so the app's event
+/// flow can set them through a shared reference.
 #[derive(Debug, Default)]
 pub struct InputState {
     keys: u8,
     mouse_delta: Cell<Vec2>,
+    fly_toggle: Cell<bool>,
 }
 
 impl InputState {
@@ -70,140 +77,97 @@ impl InputState {
         self.mouse_delta.set(Vec2::ZERO);
         delta
     }
-}
 
-/// Fly movement tuning: speed in blocks per second, a sprint multiplier
-/// and mouse sensitivity in radians per pixel.
-#[derive(Debug, Clone, Copy)]
-pub struct FlyController {
-    pub speed: f64,
-    pub sprint_multiplier: f32,
-    pub sensitivity: f32,
-}
+    /// Records one F press (one edge per press).
+    pub fn press_fly_toggle(&self) {
+        self.fly_toggle.set(true);
+    }
 
-impl Default for FlyController {
-    fn default() -> Self {
-        FlyController {
-            speed: 20.0,
-            sprint_multiplier: 4.0,
-            sensitivity: 0.002,
-        }
+    /// Returns whether F was pressed since the last call, clearing the
+    /// edge. Consumed by the next simulation tick.
+    pub fn take_fly_toggle(&self) -> bool {
+        let pressed = self.fly_toggle.get();
+        self.fly_toggle.set(false);
+        pressed
     }
 }
 
-impl FlyController {
-    /// Applies look and movement for one frame of `dt` seconds.
-    ///
-    /// Horizontal movement follows yaw only; Up/Down move along world Y;
-    /// the combined direction is normalized so diagonals are not faster.
-    /// Mouse deltas in `input` are consumed.
-    pub fn update(&self, camera: &mut Camera, input: &InputState, dt: f32) {
-        let delta = input.take_mouse_delta();
-        camera.set_yaw(camera.yaw + delta.x * self.sensitivity);
-        camera.set_pitch(camera.pitch - delta.y * self.sensitivity);
+/// Applies pending mouse motion to the camera's yaw and pitch. Called once
+/// per frame; the delta is consumed.
+pub fn apply_mouse_look(camera: &mut Camera, input: &InputState) {
+    let delta = input.take_mouse_delta();
+    camera.set_yaw(camera.yaw + delta.x * MOUSE_SENSITIVITY);
+    camera.set_pitch(camera.pitch - delta.y * MOUSE_SENSITIVITY);
+}
 
-        let yaw = camera.yaw as f64;
-        let forward = DVec3::new(yaw.sin(), 0.0, -yaw.cos());
-        let right = DVec3::new(yaw.cos(), 0.0, yaw.sin());
-
-        let mut move_dir = DVec3::ZERO;
-        if input.is_held(Key::Forward) {
-            move_dir += forward;
-        }
-        if input.is_held(Key::Back) {
-            move_dir -= forward;
-        }
-        if input.is_held(Key::Right) {
-            move_dir += right;
-        }
-        if input.is_held(Key::Left) {
-            move_dir -= right;
-        }
-        if input.is_held(Key::Up) {
-            move_dir.y += 1.0;
-        }
-        if input.is_held(Key::Down) {
-            move_dir.y -= 1.0;
-        }
-        if move_dir != DVec3::ZERO {
-            move_dir = move_dir.normalize();
-        }
-        let speed = self.speed
-            * if input.is_held(Key::Sprint) {
-                f64::from(self.sprint_multiplier)
-            } else {
-                1.0
-            };
-        camera.position += move_dir * speed * f64::from(dt);
+/// Builds the tick's [`MoveInput`] from held keys, the camera yaw and an
+/// F-press edge: WASD move, Space jumps (walk) or flies up, Shift flies
+/// down, Ctrl sprints.
+pub fn move_input(state: &InputState, yaw: f32, fly_toggle: bool) -> MoveInput {
+    let axis = |plus: Key, minus: Key| state.is_held(plus) as i8 - state.is_held(minus) as i8;
+    MoveInput {
+        forward: axis(Key::Forward, Key::Back),
+        strafe: axis(Key::Right, Key::Left),
+        up: axis(Key::Up, Key::Down),
+        jump: state.is_held(Key::Up),
+        sprint: state.is_held(Key::Sprint),
+        fly_toggle,
+        yaw,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn controller() -> FlyController {
-        FlyController {
-            speed: 10.0,
-            sprint_multiplier: 4.0,
-            sensitivity: 0.1,
-        }
-    }
+    use glam::DVec3;
 
     #[test]
-    fn forward_one_second_moves_speed_toward_negative_z() {
-        let mut camera = Camera::new(DVec3::ZERO, 70.0_f32.to_radians(), 1.0);
+    fn keys_map_onto_move_input_axes() {
         let mut input = InputState::new();
         input.set_key(Key::Forward, true);
-        controller().update(&mut camera, &input, 1.0);
-        assert!(
-            (camera.position.z + 10.0).abs() < 1e-6,
-            "{:?}",
-            camera.position
-        );
-        assert!(camera.position.x.abs() < 1e-6);
-        assert!(camera.position.y.abs() < 1e-6);
+        input.set_key(Key::Left, true);
+        input.set_key(Key::Sprint, true);
+        let m = move_input(&input, 0.25, false);
+        assert_eq!(m.forward, 1);
+        assert_eq!(m.strafe, -1);
+        assert_eq!(m.up, 0);
+        assert!(!m.jump);
+        assert!(m.sprint);
+        assert!(!m.fly_toggle);
+        assert_eq!(m.yaw, 0.25);
     }
 
     #[test]
-    fn diagonal_movement_keeps_the_same_speed() {
-        let mut camera = Camera::new(DVec3::ZERO, 70.0_f32.to_radians(), 1.0);
-        let mut input = InputState::new();
-        input.set_key(Key::Forward, true);
-        input.set_key(Key::Right, true);
-        controller().update(&mut camera, &input, 1.0);
-        assert!(
-            (camera.position.length() - 10.0).abs() < 1e-6,
-            "{:?}",
-            camera.position
-        );
-        let d = (45.0_f64).to_radians();
-        assert!((camera.position.x - 10.0 * d.sin()).abs() < 1e-6);
-        assert!((camera.position.z + 10.0 * d.cos()).abs() < 1e-6);
-    }
-
-    #[test]
-    fn up_moves_along_world_y() {
-        let mut camera = Camera::new(DVec3::ZERO, 70.0_f32.to_radians(), 1.0);
-        camera.set_yaw(90.0_f32.to_radians());
+    fn space_and_shift_drive_the_vertical_axis_and_jump() {
         let mut input = InputState::new();
         input.set_key(Key::Up, true);
-        controller().update(&mut camera, &input, 1.0);
-        assert!((camera.position.y - 10.0).abs() < 1e-6);
-        assert!(camera.position.x.abs() < 1e-6 && camera.position.z.abs() < 1e-6);
+        assert_eq!(move_input(&input, 0.0, false).up, 1);
+        assert!(move_input(&input, 0.0, false).jump);
+
+        input.set_key(Key::Up, false);
+        input.set_key(Key::Down, true);
+        let m = move_input(&input, 0.0, false);
+        assert_eq!(m.up, -1);
+        assert!(!m.jump, "jump follows Space only");
     }
 
     #[test]
-    fn sprint_multiplies_speed() {
-        let mut camera = Camera::new(DVec3::ZERO, 70.0_f32.to_radians(), 1.0);
+    fn opposing_keys_cancel() {
         let mut input = InputState::new();
         input.set_key(Key::Forward, true);
-        input.set_key(Key::Sprint, true);
-        controller().update(&mut camera, &input, 1.0);
+        input.set_key(Key::Back, true);
+        assert_eq!(move_input(&input, 0.0, false).forward, 0);
+    }
+
+    #[test]
+    fn fly_toggle_edge_is_consumed_once() {
+        let input = InputState::new();
+        input.press_fly_toggle();
+        input.press_fly_toggle();
+        assert!(move_input(&input, 0.0, input.take_fly_toggle()).fly_toggle);
         assert!(
-            (camera.position.z + 40.0).abs() < 1e-6,
-            "{:?}",
-            camera.position
+            !input.take_fly_toggle(),
+            "two presses before one tick still toggle once"
         );
     }
 
@@ -212,11 +176,11 @@ mod tests {
         let mut camera = Camera::new(DVec3::ZERO, 70.0_f32.to_radians(), 1.0);
         let input = InputState::new();
         input.accumulate_mouse(Vec2::new(5.0, 0.0));
-        controller().update(&mut camera, &input, 0.0);
-        assert!((camera.yaw - 0.5).abs() < 1e-6, "yaw: {}", camera.yaw);
+        apply_mouse_look(&mut camera, &input);
+        assert!((camera.yaw - 5.0 * MOUSE_SENSITIVITY).abs() < 1e-6);
         // The delta was consumed: a second update with no motion changes nothing.
         let yaw = camera.yaw;
-        controller().update(&mut camera, &input, 0.0);
+        apply_mouse_look(&mut camera, &input);
         assert_eq!(camera.yaw, yaw);
     }
 
@@ -225,7 +189,11 @@ mod tests {
         let mut camera = Camera::new(DVec3::ZERO, 70.0_f32.to_radians(), 1.0);
         let input = InputState::new();
         input.accumulate_mouse(Vec2::new(0.0, -2.0));
-        controller().update(&mut camera, &input, 0.0);
-        assert!((camera.pitch - 0.2).abs() < 1e-6, "pitch: {}", camera.pitch);
+        apply_mouse_look(&mut camera, &input);
+        assert!(
+            (camera.pitch - 2.0 * MOUSE_SENSITIVITY).abs() < 1e-6,
+            "pitch: {}",
+            camera.pitch
+        );
     }
 }

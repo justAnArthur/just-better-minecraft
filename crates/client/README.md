@@ -11,8 +11,10 @@ prediction. Talks to the server only through `jbm-core` protocol messages.
 - `camera::Camera` — f64 position, yaw/pitch (pitch clamped to ±89°),
   reverse-Z infinite-far projection, camera-relative `view_proj()` and
   `relative()`.
-- `input::InputState` / `input::FlyController` — winit-independent key
-  set + mouse delta accumulation, and the fly movement that consumes them.
+- `input::InputState` — winit-independent key set, mouse delta
+  accumulation and the F-key fly-toggle edge; `input::move_input` maps
+  held keys onto the physics `MoveInput`, `input::apply_mouse_look`
+  applies the per-frame look.
 - `mesh::appearance` — the flat per-state appearance table plus the
   procedural builtin 16×16 placeholder textures (`builtin_textures`).
 - `mesh::face` — the 8-byte `PackedFace` format (see below).
@@ -35,6 +37,8 @@ prediction. Talks to the server only through `jbm-core` protocol messages.
 - `render::offscreen::OffscreenTarget` — an `Rgba8UnormSrgb` render
   target with `read_rgba(&Gpu) -> image::RgbaImage` readback.
 - `render::triangle` — the minimal test pipeline.
+- `predict::Predictor` — client-side prediction of the shared physics
+  (see below).
 - `app::run(link)` — opens the window and runs the frame loop against a
   server link.
 - `testing::screenshot` (only with `--features testing` or in unit tests)
@@ -172,13 +176,46 @@ shading (top 1.0, ±Z 0.8, ±X 0.6, bottom 0.5) times the AO factor
 ### App runtime
 
 `app::run(link)` sends `Hello`, then polls the link every frame without
-blocking. `Welcome` moves the camera to the spawn point; `Rejected`,
-`Disconnected` or a closed link print the reason to stderr and exit the
-loop cleanly. Each frame drains the link into `ClientWorld`, submits
-dirty cubes, receives and uploads meshes within the budgets above, and
-sends `PlayerInput` at most 20×/s. The overlay adds
-`CUBES <loaded> MESHED <n> PENDING <dirty + in flight>` and
-`FACES <total> DRAWS <n>`.
+blocking. `Welcome` creates the `Predictor` at the spawn feet position
+(the sim does not run before it); `Rejected`, `Disconnected` or a closed
+link print the reason to stderr and exit the loop cleanly. Each frame
+applies mouse look, runs a fixed 20 Hz sim clock with an accumulator (at
+most 5 catch-up ticks per frame; the leftover accumulator is dropped so a
+stall never spirals), sets the camera position to
+`predictor.render_position(alpha)` where `alpha` is the accumulator
+fraction, drains the link into `ClientWorld` and the `Predictor`
+(`PlayerState` → `on_server_state`), submits dirty cubes, receives and
+uploads meshes within the budgets above. The overlay adds
+`CUBES <loaded> MESHED <n> PENDING <dirty + in flight>`,
+`FACES <total> DRAWS <n>`, and the prediction lines
+`MODE <WALK/FLY> GROUND <YES/NO>`, `VEL <x y z>` and
+`PENDING <n> CORRECTIONS <n>`.
+
+## Prediction (task 1.6)
+
+`predict::Predictor` runs the shared `jbm_core::physics::step` ahead of
+the server:
+
+- **Tick:** each sim tick steps the prediction, stores the input with
+  its seq (starting at 1) and returns the `PlayerInput` to send. Pending
+  (unacknowledged) inputs are capped at 128; past that the oldest is
+  dropped and counted — the server's next state resynchronizes anyway.
+- **Correction:** `on_server_state(ack_seq, state)` drops pending inputs
+  with seq ≤ ack, re-simulates from the authoritative state through the
+  remaining pending inputs **in seq order**, and counts a correction when
+  the replay differs from the prediction (exact `PartialEq`). The
+  replayed state wins; corrections **snap** — the render interpolation's
+  previous state jumps too. Smoothing the snap is a later task.
+- **Interpolation:** `render_position(alpha)` returns the eye position
+  lerped between the previous and current tick states, so rendering at
+  any frame rate stays smooth between 20 Hz sim ticks.
+
+The client's `ClientWorld` implements `jbm_core::physics::BlockShapes`
+(its `SolidTable` is built from the builtin registry in `new`), so
+prediction collides against exactly the cubes the server sent — the
+unloaded rule freezes both sides identically at streaming edges. End-to
+end convergence (and the client-world-lies correction path) is proven by
+`crates/game/tests/prediction.rs`.
 
 ### Reverse-Z rendering
 
@@ -227,8 +264,10 @@ Above the horizon the color rises from horizon pale to zenith blue with
 | Input | Action |
 | --- | --- |
 | W / A / S / D | Move (yaw-plane) |
-| Space / Shift | Move up / down (world Y) |
-| Ctrl | Sprint (×4) |
+| Space | Jump (walk) / fly up |
+| Shift | Fly down |
+| Ctrl | Sprint (walk 5.6, fly 22 blocks/s) |
+| F | Toggle fly (one edge per press) |
 | Mouse | Look (while cursor grabbed) |
 | Left click | Grab + hide cursor (Locked, falls back to Confined) |
 | Esc | Release cursor; a second Esc quits |

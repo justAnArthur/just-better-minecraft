@@ -12,10 +12,11 @@
 
 use crate::coords::CubePos;
 use crate::cube::Cube;
+use crate::physics::{MoveInput, PlayerState};
 
 /// Version of the client/server protocol. A `Hello` carrying any other
 /// version is rejected.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Identifies a joined player inside one server. Ids start at 1 and count up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -27,12 +28,12 @@ pub enum ClientMsg {
     /// First message on a fresh connection. A matching
     /// [`PROTOCOL_VERSION`] joins the player; anything else is rejected.
     Hello { protocol_version: u32, name: String },
-    /// The client's latest movement state. Placeholder shape; task 1.6
-    /// replaces it with real movement input.
+    /// One tick of movement input. `seq` starts at 1 and increments by 1
+    /// per client tick; the server ignores seqs it has already processed.
+    /// Pitch is display-only (and later use); physics ignores it.
     PlayerInput {
-        client_tick: u64,
-        position: [f64; 3],
-        yaw: f32,
+        seq: u64,
+        input: MoveInput,
         pitch: f32,
     },
     /// Round-trip latency probe; answered by [`ServerMsg::Pong`].
@@ -49,9 +50,14 @@ pub enum ServerMsg {
         player_id: PlayerId,
         server_tick: u64,
         tick_rate: u32,
-        /// Where the player starts, in world block coordinates.
+        /// The spawn position: the player's feet and initial state —
+        /// velocity 0, not on ground, walking.
         spawn: [f64; 3],
     },
+    /// The authoritative player state after the server processed input
+    /// `ack_seq`. Sent in phase 5 before `Tick`, only in ticks where at
+    /// least one input was processed.
+    PlayerState { ack_seq: u64, state: PlayerState },
     /// A `Hello` was refused; the connection is dropped right after.
     Rejected { reason: String },
     /// Sent to every joined player at the end of each tick.

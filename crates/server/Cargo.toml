@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 jbm-core.workspace = true
+glam.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

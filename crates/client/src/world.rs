@@ -6,8 +6,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use glam::DVec3;
-use jbm_core::coords::CubePos;
+use jbm_core::block::{BlockRegistry, BlockStateId, builtin};
+use jbm_core::coords::{BlockPos, CubePos};
 use jbm_core::cube::Cube;
+use jbm_core::physics::{BlockShapes, SolidTable};
 use jbm_core::protocol::ServerMsg;
 
 use crate::mesh::greedy::{MeshInput, neighbor_index};
@@ -40,6 +42,9 @@ pub struct ClientWorld {
     versions: HashMap<CubePos, u32>,
     dirty: HashSet<CubePos>,
     next_version: u32,
+    /// Per-state solidity for collision; `new` builds the builtin table so
+    /// plain construction stays usable in tests.
+    solid: SolidTable,
 }
 
 impl Default for ClientWorld {
@@ -48,13 +53,25 @@ impl Default for ClientWorld {
     }
 }
 
+impl BlockShapes for ClientWorld {
+    fn solid(&self, pos: BlockPos) -> Option<bool> {
+        let (cube_pos, local) = pos.split();
+        self.cubes
+            .get(&cube_pos)
+            .map(|cube| self.solid.is_solid(cube.get(local)))
+    }
+}
+
 impl ClientWorld {
     pub fn new() -> ClientWorld {
+        let mut registry = BlockRegistry::new();
+        builtin::register(&mut registry);
         ClientWorld {
             cubes: HashMap::new(),
             versions: HashMap::new(),
             dirty: HashSet::new(),
             next_version: 0,
+            solid: SolidTable::new(&registry),
         }
     }
 
@@ -170,6 +187,21 @@ impl ClientWorld {
 
     pub fn cube(&self, pos: CubePos) -> Option<&Arc<Cube>> {
         self.cubes.get(&pos)
+    }
+
+    /// Test hook: removes a single block from the client's copy of the
+    /// world only — the server never learns of it. Prediction tests use it
+    /// to make the client's collision world disagree with the server's.
+    #[cfg(feature = "testing")]
+    pub fn remove_block(&mut self, pos: BlockPos) {
+        let (cube_pos, local) = pos.split();
+        let Some(cube) = self.cubes.get(&cube_pos) else {
+            return;
+        };
+        let mut replacement = cube.as_ref().clone();
+        replacement.set(local, BlockStateId::AIR);
+        self.cubes.insert(cube_pos, Arc::new(replacement));
+        self.mark_dirty(cube_pos);
     }
 }
 
@@ -341,5 +373,46 @@ mod tests {
             WorldChange::None
         );
         assert_eq!(world.cube_count(), 0);
+    }
+
+    #[test]
+    fn block_shapes_reads_loaded_air_and_missing() {
+        use jbm_core::physics::BlockShapes;
+
+        let mut world = ClientWorld::new();
+        let origin = CubePos { x: 0, y: 0, z: 0 };
+        // A stone floor cube below an air cube above it.
+        world.apply(&ServerMsg::CubeData {
+            pos: origin,
+            cube: stone_cube(),
+        });
+        world.apply(&ServerMsg::CubeData {
+            pos: CubePos { x: 0, y: 1, z: 0 },
+            cube: Box::new(Cube::default()),
+        });
+        let solid = |x: i64, y: i64, z: i64| world.solid(BlockPos { x, y, z });
+        assert_eq!(solid(3, 2, 7), Some(true), "stone inside the floor cube");
+        assert_eq!(solid(0, 32, 0), Some(false), "air in the cube above");
+        assert_eq!(solid(0, 64, 0), None, "an unloaded cube is None");
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn remove_block_guts_only_the_client_copy() {
+        use jbm_core::physics::BlockShapes;
+
+        let mut world = ClientWorld::new();
+        let origin = CubePos { x: 0, y: 0, z: 0 };
+        world.apply(&cube_data(origin));
+        let at = BlockPos { x: 3, y: 2, z: 7 };
+        assert_eq!(world.solid(at), Some(true));
+        world.remove_block(at);
+        assert_eq!(world.solid(at), Some(false), "the block is gone");
+        assert_eq!(
+            world.solid(BlockPos { x: 4, y: 2, z: 7 }),
+            Some(true),
+            "its neighbors stay"
+        );
+        assert_eq!(world.dirty_count(), 1, "the cube re-meshes");
     }
 }

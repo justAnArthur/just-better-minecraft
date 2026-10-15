@@ -2,12 +2,14 @@
 //! phases from the design doc's "Simulation" section. Clients are talked to
 //! only through [`ServerLink`]s.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
+use glam::DVec3;
 use jbm_core::coords::{BlockPos, CubePos};
 use jbm_core::link::{LinkClosed, ServerLink};
+use jbm_core::physics::{self, BlockShapes, MoveInput, PlayerState, SolidTable};
 use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION, PlayerId, ServerMsg};
 
 use crate::gen_pool::GenPool;
@@ -19,6 +21,12 @@ use crate::tick::{TICKS_PER_SECOND, TickClock};
 /// Leftovers wait for the next tick, so a flooding client cannot stall the
 /// tick.
 const MESSAGES_PER_CONNECTION_PER_TICK: usize = 256;
+
+/// Queued [`MoveInput`]s per player; on overflow the oldest is dropped.
+const INPUT_QUEUE_CAP: usize = 20;
+
+/// Inputs stepped per player per tick in phase 4.
+const INPUTS_PER_TICK: usize = 4;
 
 /// The seed every default server generates its world with. Fixed so a
 /// fresh install always starts on the same terrain.
@@ -78,24 +86,14 @@ impl ServerConfig {
 }
 
 /// The cube containing a world position given in block coordinates.
-fn cube_containing(position: [f64; 3]) -> CubePos {
+fn cube_containing(position: DVec3) -> CubePos {
     BlockPos {
-        x: position[0].floor() as i64,
-        y: position[1].floor() as i64,
-        z: position[2].floor() as i64,
+        x: position.x.floor() as i64,
+        y: position.y.floor() as i64,
+        z: position.z.floor() as i64,
     }
     .split()
     .0
-}
-
-/// The player's latest movement state as stored server-side. Placeholder
-/// shape mirroring [`ClientMsg::PlayerInput`]; task 1.6 replaces it.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PlayerInput {
-    pub client_tick: u64,
-    pub position: [f64; 3],
-    pub yaw: f32,
-    pub pitch: f32,
 }
 
 /// Read-only view of a joined player, for tests and diagnostics.
@@ -103,7 +101,11 @@ pub struct PlayerInput {
 pub struct PlayerView {
     pub id: PlayerId,
     pub name: String,
-    pub latest_input: Option<PlayerInput>,
+    /// The authoritative physics state.
+    pub state: PlayerState,
+    /// Seq of the last processed input (0 before any).
+    pub last_seq: u64,
+    /// `PlayerInput` messages received in total.
     pub input_count: u64,
 }
 
@@ -111,10 +113,20 @@ pub struct PlayerView {
 struct Player {
     id: PlayerId,
     name: String,
-    latest_input: Option<PlayerInput>,
+    /// The authoritative state; stepped in phase 4 from the spawn state.
+    state: PlayerState,
+    /// Received, not-yet-processed inputs in arrival order. Capped at
+    /// [`INPUT_QUEUE_CAP`]; overflow drops the oldest.
+    input_queue: VecDeque<(u64, MoveInput)>,
+    /// Seq of the last processed input; anything ≤ this is ignored on
+    /// arrival.
+    last_seq: u64,
     input_count: u64,
-    /// The cube the player is centered on (latest input position, else the
-    /// spawn). Drives the desired and keep sets.
+    /// Set in phase 4 when at least one input was stepped; makes phase 5
+    /// send a `PlayerState` before the `Tick`.
+    pending_ack: bool,
+    /// The cube the player is centered on (their state position). Drives
+    /// the desired and keep sets.
     center: CubePos,
     /// Cubes this player has been sent and not yet had unloaded. A cube is
     /// never sent twice while it stays in this set.
@@ -128,8 +140,9 @@ struct Player {
 enum ConnectionState {
     /// Connected, but no valid `Hello` has arrived yet.
     Pending,
-    /// Welcomed and playing.
-    Joined(Player),
+    /// Welcomed and playing. Boxed: the player state outgrew the pending
+    /// variant several times over.
+    Joined(Box<Player>),
 }
 
 struct Connection {
@@ -168,6 +181,9 @@ pub struct Server {
     pool: GenPool,
     /// Generated cubes the server keeps in memory, keyed by position.
     world: HashMap<CubePos, jbm_core::cube::Cube>,
+    /// Per-state solidity for physics; built once from the same registry
+    /// the generator uses, so both sides of a collision agree.
+    solid: SolidTable,
     /// Desired-set offsets for the configured radii, sorted nearest-first.
     /// Computed once per config.
     desired: Vec<Offset>,
@@ -198,6 +214,7 @@ impl Server {
         let pool = GenPool::new(config.gen_threads, Arc::clone(&generator));
         let desired = desired_offsets(config.view_radius, config.vertical_radius);
         let spawn = generator.spawn();
+        let solid = SolidTable::new(&registry);
         Self {
             clock: TickClock::new(),
             tick_number: 0,
@@ -206,6 +223,7 @@ impl Server {
             config,
             pool,
             world: HashMap::new(),
+            solid,
             desired,
             spawn,
             eviction_dirty: true,
@@ -266,7 +284,8 @@ impl Server {
             conn.joined_player().map(|player| PlayerView {
                 id: player.id,
                 name: player.name.clone(),
-                latest_input: player.latest_input,
+                state: player.state,
+                last_seq: player.last_seq,
                 input_count: player.input_count,
             })
         })
@@ -346,15 +365,25 @@ impl Server {
                 let player_id = PlayerId(self.next_player_id);
                 self.next_player_id += 1;
                 let spawn = self.spawn;
-                conn.state = ConnectionState::Joined(Player {
+                conn.state = ConnectionState::Joined(Box::new(Player {
                     id: player_id,
                     name,
-                    latest_input: None,
+                    // The Welcome's spawn is the initial state: velocity 0,
+                    // not on ground, walking.
+                    state: PlayerState {
+                        position: DVec3::from(spawn),
+                        velocity: DVec3::ZERO,
+                        on_ground: false,
+                        flying: false,
+                    },
+                    input_queue: VecDeque::new(),
+                    last_seq: 0,
                     input_count: 0,
-                    center: cube_containing(spawn),
+                    pending_ack: false,
+                    center: cube_containing(DVec3::from(spawn)),
                     sent: HashSet::new(),
                     cursor: 0,
-                });
+                }));
                 let welcome = ServerMsg::Welcome {
                     player_id,
                     server_tick: self.tick_number,
@@ -382,22 +411,16 @@ impl Server {
                 let _ = conn.link.send(disconnected);
                 Outcome::Drop
             }
-            (
-                ConnectionState::Joined(player),
-                ClientMsg::PlayerInput {
-                    client_tick,
-                    position,
-                    yaw,
-                    pitch,
-                },
-            ) => {
-                player.latest_input = Some(PlayerInput {
-                    client_tick,
-                    position,
-                    yaw,
-                    pitch,
-                });
+            (ConnectionState::Joined(player), ClientMsg::PlayerInput { seq, input, .. }) => {
                 player.input_count += 1;
+                // Old or duplicate seqs are ignored outright; the queue
+                // keeps arrival order, which a sane client makes seq order.
+                if seq > player.last_seq {
+                    player.input_queue.push_back((seq, input));
+                    if player.input_queue.len() > INPUT_QUEUE_CAP {
+                        player.input_queue.pop_front();
+                    }
+                }
                 Outcome::Keep
             }
             (ConnectionState::Joined(_), ClientMsg::Ping { nonce }) => {
@@ -422,15 +445,52 @@ impl Server {
     /// per-tick budget. Empty stub until block updates land (Stage 2).
     fn phase_block_update_queue(&mut self) {}
 
-    /// Phase 4: run ECS systems: physics, AI, block entities, mod systems.
-    /// Empty stub until bevy_ecs lands (task 1.5+).
-    fn phase_ecs_systems(&mut self) {}
+    /// Phase 4: run ECS systems — here, player physics. Per player, in
+    /// join order, up to [`INPUTS_PER_TICK`] queued inputs are stepped
+    /// through the shared [`physics::step`] against a [`BlockShapes`]
+    /// view of the server's world (a missing cube reads as `None` for its
+    /// blocks, so players freeze at the edge of loaded terrain).
+    ///
+    /// Input-driven: a tick with no queued input does not step the player
+    /// at all — a stalled client freezes in place. Anti-cheat and input
+    /// timeouts are a later task; the caps above are the only protection
+    /// for now.
+    fn phase_ecs_systems(&mut self) {
+        let Server {
+            connections,
+            world,
+            solid,
+            ..
+        } = self;
+        let shapes = ServerShapes { world, solid };
+        for conn in connections {
+            let ConnectionState::Joined(player) = &mut conn.state else {
+                continue;
+            };
+            let mut processed = 0;
+            while processed < INPUTS_PER_TICK {
+                let Some((seq, input)) = player.input_queue.pop_front() else {
+                    break;
+                };
+                // Defensive: phase 1 already filters, but the cap rules can
+                // leave a stale seq behind after a burst.
+                if seq <= player.last_seq {
+                    continue;
+                }
+                player.state = physics::step(player.state, &input, &shapes);
+                player.last_seq = seq;
+                player.pending_ack = true;
+                processed += 1;
+            }
+        }
+    }
 
     /// Phase 5: recompute dirty light and send outgoing changes — here, the
-    /// cube streaming pass (before the `Tick` message every joined player
-    /// receives, so cubes always precede their tick) followed by the `Tick`
-    /// itself. A player whose link has closed is removed — a failed send
-    /// never panics.
+    /// cube streaming pass, then per player the `PlayerState` (only in
+    /// ticks where at least one input was processed) followed by the
+    /// `Tick` message every joined player receives, so cubes and state
+    /// always precede their tick. A player whose link has closed is
+    /// removed — a failed send never panics.
     fn phase_light_and_outgoing(&mut self) {
         if self.config.streaming {
             self.phase_streaming();
@@ -440,7 +500,21 @@ impl Server {
         };
         let mut dropped: Vec<usize> = Vec::new();
         for (idx, conn) in self.connections.iter_mut().enumerate() {
-            if conn.joined_player().is_some() && conn.link.send(tick_msg.clone()).is_err() {
+            let ConnectionState::Joined(player) = &mut conn.state else {
+                continue;
+            };
+            if player.pending_ack {
+                let state_msg = ServerMsg::PlayerState {
+                    ack_seq: player.last_seq,
+                    state: player.state,
+                };
+                if conn.link.send(state_msg).is_err() {
+                    dropped.push(idx);
+                    continue;
+                }
+                player.pending_ack = false;
+            }
+            if conn.link.send(tick_msg.clone()).is_err() {
                 dropped.push(idx);
             }
         }
@@ -528,6 +602,23 @@ impl Server {
     }
 }
 
+/// A [`BlockShapes`] view of the server's world: a cube lookup per block,
+/// no clones. A missing cube reads as `None` (not loaded), which freezes
+/// players at the edge of generated terrain.
+struct ServerShapes<'a> {
+    world: &'a HashMap<CubePos, jbm_core::cube::Cube>,
+    solid: &'a SolidTable,
+}
+
+impl BlockShapes for ServerShapes<'_> {
+    fn solid(&self, pos: BlockPos) -> Option<bool> {
+        let (cube_pos, local) = pos.split();
+        self.world
+            .get(&cube_pos)
+            .map(|cube| self.solid.is_solid(cube.get(local)))
+    }
+}
+
 /// One player's slice of the streaming pass. Returns `true` when the link
 /// closed and the connection must be dropped.
 ///
@@ -543,11 +634,8 @@ fn stream_player(
     desired: &[Offset],
     eviction_dirty: &mut bool,
 ) -> bool {
-    // Center: the latest input position, else the spawn cube.
-    let center = player
-        .latest_input
-        .map(|input| cube_containing(input.position))
-        .unwrap_or(player.center);
+    // Center: the cube containing the authoritative state position.
+    let center = cube_containing(player.state.position);
     let (r, v) = (config.view_radius, config.vertical_radius);
 
     if center != player.center {
@@ -631,8 +719,9 @@ impl Default for Server {
 
 #[cfg(test)]
 mod tests {
-    use super::{Server, ServerConfig};
+    use super::{INPUT_QUEUE_CAP, INPUTS_PER_TICK, Server, ServerConfig};
     use jbm_core::link::{ClientLink, in_process_pair};
+    use jbm_core::physics::MoveInput;
     use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION, ServerMsg};
 
     /// Every unit test here asserts exact message sequences, so it runs the
@@ -641,10 +730,29 @@ mod tests {
         Server::with_config(ServerConfig::protocol_only())
     }
 
+    /// Streaming with tiny radii and inline generation: what the physics
+    /// tests use, so players stand on real generated terrain.
+    fn physics_server() -> Server {
+        Server::with_config(ServerConfig {
+            streaming: true,
+            view_radius: 1,
+            vertical_radius: 1,
+            send_budget_per_tick: 64,
+            gen_threads: 0,
+            gen_budget_per_tick: 64,
+            max_in_flight: 512,
+            ..ServerConfig::default()
+        })
+    }
+
     /// A server with one client whose `Hello` is queued but not yet
     /// processed.
     fn pending_hello() -> (Server, ClientLink) {
-        let mut server = protocol_server();
+        pending_hello_on(protocol_server())
+    }
+
+    fn pending_hello_on(server: Server) -> (Server, ClientLink) {
+        let mut server = server;
         let (mut client, server_end) = in_process_pair();
         server.add_connection(server_end);
         client
@@ -656,12 +764,42 @@ mod tests {
         (server, client)
     }
 
+    fn input(seq: u64, input: MoveInput) -> ClientMsg {
+        ClientMsg::PlayerInput {
+            seq,
+            input,
+            pitch: 0.0,
+        }
+    }
+
+    fn fly_up(toggle: bool) -> MoveInput {
+        MoveInput {
+            fly_toggle: toggle,
+            up: 1,
+            ..MoveInput::IDLE
+        }
+    }
+
     fn drain(client: &mut ClientLink) -> Vec<ServerMsg> {
         let mut messages = Vec::new();
         while let Ok(Some(msg)) = client.try_recv() {
             messages.push(msg);
         }
         messages
+    }
+
+    /// Joins, settles terrain loading, and returns the spawn state.
+    fn joined_and_loaded(
+        server: &mut Server,
+        client: &mut ClientLink,
+    ) -> jbm_core::physics::PlayerState {
+        server.tick();
+        let _ = drain(client);
+        for _ in 0..10 {
+            server.tick();
+            let _ = drain(client);
+        }
+        server.players().next().unwrap().state
     }
 
     #[test]
@@ -681,7 +819,10 @@ mod tests {
         assert_eq!(players.len(), 1);
         assert_eq!(players[0].name, "alice");
         assert_eq!(players[0].input_count, 0);
-        assert_eq!(players[0].latest_input, None);
+        assert_eq!(players[0].last_seq, 0);
+        assert_eq!(players[0].state.velocity, glam::DVec3::ZERO);
+        assert!(!players[0].state.flying);
+        assert!(!players[0].state.on_ground);
     }
 
     #[test]
@@ -767,40 +908,197 @@ mod tests {
     }
 
     #[test]
-    fn player_input_is_stored_as_latest_and_counted() {
+    fn inputs_are_applied_in_seq_order_and_duplicates_ignored() {
+        let (mut server, mut client) = pending_hello_on(physics_server());
+        let spawn = joined_and_loaded(&mut server, &mut client);
+
+        // Fly up one tick, then hover; the duplicate and the old seq must
+        // not move the player again.
+        client.send(input(1, fly_up(true))).unwrap();
+        client.send(input(2, MoveInput::IDLE)).unwrap();
+        client.send(input(1, fly_up(true))).unwrap();
+        client.send(input(2, MoveInput::IDLE)).unwrap();
+        server.tick();
+        let players: Vec<_> = server.players().collect();
+        assert_eq!(players[0].input_count, 4, "every message is counted");
+        assert_eq!(players[0].last_seq, 2);
+        assert_eq!(players[0].state.position.y, spawn.position.y + 0.55);
+        assert!(players[0].state.flying);
+
+        // The queued duplicates were dropped at arrival, not processed
+        // later: one more empty tick changes nothing.
+        server.tick();
+        let players: Vec<_> = server.players().collect();
+        assert_eq!(players[0].last_seq, 2);
+        assert_eq!(players[0].state.position.y, spawn.position.y + 0.55);
+    }
+
+    #[test]
+    fn at_most_four_inputs_are_processed_per_tick() {
+        let (mut server, mut client) = pending_hello_on(physics_server());
+        let spawn = joined_and_loaded(&mut server, &mut client);
+
+        for seq in 1..=6u64 {
+            client.send(input(seq, fly_up(seq == 1))).unwrap();
+        }
+        server.tick();
+        let players: Vec<_> = server.players().collect();
+        assert_eq!(players[0].last_seq, INPUTS_PER_TICK as u64);
+        // Mirror the physics' repeated additions so the compare is bitwise.
+        let mut expected = spawn.position.y;
+        for _ in 0..INPUTS_PER_TICK {
+            expected += 0.55;
+        }
+        assert_eq!(players[0].state.position.y, expected);
+
+        // The remaining two process on the next tick.
+        server.tick();
+        let players: Vec<_> = server.players().collect();
+        assert_eq!(players[0].last_seq, 6);
+        for _ in 0..2 {
+            expected += 0.55;
+        }
+        assert_eq!(players[0].state.position.y, expected);
+    }
+
+    #[test]
+    fn queue_cap_drops_the_oldest_inputs() {
+        let (mut server, mut client) = pending_hello_on(physics_server());
+        joined_and_loaded(&mut server, &mut client);
+
+        let burst = (INPUT_QUEUE_CAP + 5) as u64;
+        for seq in 1..=burst {
+            client.send(input(seq, fly_up(seq == 1))).unwrap();
+        }
+        server.tick();
+        let players: Vec<_> = server.players().collect();
+        assert_eq!(players[0].input_count, burst);
+        // The queue kept the newest 20 (seqs 6..=25) and the first tick
+        // processed four of those: the oldest five, fly toggle included,
+        // were dropped on arrival.
+        assert_eq!(players[0].last_seq, 9);
+
+        // Everything queued eventually processes, exactly once each.
+        for _ in 0..10 {
+            server.tick();
+        }
+        let players: Vec<_> = server.players().collect();
+        assert_eq!(players[0].last_seq, burst);
+    }
+
+    #[test]
+    fn player_state_precedes_tick_only_in_ticks_with_inputs() {
         let (mut server, mut client) = pending_hello();
         server.tick();
         let _ = drain(&mut client);
 
-        client
-            .send(ClientMsg::PlayerInput {
-                client_tick: 5,
-                position: [1.0, 64.0, 2.0],
-                yaw: 90.0,
-                pitch: -10.0,
-            })
-            .unwrap();
+        // No input: only the Tick.
         server.tick();
-        let players: Vec<_> = server.players().collect();
-        assert_eq!(players[0].input_count, 1);
-        let input = players[0].latest_input.unwrap();
-        assert_eq!(input.client_tick, 5);
-        assert_eq!(input.position, [1.0, 64.0, 2.0]);
-        assert_eq!(input.yaw, 90.0);
-        assert_eq!(input.pitch, -10.0);
+        assert!(matches!(
+            drain(&mut client).as_slice(),
+            [ServerMsg::Tick { tick: 2 }]
+        ));
 
+        client.send(input(1, MoveInput::IDLE)).unwrap();
+        server.tick();
+        assert!(matches!(
+            drain(&mut client).as_slice(),
+            [
+                ServerMsg::PlayerState { ack_seq: 1, .. },
+                ServerMsg::Tick { tick: 3 }
+            ]
+        ));
+
+        server.tick();
+        assert!(matches!(
+            drain(&mut client).as_slice(),
+            [ServerMsg::Tick { tick: 4 }]
+        ));
+    }
+
+    #[test]
+    fn streaming_center_follows_the_authoritative_position() {
+        let mut server = Server::with_config(ServerConfig {
+            streaming: true,
+            view_radius: 2,
+            vertical_radius: 1,
+            send_budget_per_tick: 64,
+            gen_threads: 0,
+            gen_budget_per_tick: 64,
+            max_in_flight: 512,
+            ..ServerConfig::default()
+        });
+        let (mut client, server_end) = in_process_pair();
+        server.add_connection(server_end);
         client
-            .send(ClientMsg::PlayerInput {
-                client_tick: 6,
-                position: [3.0, 65.0, 0.0],
-                yaw: 0.0,
-                pitch: 0.0,
+            .send(ClientMsg::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                name: "walker".to_owned(),
             })
             .unwrap();
         server.tick();
-        let players: Vec<_> = server.players().collect();
-        assert_eq!(players[0].input_count, 2);
-        assert_eq!(players[0].latest_input.unwrap().client_tick, 6);
+        let _ = drain(&mut client);
+        for _ in 0..10 {
+            server.tick();
+            let _ = drain(&mut client);
+        }
+        let start = server.players().next().unwrap().state;
+        let center0 = jbm_core::coords::BlockPos {
+            x: start.position.x.floor() as i64,
+            y: start.position.y.floor() as i64,
+            z: start.position.z.floor() as i64,
+        }
+        .split()
+        .0;
+
+        // Fly well above the terrain, then east across a cube border. The
+        // unloaded rule stalls movement while cubes stream in, so the loop
+        // runs until the position actually crosses.
+        let east = std::f32::consts::FRAC_PI_2;
+        let mut seq = 0u64;
+        let mut crossed = false;
+        for _ in 0..4000 {
+            let state = server.players().next().unwrap().state;
+            let rise = state.position.y < start.position.y + 40.0;
+            let move_input = if rise {
+                MoveInput {
+                    up: 1,
+                    fly_toggle: !state.flying,
+                    ..MoveInput::IDLE
+                }
+            } else {
+                MoveInput {
+                    forward: 1,
+                    sprint: true,
+                    yaw: east,
+                    ..MoveInput::IDLE
+                }
+            };
+            seq += 1;
+            client.send(input(seq, move_input)).unwrap();
+            server.tick();
+            for msg in drain(&mut client) {
+                if let ServerMsg::CubeData { pos, .. } = msg
+                    && pos.x >= center0.x + 2
+                    && pos.z == center0.z
+                {
+                    crossed = true;
+                }
+            }
+            let state = server.players().next().unwrap().state;
+            if !rise && state.position.x >= start.position.x + 33.0 {
+                break;
+            }
+        }
+        let state = server.players().next().unwrap().state;
+        assert!(
+            state.position.x >= start.position.x + 33.0,
+            "never crossed the cube border: {state:?}"
+        );
+        assert!(
+            crossed,
+            "no cubes streamed east of the start — the center did not follow"
+        );
     }
 
     #[test]

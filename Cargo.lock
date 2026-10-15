@@ -830,6 +830,7 @@ name = "jbm-core"
 version = "0.0.0"
 dependencies = [
  "criterion",
+ "glam",
 ]
 
 [[package]]
@@ -855,6 +856,7 @@ name = "jbm-server"
 version = "0.0.0"
 dependencies = [
  "criterion",
+ "glam",
  "jbm-core",
 ]
 
