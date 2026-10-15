@@ -117,9 +117,9 @@ loops — uniform neighbors fill, non-uniform use `get_index` on just the
 along u first, then along v. Faces never span outside the cube. Output is
 grouped by direction (`ranges`) so 2.2 can skip back-facing directions.
 
-**Bench medians (this Mac, single-threaded):** `terrain_like` 244 µs
-(target ≤ 300 µs), `checkerboard` 769 µs, `uniform_stone_air_neighbors`
-233 µs, `padded_build` 22 µs.
+**Bench medians (Apple M5 Pro, idle, single-threaded):** `terrain_like`
+221 µs (target ≤ 300 µs), `checkerboard` 697 µs,
+`uniform_stone_air_neighbors` 219 µs, `padded_build` 20 µs.
 
 ### Worker pool
 
