@@ -516,6 +516,12 @@ impl Server {
         self.failed_batches
     }
 
+    /// Batches handed to the save thread and not yet answered (committed or
+    /// failed). Tests wait for 0 before holding saves.
+    pub fn unanswered_batches(&self) -> u64 {
+        self.sent_batches - self.saved_batches - self.failed_batches
+    }
+
     /// The open world storage, when persistence is on. Test and diagnostic
     /// access (the crash tests read the database through it).
     pub fn storage(&self) -> Option<&Arc<Storage>> {

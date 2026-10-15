@@ -82,6 +82,14 @@ impl Drop for ReleaseOnDrop {
     }
 }
 
+/// Steps until every batch sent so far is answered. These tests send no
+/// movement input, so after the join-time player record nothing else
+/// changes on its own: batch counts then move only for what the test does.
+fn quiesce(hs: &mut HeadlessServer) {
+    let quiet = wait_until(hs, |hs| hs.server().unanswered_batches() == 0, 400);
+    assert!(quiet, "the server never went quiet");
+}
+
 fn wait_until(
     hs: &mut HeadlessServer,
     cond: impl Fn(&HeadlessServer) -> bool,
@@ -267,6 +275,8 @@ fn an_edit_during_a_save_stays_pinned_until_the_next_batch() {
     let ground = settle(&mut hs, &mut client);
 
     // Hold the saver, edit (version 1), let the interval snapshot it.
+    quiesce(&mut hs);
+    let base = hs.server().saved_batches();
     let held = hs.server().storage().unwrap().clone();
     held.hold_saves();
     let release = ReleaseOnDrop(held.clone());
@@ -286,7 +296,7 @@ fn an_edit_during_a_save_stays_pinned_until_the_next_batch() {
     // Give the saver a moment to take the batch, so the release below
     // deterministically unblocks an in-flight save.
     std::thread::sleep(Duration::from_millis(10));
-    assert_eq!(hs.server().saved_batches(), 0);
+    assert_eq!(hs.server().saved_batches(), base);
 
     // Edit again (version 2) while batch 1 is held mid-save.
     client.send(ClientMsg::PlaceBlock {
@@ -301,7 +311,7 @@ fn an_edit_during_a_save_stays_pinned_until_the_next_batch() {
     // is at version 2, so it stays pinned until the second batch commits.
     // The version-2 batch stays held, so the count cannot skip past 1.
     held.release_one_save();
-    let acked = wait_until(&mut hs, |hs| hs.server().saved_batches() >= 1, 400);
+    let acked = wait_until(&mut hs, |hs| hs.server().saved_batches() > base, 400);
     assert!(acked, "the held batch never committed");
     assert_eq!(
         hs.server().pinned_count(),
@@ -310,7 +320,7 @@ fn an_edit_during_a_save_stays_pinned_until_the_next_batch() {
     );
     assert_eq!(hs.server().block(ground), Some(glass()));
 
-    assert_eq!(hs.server().saved_batches(), 1);
+    assert_eq!(hs.server().saved_batches(), base + 1);
 
     held.release_saves();
     let settled = wait_until(&mut hs, |hs| hs.server().pinned_count() == 0, 400);
@@ -342,6 +352,8 @@ fn a_failed_save_keeps_cubes_pinned_and_retries() {
     let ground = settle(&mut hs, &mut client);
 
     // Hold saves so the failure and the retry happen one batch at a time.
+    quiesce(&mut hs);
+    let base = hs.server().saved_batches();
     let storage = hs.server().storage().unwrap().clone();
     storage.hold_saves();
     let _release = ReleaseOnDrop(storage.clone());
@@ -359,12 +371,12 @@ fn a_failed_save_keeps_cubes_pinned_and_retries() {
     // that applies the failure may already re-snapshot the retry.
     let failed = wait_until(&mut hs, |hs| hs.server().failed_batches() == 1, 400);
     assert!(failed, "the failing batch was never reported");
-    assert_eq!(hs.server().saved_batches(), 0);
+    assert_eq!(hs.server().saved_batches(), base);
     assert_eq!(hs.server().dirty_count(), 1, "a failed save must not unpin");
 
     // The hook is one-shot: the next interval's retry commits.
     storage.release_saves();
-    let retried = wait_until(&mut hs, |hs| hs.server().saved_batches() >= 1, 400);
+    let retried = wait_until(&mut hs, |hs| hs.server().saved_batches() > base, 400);
     assert!(retried, "the retry never committed");
     assert_eq!(hs.server().pinned_count(), 0);
     assert_eq!(
