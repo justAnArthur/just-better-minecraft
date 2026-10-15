@@ -2,7 +2,7 @@
 
 ## Next up
 
-Stage 2 · Far view, wave B: 2.4 LOD pyramid (downsampling rule, edit propagation up the levels), 2.5 GPU frustum and Hi-Z occlusion culling in compute. Specs not written yet. Wave A merged (PR #9). Start with `/clear`.
+Stage 2 · Far view, wave C: 2.6 clipmap streaming of LOD rings with skirts at seams, 2.7 LOD sampled straight from worldgen plus stored LOD in redb. Specs not written yet. Wave B merged (2.4 LOD pyramid, 2.5 GPU culling).
 
 ## Benchmarks
 
@@ -32,6 +32,11 @@ Stage 2 · Far view, wave B: 2.4 LOD pyramid (downsampling rule, edit propagatio
 | storage/load_cube | 23.83 µs | Apple M5 Pro (orchestrator, light load) | 2026-10-15 |
 | suballoc/churn_10k | ≈308 µs | Apple M5 Pro (2.2 implementer) | 2026-10-15 |
 | terrain_draw/mdi, /fallback | ≈370 µs, ≈329 µs | Apple M5 Pro (2.2 implementer) | 2026-10-15 |
+| lod/insert_lod0/surface | ≈102 µs (worldgen/surface_cube 160 µs in the same run) | Apple M5 Pro (orchestrator, heavy load) | 2026-10-15 |
+| lod/edit (one real change, 4 levels) | ≈13.6 µs | Apple M5 Pro (orchestrator, heavy load) | 2026-10-15 |
+| lod/downsample_octant/surface | ≈80 µs | Apple M5 Pro (orchestrator, heavy load) | 2026-10-15 |
+| terrain_draw/gpu_cull, /mdi (cpu-cull), /fallback | ≈380, ≈248, ≈211 µs | Apple M5 Pro (2.5 implementer) | 2026-10-15 |
+| terrain_draw/cave/gpu_cull, /cave/cpu_cull | ≈386, ≈257 µs | Apple M5 Pro (2.5 implementer) | 2026-10-15 |
 
 Baselines are bench worker runs on an otherwise idle machine. Run-to-run noise on this Mac is ±10–15%; treat smaller deltas as noise. `iter()` is ~3× faster than per-block `get`, so the mesher should iterate. Compare only runs made without parallel builds (the implementer's 3.67 µs ran alongside other builds; ignore it). The wave A worldgen rows ran during three parallel worker builds: the graph/reference ratio is meaningful, the absolute numbers are not (idle baseline surface_cube was 92 µs). Re-run worldgen idle before 2.7.
 
@@ -65,6 +70,8 @@ Baselines are bench worker runs on an otherwise idle machine. Run-to-run noise o
 
 - 2026-10-15: Terrain is data: a JSON density graph (`crates/server/assets/worldgen/overworld.json`) compiled to a flat register program with constant folding, xz-only instructions run once per column, interval bounds for fast paths and a per-column "band" solidity cache. Solid means density ≥ 0; grass/dirt/sand come from a code surface stage (depth below air). It reproduces the 1.5 terrain bit for bit; the old code stays as `worldgen::reference` for the equivalence tests until a later stage deletes it.
 - 2026-10-15: Terrain draws from shared 32 MiB face pages with a first-fit suballocator and one `multi_draw_indirect` per page; one indirect command per visible cube and face direction, back-facing directions skipped (a ≥1-block margin keeps f32 rounding safe). Fallback (`JBM_NO_MDI=1`, or no INDIRECT_EXECUTION / INDIRECT_FIRST_INSTANCE) issues the same commands as direct draws; images are pixel-identical. Region draw calls 24 → 1.
+- 2026-10-15: LOD downsampling: a 2×2×2 group is filled when at least 2 of 8 children are non-air; its material is the most common among the topmost filled child of each of the 4 columns (ties: higher dy, then smaller id). The rule is local to the group, so an edit changes at most one cell per level and incremental propagation equals a full rebuild exactly. The server keeps levels 1–4 (`lod_levels`) in memory, fed by every generated/loaded cube and every edit; LOD cubes outlive their LOD0 children.
+- 2026-10-15: GPU frustum + two-phase Hi-Z occlusion culling exists and is tested pixel-identical to CPU culling on every frame of a moving camera, but **cpu-cull is the default**; gpu-cull is opt-in (`JBM_GPU_CULL=1`). On Metal it was slower in every measured scene (game-sized region: surface 0.80–1.07 vs 0.43–0.61 ms, cave 0.41–0.71 vs 0.27–0.46 ms): `multi_draw_indirect` is a CPU loop there, `draw_indirect_count` is missing, and the per-frame Hi-Z rebuild costs ~0.18 ms. Re-measure in 2.6 with LOD rings; levers in the client README.
 - 2026-10-15: Worlds persist in `saves/default/world.redb` (`JBM_WORLD_DIR`, `JBM_NO_SAVE=1`). Only edited cubes are stored (zstd'd palette + words, on-disk id table for remapping); unedited cubes regenerate. A `jbm-save` thread commits one transaction per batch every 5 s and on drop; cubes stay pinned until their latest edit version is committed, then evict normally. The gen pool is load-or-generate. Players (by name) are saved with each batch and on disconnect, and rejoin at their saved position, look and flight (protocol v5 `Welcome { spawn, yaw, pitch, flying }`).
 
 ## Known issues
@@ -77,9 +84,11 @@ Baselines are bench worker runs on an otherwise idle machine. Run-to-run noise o
 - server: `Drop for Server` joins `jbm-save` after `flush`'s 30 s timeout, so a hung commit can still block shutdown. Bound the join if it ever matters.
 - client: face pages are never freed or compacted; fragmentation grows with churn until a compaction task (2.6 or later).
 - LOD pyramid has no eviction until 2.6 (rings) and 2.7 (stored LOD); it grows with the explored area.
+- LOD ingest runs on the tick thread: ~0.6× the generation cost of a surface cube (~100 µs), ~40–60 ms total while the default view loads. Move the level-1 downsample to the gen pool workers if it shows up in 2.7's tick budget.
+- LOD octants whose child cube was never loaded read as air (`known` mask says which are real); 2.7 fills them from worldgen.
+- gpu-cull rebuilds a full-resolution Hi-Z pyramid every frame; start it at half resolution if gpu-cull becomes the default.
 - `worldgen::reference` (the 1.5 noise code) is kept only for equivalence tests; delete it once LOD sampling (2.7) has its own coverage.
 - Golden tolerance (0.5% of pixels differing) is larger than thin features such as the target outline (~40–140 px). Tests for thin features must also assert directly: `edit_screenshot` renders with and without the outline and requires a difference.
-- `Renderer::render` takes one optional argument per pass (8 args, clippy allowed with a reason). Bundle them into a frame struct when the next pass lands.
 - Reviewers passed 1.4 with three visible bugs (one-block face offset for +X/−Z, stale mesh race, magenta grass side). The orchestrator must keep inspecting goldens zoomed in, and golden cameras must be close enough to show per-block detail.
 - First release/bench build is slow (wgpu + thin LTO + codegen-units=1). Revisit profile if CI bench-smoke gets too slow.
 
@@ -119,4 +128,7 @@ Baselines are bench worker runs on an otherwise idle machine. Run-to-run noise o
 - 2.1 merged: density graph format + compiler + evaluator, shipped overworld graph, exact equivalence with the 1.5 code (3 seeds, 512² + far columns), `sample_grid` at LOD steps, goldens untouched. The worker caught a spec error (`y − 70` is solid above 70 under "≥ 0 is solid"). Orchestrator fixed `surface_height` scanning the shipped graph's range instead of the graph's own band, with a test.
 - 2.3 merged: redb storage + cube codec in core + background saver + load-or-generate, kill-during-save tests (storage-level atomicity over 10 SIGKILL rounds, server-level prefix property). Orchestrator: decode builds the cube from the stored words instead of re-packing (load 211 → 24 µs), bulk zstd frames, typed corrupt-meta error, fixed the load bench (it measured a uniform cube), resolved merge conflicts with 2.1/2.2, and made the held-save tests deterministic after they flaked under the parallel workspace run (one attempted fix hung the test binary; now a `release_one_save` hook, a `failed_batches` counter and a release guard).
 - Play-test of wave A: no holes, edits survive restart and flying away and back. Position and look were not kept (player data was out of 2.3's scope); the orchestrator added player records (`players` table, protocol v5 `Welcome` with look and flight, departures captured on disconnect) with storage and end-to-end tests, plus a regression test for an edit restored from disk surviving eviction with threaded generation.
-
+- Stage 2 wave B specs written (docs/tasks/2.4, 2.5). Both GLM implementers hit the Z.ai 5-hour limit mid-task and resumed from their uncommitted work after the reset; the last 2.5 round hit the weekly limit and the orchestrator finished it.
+- 2.4 merged: LOD rule in core (`lod.rs`: `downsample_cell`, octant/region API), `LodPyramid` in the server (levels 1–4, `known` octant mask, ingest on collect, one-cell-per-level edit path), thin-wall/trunk/terrain tests, incremental-equals-rebuild over 2,000 edits ×10 seeds. Orchestrator: octant downsample ~2× faster (unpack once, all-equal fast path, `Cube::compact` skips the repack when nothing is unused), both edit benches had measured no-op edits (~100 ns) and now force a real change (~13 µs), fixed `codec_rejects_bad_headers` under `cube16` (broken since 2.3). design.md's downsampling paragraph now states the rule.
+- 2.5 merged: meta slots + one origin formula for all paths, Hi-Z pyramid with odd-size folding, two-phase compute culling with per-page regions, CPU frustum bound on region sizes, `Renderer::render(gpu, FrameInputs)`. Tests: three-path pixel equality, 60-frame no-popping, cave ≥80% occluded (93%), odd resize, churn. Orchestrator measured a game-sized region, found gpu-cull slower on Metal, and made cpu-cull the default (see Decisions); fixed the path-equality test under `JBM_NO_MDI=1`.
+- Play-test of wave B: both the default and `JBM_GPU_CULL=1` render normally, no pop-in.
