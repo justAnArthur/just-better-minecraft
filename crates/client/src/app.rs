@@ -225,10 +225,20 @@ impl App {
         loop {
             match self.link.try_recv() {
                 Ok(Some(msg)) => match &msg {
-                    ServerMsg::Welcome { spawn, .. } => {
+                    ServerMsg::Welcome {
+                        spawn,
+                        yaw,
+                        pitch,
+                        flying,
+                        ..
+                    } => {
                         // The spawn is the feet position; the predictor
-                        // interpolates the eye for rendering.
-                        self.predictor = Some(Predictor::new(DVec3::from(*spawn)));
+                        // interpolates the eye for rendering. A returning
+                        // player also gets their saved look and flight.
+                        self.predictor =
+                            Some(Predictor::new(DVec3::from(*spawn)).with_flying(*flying));
+                        self.camera.yaw = *yaw;
+                        self.camera.pitch = *pitch;
                         self.joined = true;
                     }
                     ServerMsg::PlayerState { ack_seq, state } => {

@@ -17,7 +17,7 @@ use crate::physics::{MoveInput, PlayerState};
 
 /// Version of the client/server protocol. A `Hello` carrying any other
 /// version is rejected.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Identifies a joined player inside one server. Ids start at 1 and count up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -59,8 +59,15 @@ pub enum ServerMsg {
         server_tick: u64,
         tick_rate: u32,
         /// The spawn position: the player's feet and initial state —
-        /// velocity 0, not on ground, walking.
+        /// velocity 0, not on ground. A returning player gets where they
+        /// last stood (persistence), a new one the world spawn.
         spawn: [f64; 3],
+        /// Initial look direction (radians), as the player last sent it;
+        /// 0 for a new player.
+        yaw: f32,
+        pitch: f32,
+        /// Whether the player starts flying.
+        flying: bool,
     },
     /// The authoritative player state after the server processed input
     /// `ack_seq`. Sent in phase 5 before `Tick`, only in ticks where at

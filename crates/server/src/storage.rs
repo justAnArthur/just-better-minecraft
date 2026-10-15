@@ -31,6 +31,8 @@ use zstd::stream::decode_all;
 const META: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("meta");
 /// On-disk block state id → canonical `namespace:path[prop=value,…]` string.
 const BLOCK_STATES: TableDefinition<'_, u32, &str> = TableDefinition::new("block_states");
+/// Player name → player record ([`PlayerRecord`]).
+const PLAYERS: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("players");
 /// Position key (below) → cube record.
 const CUBES: TableDefinition<'_, &[u8; 13], &[u8]> = TableDefinition::new("cubes");
 
@@ -59,6 +61,8 @@ pub enum StorageError {
     },
     /// A `meta` entry (named here) has the wrong shape.
     CorruptMeta(&'static str),
+    /// A player record (named here) could not be decoded.
+    CorruptPlayer(String),
     /// The database names a block state the running registry does not know.
     UnknownBlockState(String),
     /// The database was written by a newer format version.
@@ -72,6 +76,7 @@ impl std::fmt::Display for StorageError {
             Self::Locked(path) => write!(f, "world database {path:?} is locked by another holder"),
             Self::Corrupt { pos, reason } => write!(f, "corrupt record at {pos:?}: {reason}"),
             Self::CorruptMeta(key) => write!(f, "corrupt world meta entry {key:?}"),
+            Self::CorruptPlayer(name) => write!(f, "corrupt player record {name:?}"),
             Self::UnknownBlockState(name) => write!(f, "unknown block state {name:?}"),
             Self::VersionTooNew => write!(f, "world database format is newer than this build"),
         }
@@ -79,6 +84,56 @@ impl std::fmt::Display for StorageError {
 }
 
 impl std::error::Error for StorageError {}
+
+/// What the world remembers about a player between sessions: where they
+/// stood, where they looked and whether they were flying. Velocity is not
+/// kept; a returning player starts at rest, not on ground.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlayerRecord {
+    /// Feet position.
+    pub position: [f64; 3],
+    pub yaw: f32,
+    pub pitch: f32,
+    pub flying: bool,
+}
+
+/// Player record schema: `[schema u8 = 1][x y z: f64][yaw pitch: f32][flying u8]`,
+/// little-endian, 34 bytes.
+const PLAYER_SCHEMA: u8 = 1;
+const PLAYER_RECORD_LEN: usize = 1 + 3 * 8 + 2 * 4 + 1;
+
+impl PlayerRecord {
+    fn encode(&self) -> [u8; PLAYER_RECORD_LEN] {
+        let mut out = [0u8; PLAYER_RECORD_LEN];
+        out[0] = PLAYER_SCHEMA;
+        for (i, v) in self.position.iter().enumerate() {
+            out[1 + i * 8..9 + i * 8].copy_from_slice(&v.to_le_bytes());
+        }
+        out[25..29].copy_from_slice(&self.yaw.to_le_bytes());
+        out[29..33].copy_from_slice(&self.pitch.to_le_bytes());
+        out[33] = u8::from(self.flying);
+        out
+    }
+
+    /// `None` for anything but a well-formed record with finite values.
+    fn decode(bytes: &[u8]) -> Option<PlayerRecord> {
+        if bytes.len() != PLAYER_RECORD_LEN || bytes[0] != PLAYER_SCHEMA || bytes[33] > 1 {
+            return None;
+        }
+        let f64_at = |i: usize| f64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
+        let f32_at = |i: usize| f32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
+        let record = PlayerRecord {
+            position: [f64_at(1), f64_at(9), f64_at(17)],
+            yaw: f32_at(25),
+            pitch: f32_at(29),
+            flying: bytes[33] == 1,
+        };
+        let finite = record.position.iter().all(|v| v.is_finite())
+            && record.yaw.is_finite()
+            && record.pitch.is_finite();
+        finite.then_some(record)
+    }
+}
 
 fn meta_corrupt(key: &'static str) -> StorageError {
     StorageError::CorruptMeta(key)
@@ -390,6 +445,43 @@ impl Storage {
         batch: &[(CubePos, &Cube)],
         meta: &[(&str, &[u8])],
     ) -> Result<(), StorageError> {
+        self.save_batch_full(batch, &[], meta)
+    }
+
+    /// [`Storage::save_batch`] plus player records, all in the one
+    /// transaction: a batch's cubes and the players that saw them commit
+    /// together or not at all.
+    pub fn save_batch_with_players(
+        &self,
+        batch: &[(CubePos, &Cube)],
+        players: &[(String, PlayerRecord)],
+    ) -> Result<(), StorageError> {
+        self.save_batch_full(batch, players, &[])
+    }
+
+    /// The player record stored under `name`, if any.
+    pub fn load_player(&self, name: &str) -> Result<Option<PlayerRecord>, StorageError> {
+        let txn = self.db.begin_read().map_err(io_err)?;
+        let table = match txn.open_table(PLAYERS) {
+            Ok(table) => table,
+            // A world saved before any player record has no table yet.
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(io_err(error)),
+        };
+        let Some(record) = table.get(name).map_err(io_err)? else {
+            return Ok(None);
+        };
+        PlayerRecord::decode(record.value())
+            .map(Some)
+            .ok_or_else(|| StorageError::CorruptPlayer(name.to_owned()))
+    }
+
+    fn save_batch_full(
+        &self,
+        batch: &[(CubePos, &Cube)],
+        players: &[(String, PlayerRecord)],
+        meta: &[(&str, &[u8])],
+    ) -> Result<(), StorageError> {
         self.hooks.enter_save()?;
         let mut txn = self.db.begin_write().map_err(io_err)?;
         txn.set_durability(Durability::Immediate).map_err(io_err)?;
@@ -408,6 +500,14 @@ impl Storage {
                 record.extend_from_slice(&frame);
                 cubes
                     .insert(&cube_key(pos), record.as_slice())
+                    .map_err(io_err)?;
+            }
+        }
+        if !players.is_empty() {
+            let mut table = txn.open_table(PLAYERS).map_err(io_err)?;
+            for (name, record) in players {
+                table
+                    .insert(name.as_str(), record.encode().as_slice())
                     .map_err(io_err)?;
             }
         }
@@ -600,6 +700,57 @@ mod tests {
         let storage = storage_in(&dir);
         assert_eq!(storage.load(pos(0, 0, 0)).unwrap(), None);
         assert_eq!(storage.cube_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn player_records_round_trip_across_a_reopen() {
+        use super::PlayerRecord;
+        let dir = tempfile::TempDir::new().unwrap();
+        let alice = PlayerRecord {
+            position: [-1234.25, 77.0, 9.5e6],
+            yaw: 1.25,
+            pitch: -0.5,
+            flying: true,
+        };
+        {
+            let storage = storage_in(&dir);
+            assert_eq!(storage.load_player("alice").unwrap(), None, "no table yet");
+            storage
+                .save_batch_with_players(&[], &[("alice".to_owned(), alice)])
+                .unwrap();
+            assert_eq!(storage.load_player("bob").unwrap(), None);
+        }
+        let reopened = storage_in(&dir);
+        assert_eq!(reopened.load_player("alice").unwrap(), Some(alice));
+    }
+
+    #[test]
+    fn a_corrupt_player_record_is_a_typed_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = storage_in(&dir);
+        {
+            let txn = storage.db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(super::PLAYERS).unwrap();
+                table.insert("alice", [1u8, 2, 3].as_slice()).unwrap();
+                let mut nan = super::PlayerRecord {
+                    position: [0.0; 3],
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    flying: false,
+                }
+                .encode();
+                nan[1..9].copy_from_slice(&f64::NAN.to_le_bytes());
+                table.insert("bob", nan.as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        for name in ["alice", "bob"] {
+            assert_eq!(
+                storage.load_player(name),
+                Err(StorageError::CorruptPlayer(name.to_owned()))
+            );
+        }
     }
 
     #[test]

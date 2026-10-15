@@ -378,3 +378,177 @@ fn a_failed_save_keeps_cubes_pinned_and_retries() {
         BlockStateId::AIR
     );
 }
+
+/// The game's shape: threaded generation, R = 8 / V = 4, an edit restored
+/// from disk after a restart, then flown away from until evicted and back.
+#[test]
+fn a_restored_edit_survives_eviction_with_threaded_generation() {
+    let dir = TempDir::new().unwrap();
+    let config = || ServerConfig {
+        gen_threads: 4,
+        view_radius: 8,
+        vertical_radius: 4,
+        ..persistent_config(&dir, Duration::from_millis(150))
+    };
+    let warm = |hs: &mut HeadlessServer, client: &mut TestClient| {
+        for _ in 0..300 {
+            hs.step(1);
+            client.drain();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    // Session 1: edit, quit.
+    let mut hs = HeadlessServer::with_config(config());
+    let mut client = hs.connect("alice");
+    warm(&mut hs, &mut client);
+    let ground = settle(&mut hs, &mut client);
+    client.send(ClientMsg::BreakBlock { pos: ground });
+    hs.step(1);
+    client.drain();
+    drop(hs);
+    drop(client);
+    // Session 2: edit is back; fly far away and back.
+    let mut hs = HeadlessServer::with_config(config());
+    let mut client = hs.connect("alice");
+    warm(&mut hs, &mut client);
+    assert_eq!(
+        hs.server().block(ground),
+        Some(BlockStateId::AIR),
+        "edit not restored"
+    );
+    let edited_cube = ground.split().0;
+    let mut seq = 0u64;
+    let cruise = hs.server().players().next().unwrap().state.position.y + 40.0;
+    let left = fly_until(
+        &mut hs,
+        &mut client,
+        std::f32::consts::FRAC_PI_2,
+        cruise,
+        &mut seq,
+        |hs, _| {
+            std::thread::sleep(Duration::from_millis(1));
+            hs.server().block(ground).is_none()
+        },
+        20000,
+    );
+    assert!(left, "never evicted");
+    let returned = fly_until(
+        &mut hs,
+        &mut client,
+        -std::f32::consts::FRAC_PI_2,
+        cruise,
+        &mut seq,
+        |hs, client| {
+            std::thread::sleep(Duration::from_millis(1));
+            client.loaded().contains(&edited_cube) && hs.server().block(ground).is_some()
+        },
+        20000,
+    );
+    assert!(returned, "never came back");
+    assert_eq!(
+        hs.server().block(ground),
+        Some(BlockStateId::AIR),
+        "server lost the edit"
+    );
+}
+
+/// Joins `name` and returns its `Welcome`: (spawn, yaw, pitch, flying).
+fn join(hs: &mut HeadlessServer, name: &str) -> (TestClient, [f64; 3], f32, f32, bool) {
+    let mut client = hs.connect(name);
+    for _ in 0..5 {
+        hs.step(1);
+        for msg in client.drain() {
+            if let ServerMsg::Welcome {
+                spawn,
+                yaw,
+                pitch,
+                flying,
+                ..
+            } = msg
+            {
+                return (client, spawn, yaw, pitch, flying);
+            }
+        }
+    }
+    panic!("no Welcome for {name}");
+}
+
+/// Flies `client` east for a while, then looks up and down a little.
+/// Returns the server's final record for the player.
+fn wander(hs: &mut HeadlessServer, client: &mut TestClient) -> ([f64; 3], f32, f32) {
+    let mut seq = 0u64;
+    let cruise = hs.server().players().next().unwrap().state.position.y + 10.0;
+    let mut ticks = 0;
+    fly_until(
+        hs,
+        client,
+        std::f32::consts::FRAC_PI_2,
+        cruise,
+        &mut seq,
+        |_, _| {
+            ticks += 1;
+            ticks > 60
+        },
+        100,
+    );
+    seq += 1;
+    client.send(ClientMsg::PlayerInput {
+        seq,
+        input: MoveInput {
+            yaw: 0.75,
+            ..MoveInput::IDLE
+        },
+        pitch: -0.4,
+    });
+    hs.step(1);
+    client.drain();
+    let state = hs.server().players().next().unwrap().state;
+    assert!(state.flying, "the wander should end in flight");
+    (state.position.to_array(), 0.75, -0.4)
+}
+
+#[test]
+fn a_player_returns_where_they_left_looking_the_same_way() {
+    let dir = TempDir::new().unwrap();
+    // An hour-long interval: only the shutdown flush saves.
+    let config = || persistent_config(&dir, Duration::from_secs(3600));
+    let mut hs = HeadlessServer::with_config(config());
+    let (mut client, spawn, _, _, flying) = join(&mut hs, "alice");
+    assert!(!flying);
+    let (position, yaw, pitch) = wander(&mut hs, &mut client);
+    assert_ne!(position, spawn, "the player never moved");
+    drop(hs);
+    drop(client);
+
+    let mut hs = HeadlessServer::with_config(config());
+    let (_alice, back, back_yaw, back_pitch, back_flying) = join(&mut hs, "alice");
+    assert_eq!(back, position);
+    assert_eq!((back_yaw, back_pitch, back_flying), (yaw, pitch, true));
+    let state = hs.server().players().next().unwrap().state;
+    assert_eq!(state.position.to_array(), position);
+    assert!(state.flying);
+    // Someone new still gets the world spawn.
+    let (_bob, bob_spawn, bob_yaw, _, bob_flying) = join(&mut hs, "bob");
+    assert_eq!(bob_spawn, spawn);
+    assert_eq!((bob_yaw, bob_flying), (0.0, false));
+}
+
+#[test]
+fn a_player_who_disconnects_first_is_still_remembered() {
+    let dir = TempDir::new().unwrap();
+    let config = || persistent_config(&dir, Duration::from_secs(3600));
+    let mut hs = HeadlessServer::with_config(config());
+    let (mut client, _, _, _, _) = join(&mut hs, "alice");
+    let (position, yaw, pitch) = wander(&mut hs, &mut client);
+    // The client goes away first; the server notices and drops the
+    // connection, then shuts down later.
+    drop(client);
+    hs.step(3);
+    assert_eq!(hs.server().players().count(), 0);
+    drop(hs);
+
+    let mut hs = HeadlessServer::with_config(config());
+    let (_alice, back, back_yaw, back_pitch, back_flying) = join(&mut hs, "alice");
+    assert_eq!(back, position);
+    assert_eq!((back_yaw, back_pitch, back_flying), (yaw, pitch, true));
+}

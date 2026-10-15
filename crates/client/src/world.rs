@@ -474,6 +474,9 @@ mod tests {
                 server_tick: 0,
                 tick_rate: 20,
                 spawn: [0.0, 64.0, 0.0],
+                yaw: 0.0,
+                pitch: 0.0,
+                flying: false,
             }),
             WorldChange::None
         );

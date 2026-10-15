@@ -144,6 +144,7 @@ never corrupts the database or waits.
 | `meta` | `&str → &[u8]`: `format_version` (`u32` = 1) and `seed` (`u64`) |
 | `block_states` | on-disk `u32` → canonical `namespace:path[prop=value,…]` (properties in declaration order) |
 | `cubes` | 13-byte position key → `[record schema u8 = 1][zstd level-3 frame of the cube codec bytes]` |
+| `players` | player name → `[schema u8 = 1][x y z: f64][yaw pitch: f32][flying u8]` (34 bytes, little-endian) |
 
 The **cube key** is `[kind: u8][x][y][z]`, each coordinate an i32
 big-endian with the sign bit flipped, so keys sort by coordinate value.
@@ -167,6 +168,20 @@ immediate durability, so when it returns the batch is on disk — plus
 `cube_count()` and the diagnostic/test hooks `meta`, `cube_positions` and
 `save_batch_with_meta` (the crash test stamps `last_batch` atomically with
 its cubes).
+
+### Players
+
+A returning player (matched by the `Hello` name) joins where they left:
+`Welcome` carries their saved feet position, look `yaw`/`pitch` and
+`flying` (protocol v5), and their server state starts there at rest. A new
+name, or a record that fails to decode (`StorageError::CorruptPlayer`,
+logged), gets the world spawn. The server keeps each player's look from
+their newest accepted `PlayerInput`. Every snapshot also carries the
+records of joined players and of players who left since the last one
+(`remove_connection` captures them, so a disconnect never loses the last
+position), written only when they differ from what was last committed and
+in the same transaction as that batch's cubes. `flush` saves them too and
+waits until every batch sent has been answered.
 
 ### Dirty tracking and pinning
 
