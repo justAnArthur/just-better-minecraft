@@ -150,6 +150,15 @@ impl SolidTable {
     }
 }
 
+/// Whether the unit block box at `pos` strictly overlaps the box spanned by
+/// `min`/`max`. Touching faces do not overlap — the same boundary rule the
+/// sweeps use. Shared by the server's place validation and the client's
+/// optimistic place check, so both reject exactly the same placements.
+pub fn block_overlaps_box(pos: BlockPos, min: DVec3, max: DVec3) -> bool {
+    let (x, y, z) = (pos.x as f64, pos.y as f64, pos.z as f64);
+    x < max.x && x + 1.0 > min.x && y < max.y && y + 1.0 > min.y && z < max.z && z + 1.0 > min.z
+}
+
 /// Blocks whose open interval `(b, b+1)` strictly overlaps the open
 /// interval `(min, max)`: `floor(min)` through `ceil(max) - 1` inclusive.
 ///
@@ -733,6 +742,35 @@ mod tests {
         assert!(s.flying);
         s = step(s, &idle(), &world);
         assert!(s.flying, "unflagged inputs leave the mode alone");
+    }
+
+    #[test]
+    fn block_overlap_follows_the_touching_boundary_rule() {
+        // A player box resting exactly on a block's top face.
+        let min = DVec3::new(0.2, 64.0, 0.2);
+        let max = DVec3::new(0.8, 65.8, 0.8);
+        let below = BlockPos { x: 0, y: 63, z: 0 };
+        assert!(
+            !block_overlaps_box(below, min, max),
+            "touching the top face is not an overlap"
+        );
+        // The cell the feet stand in, one up: overlaps on all axes.
+        assert!(block_overlaps_box(BlockPos { x: 0, y: 64, z: 0 }, min, max));
+        // Beside and above: misses on at least one axis each time.
+        assert!(!block_overlaps_box(
+            BlockPos { x: 1, y: 64, z: 0 },
+            min,
+            max
+        ));
+        assert!(!block_overlaps_box(
+            BlockPos {
+                x: -1,
+                y: 66,
+                z: -1
+            },
+            min,
+            max
+        ));
     }
 
     #[test]

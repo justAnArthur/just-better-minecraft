@@ -159,15 +159,30 @@ are bit-exact across platforms. The one exception is `yaw.sin_cos()`,
 computed once per step — the only platform-dependent operation; server
 correction absorbs any drift.
 
+### `raycast` — block targeting (task 1.7)
+
+`raycast(origin, dir, max_dist, hit)` walks voxels with Amanatides–Woo
+DDA and returns the first block for which `hit` says `Some(true)`, as a
+`RayHit { block, face, distance }` (`face` is the face entered).
+`Some(false)` passes through, and `None` (not loaded) stops the ray with
+no hit. Zero direction components never divide (they step at infinity);
+origins on exact grid coordinates and at |x| ≈ 10⁷ are tested. An origin
+inside a targetable block hits that block at distance 0, on the face
+opposite the direction's dominant axis. `REACH = 5.0` blocks. Callers
+target `StateInfo::solid` states via `SolidTable` (air and water pass
+through); per-state outline shapes are later.
+
 ## Protocol and links
 
 `protocol` holds the message enums the client and server exchange
-(`PROTOCOL_VERSION = 3`): `ClientMsg` (`Hello`, `PlayerInput { seq,
-input, pitch }`, `Ping`, `Disconnect`) and `ServerMsg` (`Welcome` with
+(`PROTOCOL_VERSION = 4`): `ClientMsg` (`Hello`, `PlayerInput { seq,
+input, pitch }`, `BreakBlock { pos }`, `PlaceBlock { pos, state }`,
+`Ping`, `Disconnect`) and `ServerMsg` (`Welcome` with
 the spawn feet position — the initial state: velocity 0, not on ground,
 walking — `PlayerState { ack_seq, state }` sent before `Tick` in ticks
 where the server processed at least one input, `Rejected`, `Tick`,
-`Pong`, `Disconnected`, `CubeData { pos, cube }`, `UnloadCube { pos }`).
+`Pong`, `Disconnected`, `CubeData { pos, cube }`, `UnloadCube { pos }`,
+`BlockChange { pos, state }` — the authoritative state of one block).
 `PlayerInput.seq` starts at 1 and increments per client tick; the server
 ignores seqs ≤ the last processed one. Pitch is display-only; physics
 ignores it. Messages are plain owned data — no `Arc`, no references, no
@@ -197,7 +212,8 @@ To add a case, add a function to `benches/core_bench.rs` inside a
 reports read `<area>/<case>` (e.g. `sample/fill_32cubed`, `cube/get_all_16_states`).
 Current cases include `physics/step_walk_flat` (median ≈ 12 ns on this
 Mac against a trivial flat-floor world) and `physics/step_fall_terminal`
-(≈ 13 ns, fall at terminal speed over loaded air).
+(≈ 13 ns, fall at terminal speed over loaded air), and
+`raycast/reach_5_diagonal` (≈ 58 ns).
 `criterion` is a dev-dependency via `[workspace.dependencies]` only — never a
 runtime dep.
 

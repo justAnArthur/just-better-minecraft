@@ -12,6 +12,7 @@ use jbm_core::block::BlockStateId;
 use jbm_core::coords::{BlockPos, CUBE_VOLUME};
 use jbm_core::cube::Cube;
 use jbm_core::physics::{self, BlockShapes, MoveInput, PlayerState};
+use jbm_core::raycast::{REACH, raycast};
 
 const CUBE: usize = 32;
 const CELLS: usize = CUBE * CUBE * CUBE;
@@ -177,5 +178,19 @@ fn bench_physics(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench, bench_cube, bench_physics);
+fn bench_raycast(c: &mut Criterion) {
+    let mut group = c.benchmark_group("raycast");
+
+    group.bench_function("reach_5_diagonal", |b| {
+        // Loaded air everywhere, so the ray walks its full diagonal reach —
+        // the worst-case per-targeting cost.
+        let origin = DVec3::new(0.5, 0.5, 0.5);
+        let dir = DVec3::new(1.0, 1.0, 1.0);
+        b.iter(|| raycast(origin, dir, REACH, |_| Some(false)))
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench, bench_cube, bench_physics, bench_raycast);
 criterion_main!(benches);

@@ -31,6 +31,7 @@ fn render_and_compare(name: &str, camera: &Camera, overlay: Option<OverlayText>)
         camera,
         overlay.as_ref(),
         None,
+        None,
     );
     let image = target.read_rgba(&gpu);
     assert_matches_golden(name, &image);
@@ -152,6 +153,7 @@ fn render_scene(golden_name: &str, scene: &[(CubePos, Cube)], camera: &Camera) {
         camera,
         None,
         Some(&mut terrain),
+        None,
     );
     let image = target.read_rgba(&gpu);
     assert_matches_golden(golden_name, &image);

@@ -161,7 +161,15 @@ fn main() {
     let mut total = std::time::Duration::ZERO;
     for _ in 0..FRAMES {
         let start = Instant::now();
-        renderer.render(&gpu, &view, depth.view(), &camera, None, Some(&mut terrain));
+        renderer.render(
+            &gpu,
+            &view,
+            depth.view(),
+            &camera,
+            None,
+            Some(&mut terrain),
+            None,
+        );
         gpu.device
             .poll(wgpu::PollType::Wait {
                 submission_index: None,

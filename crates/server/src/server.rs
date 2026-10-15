@@ -7,10 +7,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use glam::DVec3;
+use jbm_core::block::BlockStateId;
 use jbm_core::coords::{BlockPos, CubePos};
 use jbm_core::link::{LinkClosed, ServerLink};
 use jbm_core::physics::{self, BlockShapes, MoveInput, PlayerState, SolidTable};
 use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION, PlayerId, ServerMsg};
+use jbm_core::raycast::REACH;
 
 use crate::gen_pool::GenPool;
 use crate::streaming::{Offset, desired_offsets, in_keep, offset_pos};
@@ -27,6 +29,16 @@ const INPUT_QUEUE_CAP: usize = 20;
 
 /// Inputs stepped per player per tick in phase 4.
 const INPUTS_PER_TICK: usize = 4;
+
+/// Slack on the reach check, in blocks, so a player whose client-side ray
+/// was within `REACH` when they clicked still passes validation a round
+/// trip later.
+const REACH_MARGIN: f64 = 1.0;
+
+/// One queued outgoing block edit. `None` broadcasts to every player with
+/// the cube loaded; `Some(id)` sends to that player only (a rejection
+/// revert).
+type QueuedChange = (BlockPos, BlockStateId, Option<PlayerId>);
 
 /// The seed every default server generates its world with. Fixed so a
 /// fresh install always starts on the same terrain.
@@ -94,6 +106,17 @@ fn cube_containing(position: DVec3) -> CubePos {
     }
     .split()
     .0
+}
+
+/// Whether the center of the block at `pos` lies within
+/// `REACH + REACH_MARGIN` of the player's `eye`. The margin covers the
+/// round trip between the client's ray and this validation.
+fn within_reach(pos: BlockPos, eye: DVec3) -> bool {
+    let dx = pos.x as f64 + 0.5 - eye.x;
+    let dy = pos.y as f64 + 0.5 - eye.y;
+    let dz = pos.z as f64 + 0.5 - eye.z;
+    let limit = REACH + REACH_MARGIN;
+    dx * dx + dy * dy + dz * dz <= limit * limit
 }
 
 /// Read-only view of a joined player, for tests and diagnostics.
@@ -184,6 +207,16 @@ pub struct Server {
     /// Per-state solidity for physics; built once from the same registry
     /// the generator uses, so both sides of a collision agree.
     solid: SolidTable,
+    /// Total registered states; ids ≥ this are unknown and rejected by
+    /// place validation.
+    state_count: u32,
+    /// Cubes that hold an accepted edit. Pinned cubes are never evicted,
+    /// so builds survive the editor walking away until persistence lands
+    /// (task 2.3). The set grows without bound until then.
+    pinned: HashSet<CubePos>,
+    /// Block edits handled in phase 1, flushed early in phase 5 before the
+    /// streaming pass and the `Tick` message.
+    pending_changes: Vec<QueuedChange>,
     /// Desired-set offsets for the configured radii, sorted nearest-first.
     /// Computed once per config.
     desired: Vec<Offset>,
@@ -215,6 +248,7 @@ impl Server {
         let desired = desired_offsets(config.view_radius, config.vertical_radius);
         let spawn = generator.spawn();
         let solid = SolidTable::new(&registry);
+        let state_count = registry.state_count();
         Self {
             clock: TickClock::new(),
             tick_number: 0,
@@ -224,6 +258,9 @@ impl Server {
             pool,
             world: HashMap::new(),
             solid,
+            state_count,
+            pinned: HashSet::new(),
+            pending_changes: Vec::new(),
             desired,
             spawn,
             eviction_dirty: true,
@@ -311,6 +348,18 @@ impl Server {
             .map_or(0, |player| player.sent.len())
     }
 
+    /// Cubes pinned by an accepted edit (never evicted).
+    pub fn pinned_count(&self) -> usize {
+        self.pinned.len()
+    }
+
+    /// The authoritative block at `pos`, or `None` when its cube is not
+    /// in the server world.
+    pub fn block(&self, pos: BlockPos) -> Option<BlockStateId> {
+        let (cube_pos, local) = pos.split();
+        self.world.get(&cube_pos).map(|cube| cube.get(local))
+    }
+
     /// Phase 1: apply player inputs and channel messages. Connections are
     /// drained in join order, each connection's messages in arrival order,
     /// at most [`MESSAGES_PER_CONNECTION_PER_TICK`] per connection.
@@ -344,7 +393,28 @@ impl Server {
 
     /// Handle one inbound message for the connection at `idx`. Sends to a
     /// closed link drop the connection instead of panicking.
+    ///
+    /// Block edits are handled here, in message order as they arrive,
+    /// validated against the player's authoritative state as it stands
+    /// right now (phase 4 has not run yet this tick).
     fn handle_message(&mut self, idx: usize, msg: ClientMsg) -> Outcome {
+        // Edits need the whole server (world, other players); everything
+        // else only needs the one connection.
+        match msg {
+            ClientMsg::BreakBlock { pos } if self.connections[idx].joined_player().is_some() => {
+                self.handle_break(idx, pos)
+            }
+            ClientMsg::PlaceBlock { pos, state }
+                if self.connections[idx].joined_player().is_some() =>
+            {
+                self.handle_place(idx, pos, state)
+            }
+            msg => self.handle_message_rest(idx, msg),
+        }
+    }
+
+    /// The non-edit half of [`Server::handle_message`].
+    fn handle_message_rest(&mut self, idx: usize, msg: ClientMsg) -> Outcome {
         let conn = &mut self.connections[idx];
         match (&mut conn.state, msg) {
             (
@@ -434,7 +504,99 @@ impl Server {
                 Outcome::Keep
             }
             (ConnectionState::Joined(_), ClientMsg::Disconnect) => Outcome::Drop,
+            // Edits never reach this half: handle_message routes them to
+            // their own handlers while joined, and the Pending arm above
+            // catches them while pending.
+            (
+                ConnectionState::Joined(_),
+                ClientMsg::BreakBlock { .. } | ClientMsg::PlaceBlock { .. },
+            ) => Outcome::Keep,
         }
+    }
+
+    /// A `BreakBlock` from the joined player at `idx`. Validation: the
+    /// cube is loaded, the block center is within `REACH + 1` of the
+    /// player's eye (the margin covers latency), and the block is not
+    /// air. Accepted edits set the block, pin the cube and queue a
+    /// broadcast; rejections queue the authoritative state back to the
+    /// sender only. Rejections never disconnect.
+    fn handle_break(&mut self, idx: usize, pos: BlockPos) -> Outcome {
+        let eye = self.connections[idx]
+            .joined_player()
+            .expect("checked joined in handle_message")
+            .state
+            .eye();
+        let valid = self
+            .block(pos)
+            .is_some_and(|state| state != BlockStateId::AIR)
+            && within_reach(pos, eye);
+        if valid {
+            self.apply_edit(pos, BlockStateId::AIR);
+        } else {
+            self.queue_revert(idx, pos);
+        }
+        Outcome::Keep
+    }
+
+    /// A `PlaceBlock` from the joined player at `idx`. Validation adds to
+    /// the break rules: the target is air, `state` is a registered
+    /// non-air state, and a solid state's unit box strictly overlaps no
+    /// joined player's box (touching is allowed).
+    fn handle_place(&mut self, idx: usize, pos: BlockPos, state: BlockStateId) -> Outcome {
+        let eye = self.connections[idx]
+            .joined_player()
+            .expect("checked joined in handle_message")
+            .state
+            .eye();
+        let valid = self.block(pos) == Some(BlockStateId::AIR)
+            && within_reach(pos, eye)
+            && state != BlockStateId::AIR
+            && state.0 < self.state_count
+            && (!self.solid.is_solid(state) || !self.overlaps_any_player(pos));
+        if valid {
+            self.apply_edit(pos, state);
+        } else {
+            self.queue_revert(idx, pos);
+        }
+        Outcome::Keep
+    }
+
+    /// Applies an accepted edit: set the block, pin the cube against
+    /// eviction, and queue the broadcast.
+    fn apply_edit(&mut self, pos: BlockPos, state: BlockStateId) {
+        let (cube_pos, local) = pos.split();
+        if let Some(cube) = self.world.get_mut(&cube_pos) {
+            cube.set(local, state);
+        }
+        self.pinned.insert(cube_pos);
+        self.pending_changes.push((pos, state, None));
+    }
+
+    /// Queues the authoritative state of `pos` back to the rejecting
+    /// sender only, which reverts their optimistic edit. Nothing is sent
+    /// when there is no authoritative state (the cube is not in the world,
+    /// so the player cannot have it in their sent set either).
+    fn queue_revert(&mut self, idx: usize, pos: BlockPos) {
+        let Some(state) = self.block(pos) else {
+            return;
+        };
+        let id = self.connections[idx]
+            .joined_player()
+            .expect("checked joined in handle_message")
+            .id;
+        self.pending_changes.push((pos, state, Some(id)));
+    }
+
+    /// Whether a solid block at `pos` would strictly overlap any joined
+    /// player's box.
+    fn overlaps_any_player(&self, pos: BlockPos) -> bool {
+        self.connections
+            .iter()
+            .filter_map(Connection::joined_player)
+            .any(|player| {
+                let aabb = player.state.aabb();
+                physics::block_overlaps_box(pos, aabb.min, aabb.max)
+            })
     }
 
     /// Phase 2: run scheduled block ticks that are due. Empty stub until
@@ -485,13 +647,15 @@ impl Server {
         }
     }
 
-    /// Phase 5: recompute dirty light and send outgoing changes — here, the
-    /// cube streaming pass, then per player the `PlayerState` (only in
-    /// ticks where at least one input was processed) followed by the
-    /// `Tick` message every joined player receives, so cubes and state
-    /// always precede their tick. A player whose link has closed is
-    /// removed — a failed send never panics.
+    /// Phase 5: recompute dirty light and send outgoing changes — here,
+    /// the tick's queued `BlockChange`s, then the cube streaming pass,
+    /// then per player the `PlayerState` (only in ticks where at least one
+    /// input was processed) followed by the `Tick` message every joined
+    /// player receives, so cubes, blocks and state always precede their
+    /// tick. A player whose link has closed is removed — a failed send
+    /// never panics.
     fn phase_light_and_outgoing(&mut self) {
+        self.flush_block_changes();
         if self.config.streaming {
             self.phase_streaming();
         }
@@ -523,6 +687,43 @@ impl Server {
         }
     }
 
+    /// Sends the tick's queued `BlockChange`s: broadcasts go to every
+    /// player whose sent set contains the cube, reverts to the rejecting
+    /// sender only (and only if they still have the cube sent). This runs
+    /// before the streaming pass and the `Tick`, which guarantees the
+    /// "edit shows on the client within one tick" rule. Ordering safety: a
+    /// `CubeData` sent later in the same tick already contains the edit —
+    /// phase 1 mutated the world cube before any cube is cloned for
+    /// streaming — so a freshly streamed cube is never stale.
+    fn flush_block_changes(&mut self) {
+        let changes = std::mem::take(&mut self.pending_changes);
+        if changes.is_empty() {
+            return;
+        }
+        let mut dropped: Vec<usize> = Vec::new();
+        for (pos, state, recipient) in changes {
+            let cube = pos.split().0;
+            for (idx, conn) in self.connections.iter_mut().enumerate() {
+                let ConnectionState::Joined(player) = &mut conn.state else {
+                    continue;
+                };
+                let theirs = recipient.is_none_or(|id| id == player.id);
+                if theirs
+                    && player.sent.contains(&cube)
+                    && conn
+                        .link
+                        .send(ServerMsg::BlockChange { pos, state })
+                        .is_err()
+                {
+                    dropped.push(idx);
+                }
+            }
+        }
+        for idx in dropped.into_iter().rev() {
+            self.connections.remove(idx);
+        }
+    }
+
     /// The streaming pass, once per tick. Collects finished generation
     /// results, then per player (in join order): unloads cubes that left
     /// their keep set, sends newly in-range cubes nearest-first up to the
@@ -532,13 +733,16 @@ impl Server {
         // 1. Collect finished generation results into the world. Inline
         //    mode generates up to the budget first; threaded mode drains
         //    whatever the workers finished (bounded by max_in_flight).
+        //    Collection never overwrites: an edited cube may already be
+        //    back in the world (pinned), so the stale generated copy is
+        //    dropped.
         let mut collected = false;
         if self.config.gen_threads == 0 {
             for _ in 0..self.config.gen_budget_per_tick {
                 match self.pool.try_recv() {
                     Some((pos, cube)) => {
                         collected = true;
-                        self.world.insert(pos, cube);
+                        self.world.entry(pos).or_insert(cube);
                     }
                     None => break,
                 }
@@ -546,7 +750,7 @@ impl Server {
         } else {
             while let Some((pos, cube)) = self.pool.try_recv() {
                 collected = true;
-                self.world.insert(pos, cube);
+                self.world.entry(pos).or_insert(cube);
             }
         }
 
@@ -584,10 +788,11 @@ impl Server {
             self.connections.remove(idx);
         }
 
-        // 3. Eviction: drop world cubes no player's keep set contains.
-        //    Regeneration is exact, so dropping is lossless — but task 1.7
-        //    must pin edited cubes here or player builds will be lost on
-        //    walk-away until persistence lands in 2.3.
+        // 3. Eviction: drop world cubes no player's keep set contains,
+        //    keeping every pinned cube. Unpinned regeneration is exact, so
+        //    dropping those is lossless; pinned cubes hold edits that
+        //    would be lost, so they stay until persistence lands (2.3).
+        //    The pinned set grows without bound until then.
         if eviction_dirty {
             let (r, v) = (self.config.view_radius, self.config.vertical_radius);
             let centers: Vec<CubePos> = self
@@ -595,9 +800,16 @@ impl Server {
                 .iter()
                 .filter_map(|conn| conn.joined_player().map(|player| player.center))
                 .collect();
-            self.world
-                .retain(|pos, _| centers.iter().any(|&c| in_keep(*pos, c, r, v)));
-            self.eviction_dirty = false;
+            let Server {
+                world,
+                pinned,
+                eviction_dirty,
+                ..
+            } = self;
+            world.retain(|pos, _| {
+                pinned.contains(pos) || centers.iter().any(|&c| in_keep(*pos, c, r, v))
+            });
+            *eviction_dirty = false;
         }
     }
 }
@@ -719,7 +931,9 @@ impl Default for Server {
 
 #[cfg(test)]
 mod tests {
-    use super::{INPUT_QUEUE_CAP, INPUTS_PER_TICK, Server, ServerConfig};
+    use super::{INPUT_QUEUE_CAP, INPUTS_PER_TICK, Server, ServerConfig, cube_containing};
+    use jbm_core::block::{BlockStateId, builtin::Blocks};
+    use jbm_core::coords::{BlockPos, CubePos};
     use jbm_core::link::{ClientLink, in_process_pair};
     use jbm_core::physics::MoveInput;
     use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION, ServerMsg};
@@ -1194,5 +1408,385 @@ mod tests {
         assert_eq!(server.tick_count(), 1);
         assert_eq!(server.update(crate::tick::TICK_PERIOD * 3), 3);
         assert_eq!(server.tick_count(), 4);
+    }
+
+    // ------------------------------------------------------------------
+    // Block edits (task 1.7)
+
+    /// Joins two players on a streaming server and settles their cubes.
+    /// Both stand at spawn (identical sent sets), and no inputs are ever
+    /// sent, so their authoritative state stays exactly at spawn.
+    fn two_settled_players() -> (Server, ClientLink, ClientLink) {
+        let (mut server, mut a) = pending_hello_on(physics_server());
+        let (mut b, server_end) = in_process_pair();
+        server.add_connection(server_end);
+        b.send(ClientMsg::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            name: "bob".to_owned(),
+        })
+        .unwrap();
+        for _ in 0..12 {
+            server.tick();
+            let _ = drain(&mut a);
+            let _ = drain(&mut b);
+        }
+        assert_eq!(server.players().count(), 2);
+        (server, a, b)
+    }
+
+    /// The topmost solid block in column (0, 0), from the spawn feet down.
+    fn surface_block(server: &Server) -> BlockPos {
+        let feet = server.players().next().unwrap().state.position;
+        let mut y = feet.y.floor() as i64;
+        loop {
+            let solid = server
+                .block(BlockPos { x: 0, y, z: 0 })
+                .is_some_and(|state| state != BlockStateId::AIR);
+            if solid {
+                return BlockPos { x: 0, y, z: 0 };
+            }
+            y -= 1;
+        }
+    }
+
+    #[test]
+    fn break_and_place_apply_pin_and_broadcast_within_one_tick() {
+        let (mut server, mut a, mut b) = two_settled_players();
+        let ground = surface_block(&server);
+
+        a.send(ClientMsg::BreakBlock { pos: ground }).unwrap();
+        server.tick();
+        // The edit applied and the cube is pinned.
+        assert_eq!(server.block(ground), Some(BlockStateId::AIR));
+        assert_eq!(server.pinned_count(), 1);
+        // Both players (both have the cube loaded) learn it before Tick.
+        for client in [&mut a, &mut b] {
+            assert!(matches!(
+                drain(client).as_slice(),
+                [
+                    ServerMsg::BlockChange {
+                        pos,
+                        state: BlockStateId::AIR
+                    },
+                    ServerMsg::Tick { .. }
+                ] if *pos == ground
+            ));
+        }
+
+        // Place stone back into the now-air cell.
+        let stone = Blocks::register(&mut jbm_core::block::BlockRegistry::new()).stone;
+        a.send(ClientMsg::PlaceBlock {
+            pos: ground,
+            state: stone,
+        })
+        .unwrap();
+        server.tick();
+        assert_eq!(server.block(ground), Some(stone));
+        assert!(matches!(
+            drain(&mut a).as_slice(),
+            [
+                ServerMsg::BlockChange { state, .. },
+                ServerMsg::Tick { .. }
+            ] if *state == stone
+        ));
+    }
+
+    #[test]
+    fn rejected_edits_revert_the_sender_only() {
+        let (mut server, mut a, mut b) = two_settled_players();
+        let ground = surface_block(&server);
+        let ground_state = server.block(ground).unwrap();
+        let blocks = Blocks::register(&mut jbm_core::block::BlockRegistry::new());
+        let feet = server.players().next().unwrap().state.position;
+
+        // A grab bag of rejections: (message, the state the revert must
+        // carry). Out of reach targets a loaded cube 40 blocks east.
+        let far = BlockPos {
+            x: 40,
+            y: ground.y,
+            z: 0,
+        };
+        assert!(server.block(far).is_some(), "far cube is loaded");
+        let cases: Vec<(ClientMsg, BlockStateId)> = vec![
+            (
+                ClientMsg::BreakBlock { pos: far },
+                server.block(far).unwrap(),
+            ),
+            // Breaking air: the cell above the surface.
+            (
+                ClientMsg::BreakBlock {
+                    pos: BlockPos {
+                        x: 0,
+                        y: feet.y.floor() as i64,
+                        z: 0,
+                    },
+                },
+                BlockStateId::AIR,
+            ),
+            // Placing into the solid ground.
+            (
+                ClientMsg::PlaceBlock {
+                    pos: ground,
+                    state: blocks.stone,
+                },
+                ground_state,
+            ),
+            // Placing into the player's own feet cell (strict overlap).
+            (
+                ClientMsg::PlaceBlock {
+                    pos: BlockPos {
+                        x: 0,
+                        y: feet.y.floor() as i64,
+                        z: 0,
+                    },
+                    state: blocks.stone,
+                },
+                BlockStateId::AIR,
+            ),
+            // Placing air and an unknown state.
+            (
+                ClientMsg::PlaceBlock {
+                    pos: BlockPos {
+                        x: 0,
+                        y: feet.y.floor() as i64,
+                        z: 0,
+                    },
+                    state: BlockStateId::AIR,
+                },
+                BlockStateId::AIR,
+            ),
+            (
+                ClientMsg::PlaceBlock {
+                    pos: BlockPos {
+                        x: 0,
+                        y: feet.y.floor() as i64,
+                        z: 0,
+                    },
+                    state: BlockStateId(999_999),
+                },
+                BlockStateId::AIR,
+            ),
+        ];
+        for (msg, revert_state) in cases {
+            a.send(msg.clone()).unwrap();
+            server.tick();
+            assert!(
+                matches!(
+                    drain(&mut a).as_slice(),
+                    [
+                        ServerMsg::BlockChange { state, .. },
+                        ServerMsg::Tick { .. }
+                    ] if *state == revert_state
+                ),
+                "sender must be reverted for {msg:?}"
+            );
+            assert_eq!(
+                drain(&mut b).as_slice(),
+                &[ServerMsg::Tick {
+                    tick: server.tick_count()
+                }],
+                "nobody else hears about a rejection: {msg:?}"
+            );
+            assert_eq!(server.pinned_count(), 0, "nothing was edited: {msg:?}");
+        }
+
+        // An edit into an unloaded cube is rejected too, but the player
+        // cannot have that cube in their sent set (a sent cube is always
+        // in the server world), so there is no revert to send.
+        let unloaded = BlockPos {
+            x: 0,
+            y: 40_000,
+            z: 0,
+        };
+        assert_eq!(server.block(unloaded), None);
+        a.send(ClientMsg::BreakBlock { pos: unloaded }).unwrap();
+        server.tick();
+        assert_eq!(
+            drain(&mut a).as_slice(),
+            &[ServerMsg::Tick {
+                tick: server.tick_count()
+            }]
+        );
+        // The connection survives every rejection.
+        assert_eq!(server.players().count(), 2);
+    }
+
+    #[test]
+    fn edits_from_a_pending_connection_are_disconnected() {
+        let mut server = physics_server();
+        let (mut client, server_end) = in_process_pair();
+        server.add_connection(server_end);
+        client
+            .send(ClientMsg::BreakBlock {
+                pos: BlockPos { x: 0, y: 0, z: 0 },
+            })
+            .unwrap();
+        server.tick();
+        assert!(matches!(
+            drain(&mut client).as_slice(),
+            [ServerMsg::Disconnected { .. }]
+        ));
+        server.tick();
+        assert_eq!(server.players().count(), 0);
+    }
+
+    /// Flies the (only) player toward `yaw`, first rising to `cruise_y`
+    /// (well above any terrain) then sprint-flying horizontally, until
+    /// `done` holds. Steps and drains every tick; bounded by `max_ticks`.
+    fn fly_until(
+        server: &mut Server,
+        client: &mut ClientLink,
+        yaw: f32,
+        cruise_y: f64,
+        seq: &mut u64,
+        mut done: impl FnMut(&Server, &[ServerMsg]) -> bool,
+        max_ticks: usize,
+    ) -> bool {
+        for _ in 0..max_ticks {
+            let state = server.players().next().unwrap().state;
+            let rising = state.position.y < cruise_y;
+            let fly = MoveInput {
+                up: rising.into(),
+                forward: (!rising) as i8,
+                sprint: true,
+                fly_toggle: !state.flying,
+                yaw,
+                ..MoveInput::IDLE
+            };
+            *seq += 1;
+            client.send(input(*seq, fly)).unwrap();
+            server.tick();
+            let messages = drain(client);
+            if done(server, &messages) {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn a_pinned_cube_survives_walking_away_and_back() {
+        let (mut server, mut client) = pending_hello_on(physics_server());
+        let _ = joined_and_loaded(&mut server, &mut client);
+        let ground = surface_block(&server);
+        let pinned_cube = ground.split().0;
+
+        client.send(ClientMsg::BreakBlock { pos: ground }).unwrap();
+        server.tick();
+        let _ = drain(&mut client);
+        assert_eq!(server.block(ground), Some(BlockStateId::AIR));
+        assert_eq!(server.pinned_count(), 1);
+
+        // Fly east (yaw pi/2) until the pinned cube leaves the keep set
+        // and is unloaded from the client.
+        let mut seq = 0u64;
+        let start = server.players().next().unwrap().state.position;
+        let cruise = start.y + 40.0;
+        let left = fly_until(
+            &mut server,
+            &mut client,
+            std::f32::consts::FRAC_PI_2,
+            cruise,
+            &mut seq,
+            |_, messages| {
+                messages
+                    .iter()
+                    .any(|m| matches!(m, ServerMsg::UnloadCube { pos } if *pos == pinned_cube))
+            },
+            4000,
+        );
+        assert!(left, "the pinned cube was never unloaded");
+        // Evicted world cubes: everything unpinned around spawn is gone,
+        // the pinned cube stays.
+        assert_eq!(server.block(ground), Some(BlockStateId::AIR));
+        let beside = BlockPos {
+            x: 0,
+            y: ground.y,
+            z: 32,
+        };
+        assert_eq!(
+            server.block(beside),
+            None,
+            "unpinned neighbour cube was evicted"
+        );
+        assert_eq!(server.pinned_count(), 1);
+
+        // Fly home (yaw -pi/2): the cube streams back with the edit.
+        let returned = fly_until(
+            &mut server,
+            &mut client,
+            -std::f32::consts::FRAC_PI_2,
+            cruise,
+            &mut seq,
+            |_, messages| {
+                messages
+                    .iter()
+                    .any(|m| matches!(m, ServerMsg::CubeData { pos, .. } if *pos == pinned_cube))
+            },
+            4000,
+        );
+        assert!(returned, "the pinned cube never streamed back");
+        assert_eq!(server.block(ground), Some(BlockStateId::AIR));
+    }
+
+    #[test]
+    fn world_cube_count_keeps_only_pinned_cubes_after_the_player_leaves() {
+        let (mut server, mut client) = pending_hello_on(physics_server());
+        let _ = joined_and_loaded(&mut server, &mut client);
+        let loaded = server.world_cube_count();
+        assert!(loaded > 1);
+
+        let ground = surface_block(&server);
+        client.send(ClientMsg::BreakBlock { pos: ground }).unwrap();
+        server.tick();
+        let _ = drain(&mut client);
+
+        client.send(ClientMsg::Disconnect).unwrap();
+        for _ in 0..5 {
+            server.tick();
+        }
+        drop(client);
+        for _ in 0..5 {
+            server.tick();
+        }
+        assert_eq!(server.players().count(), 0);
+        assert_eq!(server.pinned_count(), 1);
+        assert_eq!(
+            server.world_cube_count(),
+            1,
+            "only the pinned cube survives the player leaving"
+        );
+    }
+
+    #[test]
+    fn collecting_generation_never_overwrites_an_edited_cube() {
+        let (mut server, mut client) = pending_hello_on(physics_server());
+        let _ = joined_and_loaded(&mut server, &mut client);
+        let center = cube_containing(server.players().next().unwrap().state.position);
+        // In the keep set (r + 1 = 2) but outside the desired set (r = 1):
+        // streaming will keep it, but never requests or sends it.
+        let target = CubePos {
+            x: center.x + 2,
+            y: center.y,
+            z: center.z,
+        };
+        assert!(!server.world.contains_key(&target));
+
+        // Request generation, then land an edited cube in the world before
+        // the result is collected — the race `entry().or_insert` must win.
+        server.pool.request(target);
+        let blocks = Blocks::register(&mut jbm_core::block::BlockRegistry::new());
+        server
+            .world
+            .insert(target, jbm_core::cube::Cube::filled(blocks.glass));
+        let probe = target.block(jbm_core::coords::LocalPos::new_unchecked(1, 1, 1));
+        server.tick();
+        let _ = drain(&mut client);
+
+        assert_eq!(
+            server.block(probe),
+            Some(blocks.glass),
+            "generation overwrote the edited cube"
+        );
     }
 }
