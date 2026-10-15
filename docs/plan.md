@@ -90,9 +90,9 @@ Blocks are hardcoded in Rust for now.
 
 | Wave | Task | Crate | Done when |
 | --- | --- | --- | --- |
-| A | [ ] 2.1 Declarative worldgen: density-function graph format and native evaluator; replaces 1.5's noise | `server` | Same terrain from graph as from code; eval bench at several resolutions |
-| A | [ ] 2.2 GPU buffer suballocator, multi-draw indirect, fallback path | `client` | Screenshot tests unchanged; draw-call count drops in bench |
-| A | [ ] 2.3 `redb` persistence of cubes, zstd, background saving | `server` | Kill-during-save test reloads a valid world |
+| A | [x] 2.1 Declarative worldgen: density-function graph format and native evaluator; replaces 1.5's noise | `server` | Same terrain from graph as from code; eval bench at several resolutions |
+| A | [x] 2.2 GPU buffer suballocator, multi-draw indirect, fallback path | `client` | Screenshot tests unchanged; draw-call count drops in bench |
+| A | [x] 2.3 `redb` persistence of cubes, zstd, background saving | `server` | Kill-during-save test reloads a valid world |
 | B | [ ] 2.4 LOD pyramid: downsampling rule, edit propagation up the levels | `core`, `server` | Tests: thin walls survive LOD1–2; edit shows in parent LOD |
 | B | [ ] 2.5 GPU frustum and Hi-Z occlusion culling in compute | `client` | Golden images match; bench shows culled counts in caves |
 | C | [ ] 2.6 Clipmap streaming of LOD rings, skirts at seams | `client`, `server` | Fly test: no holes at ring borders (screenshots) |
