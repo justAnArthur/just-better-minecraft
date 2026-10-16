@@ -166,7 +166,11 @@ of parent cells that actually changed — the next level's input, so
 propagation stays proportional to what changed; `None` means no change.
 `downsample_octant(child, parent, octant)` is the whole-cube case with
 fast paths: a uniform child fills its octant with its own state, and a
-parent already uniform and equal to that fill is never unpacked. Both
+parent already uniform and equal to that fill is never unpacked.
+`copy_octant(src, parent, octant) -> Option<CellBox>` (task 2.7) installs
+an octant precomputed elsewhere — a generation worker downsamples the
+LOD0 cube off-thread and the tick thread only copies — returning the
+changed box like the other writers. All of them
 call `Cube::compact` after a write, so a parent that went uniform again
 returns to its cheapest storage (that cost is in the `lod/*` benches).
 

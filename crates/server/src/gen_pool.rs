@@ -14,17 +14,35 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 
+use jbm_core::block::BlockStateId;
 use jbm_core::coords::CubePos;
+use jbm_core::cube::Cube;
+use jbm_core::lod::downsample_octant;
+use jbm_core::lod::parent;
 
 use crate::storage::{Storage, StorageError};
 use crate::terrain::Generator;
 
-/// One finished (or exploded) job, as a worker reports it.
+/// One finished (or exploded) job, as a worker reports it. The second cube
+/// is the LOD0 cube's precomputed level-1 octant (task 2.7): the worker
+/// downsamples off the tick thread, into a uniform-air scratch cube at the
+/// octant's own slot of its level-1 parent, so pyramid ingest on the tick
+/// thread is a bulk copy (`copy_octant`), not a downsample.
 enum JobResult {
-    Done(CubePos, jbm_core::cube::Cube),
+    Done(CubePos, Cube, Cube),
     /// A worker panicked generating this cube; the payload is re-raised on
     /// the tick thread by `try_recv` so the panic never silently vanishes.
     Panicked(CubePos, Box<dyn std::any::Any + Send>),
+}
+
+/// The level-1 octant of a LOD0 cube, as the workers hand it back: a
+/// uniform-air scratch cube with the downsample installed at the cube's
+/// octant slot of its parent.
+fn lod1_octant(pos: CubePos, cube: &Cube) -> Cube {
+    let (_, octant) = parent(pos);
+    let mut scratch = Cube::filled(BlockStateId::AIR);
+    downsample_octant(cube, &mut scratch, octant);
+    scratch
 }
 
 /// Cube generation pool. With `threads == 0` it runs in inline mode: requests
@@ -117,23 +135,26 @@ impl GenPool {
         }
     }
 
-    /// Take one finished result if one is ready. In inline mode this
-    /// generates the next queued cube synchronously on the calling thread.
+    /// Take one finished result if one is ready: the position, the cube,
+    /// and the cube's precomputed level-1 octant scratch. In inline mode
+    /// this generates the next queued cube (and its octant) synchronously
+    /// on the calling thread.
     ///
     /// If a worker panicked generating a cube, that panic is resumed here —
     /// panics surface on the tick thread instead of vanishing with the
     /// worker.
-    pub fn try_recv(&mut self) -> Option<(CubePos, jbm_core::cube::Cube)> {
+    pub fn try_recv(&mut self) -> Option<(CubePos, Cube, Cube)> {
         if self.threads.is_empty() {
             let pos = self.inline_queue.pop_front()?;
             let cube = load_or_generate(self.storage.as_ref(), &self.generator, pos);
+            let octant = lod1_octant(pos, &cube);
             self.in_flight.remove(&pos);
-            Some((pos, cube))
+            Some((pos, cube, octant))
         } else {
             match self.results_rx.try_recv() {
-                Ok(JobResult::Done(pos, cube)) => {
+                Ok(JobResult::Done(pos, cube, octant)) => {
                     self.in_flight.remove(&pos);
-                    Some((pos, cube))
+                    Some((pos, cube, octant))
                 }
                 Ok(JobResult::Panicked(pos, payload)) => {
                     self.in_flight.remove(&pos);
@@ -211,11 +232,13 @@ fn worker(
             break;
         }
         match panic::catch_unwind(AssertUnwindSafe(|| {
-            load_or_generate(storage.as_ref(), &generator, pos)
+            let cube = load_or_generate(storage.as_ref(), &generator, pos);
+            let octant = lod1_octant(pos, &cube);
+            (cube, octant)
         })) {
-            Ok(cube) => {
+            Ok((cube, octant)) => {
                 // The pool outlives its workers, so this cannot fail.
-                let _ = results.send(JobResult::Done(pos, cube));
+                let _ = results.send(JobResult::Done(pos, cube, octant));
             }
             Err(payload) => {
                 let _ = results.send(JobResult::Panicked(pos, payload));
@@ -226,7 +249,7 @@ fn worker(
 
 #[cfg(test)]
 mod tests {
-    use super::{GenPool, Generator};
+    use super::{Cube, GenPool, Generator};
     use jbm_core::block::BlockRegistry;
     use jbm_core::block::builtin::Blocks;
     use jbm_core::coords::CubePos;
@@ -277,8 +300,14 @@ mod tests {
         let mut got = std::collections::HashSet::new();
         while got.len() < wanted.len() {
             assert!(Instant::now() < deadline, "generation timed out");
-            if let Some((pos, cube)) = pool.try_recv() {
+            if let Some((pos, cube, octant)) = pool.try_recv() {
                 assert_eq!(cube, terrain.generate(pos));
+                // The precomputed level-1 octant is the cube's downsample
+                // at its own slot of the parent.
+                let (_, octant_index) = jbm_core::lod::parent(pos);
+                let mut expected = Cube::filled(jbm_core::block::BlockStateId::AIR);
+                jbm_core::lod::downsample_octant(&cube, &mut expected, octant_index);
+                assert_eq!(octant, expected, "octant scratch for {pos:?}");
                 got.insert(pos);
             }
         }

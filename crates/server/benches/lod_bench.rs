@@ -13,11 +13,18 @@ use jbm_server::lod::LodPyramid;
 use jbm_server::terrain::Generator;
 use jbm_server::{DEFAULT_SEED, Server, ServerConfig};
 use std::hint::black_box;
+use std::sync::Arc;
 
 fn generator() -> Generator {
     let mut registry = BlockRegistry::new();
     let blocks = Blocks::register(&mut registry);
     Generator::new(DEFAULT_SEED, blocks)
+}
+
+/// A fresh generator behind an `Arc`, for pyramids (the local `generator`
+/// in `bench` shadows the builder above).
+fn arc_generator() -> Arc<Generator> {
+    Arc::new(generator())
 }
 
 /// A cube position whose column intersects the surface near the origin.
@@ -76,11 +83,13 @@ fn report_default_view_heap() {
         while client.try_recv().unwrap().is_some() {}
     }
     eprintln!(
-        "lod/default_view: lod0 cubes = {}, lod cubes = {}, lod heap = {} bytes ({:.1} KiB)",
+        "lod/default_view: lod0 cubes = {}, lod cubes = {}, lod heap = {} bytes ({:.1} KiB), \
+         internal requests = {}",
         server.world_cube_count(),
         server.lod_cube_count(),
         server.lod_heap_bytes(),
-        server.lod_heap_bytes() as f64 / 1024.0
+        server.lod_heap_bytes() as f64 / 1024.0,
+        server.lod_internal_requests()
     );
 }
 
@@ -130,7 +139,9 @@ fn bench(c: &mut Criterion) {
         // picked so that LOD1 really changes; a no-op edit would stop at
         // the first level and measure nothing.
         let cube = generator.generate(pos);
-        let base = {
+        // The pyramid owns worker plumbing and is not `Clone`; a bare one
+        // is rebuilt per batch in the untimed setup instead.
+        let base = || {
             let mut pyramid = LodPyramid::new(4);
             pyramid.insert_lod0(pos, &cube);
             pyramid
@@ -141,16 +152,50 @@ fn bench(c: &mut Criterion) {
             .find_map(|local| {
                 let mut edited = cube.clone();
                 edited.set(local, jbm_core::block::BlockStateId::AIR);
-                let mut pyramid = base.clone();
+                let mut pyramid = base();
                 (!pyramid.edit_lod0(pos.block(local), &edited).is_empty())
                     .then_some((edited, local))
             })
             .expect("some single break changes LOD1");
         let block = pos.block(local);
         b.iter_batched(
-            || base.clone(),
+            base,
             |mut pyramid| {
                 black_box(pyramid.edit_lod0(block, &edited));
+                pyramid
+            },
+            BatchSize::PerIteration,
+        )
+    });
+
+    group.bench_function("fill_poll", |b| {
+        // One inline poll that fills one requested surface cube: the
+        // load-or-sample job (one `sample_lod` at level 2) plus its merge
+        // into the pyramid — the fill pipeline's per-cube cost on the tick
+        // thread in inline mode. Setup queues the job; the poll runs it.
+        let pos = {
+            let h = generator.surface_height(0, 0);
+            CubePos {
+                x: 0,
+                y: (h >> 7) as i32,
+                z: 0,
+            }
+        };
+        assert!(
+            generator.sample_lod(2, pos).uniform().is_none(),
+            "the filled case must be mixed"
+        );
+        let fill_generator = arc_generator();
+        b.iter_batched(
+            || {
+                let mut pyramid =
+                    LodPyramid::with_workers(2, Arc::clone(&fill_generator), None, 0, 1);
+                pyramid.request(2, pos);
+                pyramid
+            },
+            |mut pyramid| {
+                pyramid.poll();
+                black_box(());
                 pyramid
             },
             BatchSize::PerIteration,

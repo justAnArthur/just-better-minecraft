@@ -110,6 +110,38 @@ fn bench(c: &mut Criterion) {
         });
     }
     group.finish();
+
+    let mut group = c.benchmark_group("worldgen/sample_lod");
+    // Sampling the LOD pyramid's fill content straight from the graph
+    // (task 2.7), next to `surface_cube`: each level's surface cube, plus
+    // level 2's uniform-air fast path. Surface cases are asserted mixed.
+    for level in [1u8, 2, 4] {
+        group.bench_function(format!("{level}/surface"), |b| {
+            let generator = generator();
+            let shift = 5 + level as i64;
+            let pos = CubePos {
+                x: 0,
+                y: (generator.surface_height(0, 0) >> shift) as i32,
+                z: 0,
+            };
+            assert!(
+                generator.sample_lod(level, pos).uniform().is_none(),
+                "level {level} surface case must be mixed"
+            );
+            b.iter(|| generator.sample_lod(level, black_box(pos)))
+        });
+    }
+    group.bench_function("2/air", |b| {
+        let generator = generator();
+        let pos = CubePos { x: 0, y: 100, z: 0 };
+        assert_eq!(
+            generator.sample_lod(2, pos).uniform(),
+            Some(jbm_core::block::BlockStateId::AIR),
+            "the air case must hit the fast path"
+        );
+        b.iter(|| generator.sample_lod(2, black_box(pos)))
+    });
+    group.finish();
 }
 
 criterion_group!(benches, bench);

@@ -10,12 +10,15 @@
 //! the equivalence tests and the comparison bench.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use jbm_core::block::BlockStateId;
 use jbm_core::block::builtin::Blocks;
 use jbm_core::coords::{CUBE_SIZE, CubePos};
 use jbm_core::cube::Cube;
+use jbm_core::lod::downsample_cell;
 
 use crate::worldgen::{self, CompiledGraph};
 
@@ -97,6 +100,13 @@ pub struct Generator {
     blocks: Blocks,
     graph: Arc<CompiledGraph>,
     column_cache: Mutex<HashMap<(i32, i32), ColumnData>>,
+    /// Test hooks (task 2.7): how many `generate` and how many
+    /// `sample_lod` mixed-path calls ran. Fast paths count nowhere — the
+    /// LOD tests use `lod_sample_calls` to prove a fast path or a storage
+    /// reload did no sampling, and `generate_calls` to prove `sample_lod`
+    /// never generates LOD0 cubes.
+    generate_calls: AtomicU64,
+    lod_sample_calls: AtomicU64,
 }
 
 impl Generator {
@@ -107,6 +117,8 @@ impl Generator {
             blocks,
             graph: worldgen::overworld(),
             column_cache: Mutex::new(HashMap::new()),
+            generate_calls: AtomicU64::new(0),
+            lod_sample_calls: AtomicU64::new(0),
         }
     }
 
@@ -118,7 +130,20 @@ impl Generator {
             blocks,
             graph: Arc::new(graph.clone()),
             column_cache: Mutex::new(HashMap::new()),
+            generate_calls: AtomicU64::new(0),
+            lod_sample_calls: AtomicU64::new(0),
         }
+    }
+
+    /// Test hook: `generate` calls so far.
+    pub fn generate_calls(&self) -> u64 {
+        self.generate_calls.load(Ordering::Relaxed)
+    }
+
+    /// Test hook: `sample_lod` calls that ran the sampling path (fast paths
+    /// excluded) so far.
+    pub fn lod_sample_calls(&self) -> u64 {
+        self.lod_sample_calls.load(Ordering::Relaxed)
     }
 
     /// Surface height (block y of the grass/sand layer) at world column
@@ -265,6 +290,7 @@ impl Generator {
     /// then build in a single [`Cube::from_fn`] pass, so there is no
     /// per-block `set` palette churn.
     pub fn generate(&self, pos: CubePos) -> Cube {
+        self.generate_calls.fetch_add(1, Ordering::Relaxed);
         let graph = self.graph.as_ref();
         let bottom = i64::from(pos.y) * i64::from(CUBE_SIZE);
         let top = bottom + i64::from(CUBE_SIZE) - 1;
@@ -364,6 +390,160 @@ impl Generator {
         }
         let mut cells = flat.into_iter();
         Cube::from_fn(move |_| cells.next().unwrap())
+    }
+
+    /// A LOD cube at `level ≥ 1` and `pos`, sampled straight from the
+    /// density graph at that level's resolution — no LOD0 cube is generated
+    /// and the LOD0 world is never consulted (task 2.7).
+    ///
+    /// Density is sampled on the level-(*n*−1) grid: 2·`CUBE_SIZE` points
+    /// per axis at step 2^(*n*−1), each at the minimum corner of its child
+    /// cell, plus the surface lookahead above. The surface stage runs in
+    /// **block units**: a sample's run `d` is its consecutive solid samples
+    /// above times 2^(*n*−1), capped at [`SURFACE_LOOKAHEAD`], and its `y`
+    /// is its block y — so at coarse levels the dirt band vanishes and the
+    /// top stays grass or sand. One refinement: the **top solid sample**
+    /// carries its column's true surface material — the surface is refined
+    /// upward from it (at most 2^(*n*−1)−1 extra rows per column) so the
+    /// sand/grass belt stays one block wide instead of one sample wide; at
+    /// level 1 the refinement is empty and the sample is the surface. Each
+    /// 2×2×2 group of samples then becomes one cell through
+    /// [`downsample_cell`], the same rule as the pyramid.
+    ///
+    /// **Level 1 is exact**: the samples equal the generated LOD0 cells
+    /// (asserted by the tests), so the cube equals `downsample_octant` of
+    /// the eight generated LOD0 cubes. Higher levels are an approximation
+    /// bounded by the accuracy tests.
+    ///
+    /// Fast paths from `bounds`, as `generate`: uniform air or uniform
+    /// stone without touching the graph (zero samples — the fast-path tests
+    /// count them through [`Generator::lod_sample_calls`]). Banded graphs
+    /// (the shipped one included) evaluate the column stage once per sample
+    /// column and take the band's provable solid/air rows for free.
+    pub fn sample_lod(&self, level: u8, pos: CubePos) -> Cube {
+        assert!(level >= 1, "sample_lod is for levels >= 1");
+        let graph = self.graph.as_ref();
+        let step = 1i64 << (level as u32 - 1); // 2^(n-1) blocks between samples
+        let side = i64::from(CUBE_SIZE) << level as u32; // blocks per axis
+        let base = [
+            i64::from(pos.x) * side,
+            i64::from(pos.y) * side,
+            i64::from(pos.z) * side,
+        ];
+        let top = base[1] + side - 1;
+        let max = [base[0] + side - 1, top, base[2] + side - 1];
+        if graph
+            .bounds(base, [max[0], top + SURFACE_LOOKAHEAD as i64, max[2]])
+            .0
+            >= 0.0
+        {
+            return Cube::filled(self.blocks.stone);
+        }
+        if graph.bounds(base, max).1 < 0.0 {
+            return Cube::default();
+        }
+        self.lod_sample_calls.fetch_add(1, Ordering::Relaxed);
+
+        // One fused downward pass per sample column, exactly `generate`'s
+        // mixed path but stepping `step` blocks: rows are the sample j of
+        // the column, plus `lookahead` samples above the cube so top rows
+        // see the same saturated runs `generate` would.
+        let per_axis = 2 * CUBE_SIZE as usize; // samples per axis
+        let lookahead = SURFACE_LOOKAHEAD.div_ceil(step as usize);
+        let rows = per_axis + lookahead;
+        let mut states = vec![BlockStateId::AIR; per_axis * per_axis * per_axis];
+        let blocks = self.blocks;
+        let mut fill_column = |x: usize, z: usize, solid: &mut dyn FnMut(i64) -> bool| {
+            // Solidity of every row first, so the top solid sample's
+            // sand/grass can be decided by the column's true surface (see
+            // the doc comment): refine upward from it, at most `step - 1`
+            // extra rows.
+            let mut is_solid = vec![false; rows];
+            for j in (0..rows).rev() {
+                is_solid[j] = solid(base[1] + step * j as i64);
+            }
+            let top_sample = (0..rows).rev().find(|&j| is_solid[j]);
+            let true_surface = top_sample.map(|top| {
+                let top_y = base[1] + step * top as i64;
+                let mut h = top_y;
+                while h + 1 < top_y + step && solid(h + 1) {
+                    h += 1;
+                }
+                h
+            });
+            let mut d: u8 = 0; // consecutive solid samples above, unscaled
+            for j in (0..rows).rev() {
+                let y = base[1] + step * j as i64;
+                let solid_j = is_solid[j];
+                if j < per_axis {
+                    // d in block units, as the surface stage defines it; the
+                    // top solid sample carries the true surface's material.
+                    let d_blocks = ((d as i64) * step).min(SURFACE_LOOKAHEAD as i64) as u8;
+                    let at = (j * per_axis + z) * per_axis + x;
+                    let block_y = if Some(j) == top_sample {
+                        true_surface.unwrap()
+                    } else {
+                        y
+                    };
+                    states[at] = surface_block(solid_j, d_blocks, block_y, &blocks);
+                }
+                d = if solid_j {
+                    (d + 1).min(SURFACE_LOOKAHEAD as u8)
+                } else {
+                    0
+                };
+            }
+        };
+        match graph.band() {
+            Some(band) => {
+                let mut regs = vec![0.0; graph.register_count()];
+                for z in 0..per_axis {
+                    for x in 0..per_axis {
+                        let (wx, wz) = (base[0] + step * x as i64, base[2] + step * z as i64);
+                        graph.eval_column(self.seed, wx, wz, &mut regs);
+                        fill_column(x, z, &mut |y| {
+                            if y <= band.low() {
+                                true
+                            } else if y >= band.high() {
+                                false
+                            } else {
+                                graph.eval_cell_density(self.seed, wx, y, wz, &mut regs) >= 0.0
+                            }
+                        });
+                    }
+                }
+            }
+            None => {
+                let mut regs = vec![0.0; graph.register_count()];
+                for z in 0..per_axis {
+                    for x in 0..per_axis {
+                        let (wx, wz) = (base[0] + step * x as i64, base[2] + step * z as i64);
+                        // The column stage only writes column registers, so
+                        // `regs` stays a valid column state for every row of
+                        // the downward pass (as `generate`'s live path).
+                        graph.eval_column(self.seed, wx, wz, &mut regs);
+                        fill_column(x, z, &mut |y| {
+                            graph.eval_cell_density(self.seed, wx, y, wz, &mut regs) >= 0.0
+                        });
+                    }
+                }
+            }
+        }
+        // Each cell's eight children are the samples at 2·cell + (dx, dy, dz)
+        // — the same gather `downsample_octant` does, on the doubled grid.
+        Cube::from_fn(|p| {
+            let (px, py, pz) = (p.x as usize, p.y as usize, p.z as usize);
+            let mut children = [BlockStateId::AIR; 8];
+            for dy in 0..2usize {
+                for dz in 0..2usize {
+                    for dx in 0..2usize {
+                        let at = ((2 * py + dy) * per_axis + 2 * pz + dz) * per_axis + 2 * px + dx;
+                        children[dx + 2 * dz + 4 * dy] = states[at];
+                    }
+                }
+            }
+            downsample_cell(children)
+        })
     }
 }
 

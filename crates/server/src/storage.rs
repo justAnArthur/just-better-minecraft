@@ -2,11 +2,14 @@
 //! (task 2.3).
 //!
 //! Layout (see the crate README for the full contract):
-//! - `meta`: `format_version`, `seed` and test bookkeeping.
+//! - `meta`: `format_version`, `seed`, `lod_fingerprint` and test
+//!   bookkeeping.
 //! - `block_states`: on-disk state id → canonical state string. Ids are
 //!   stable across restarts even when the runtime registry orders states
 //!   differently, so cubes decode to the same blocks.
 //! - `cubes`: 13-byte position key → `[record schema][zstd(codec bytes)]`.
+//!   Key kind 0 is a LOD0 cube (schema 1); kind *n* in `1..=4` is a LOD
+//!   level-*n* cube (schema 2, task 2.7).
 //!
 //! A cube record is written by exactly one transaction, so a crash never
 //! leaves a half-written cube or a half-written batch. [`Storage`] is
@@ -18,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use jbm_core::block::{BlockRegistry, BlockStateId, StateInfo};
 use jbm_core::coords::{CUBE_VOLUME, CubePos};
@@ -37,11 +41,25 @@ const PLAYERS: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("players"
 const CUBES: TableDefinition<'_, &[u8; 13], &[u8]> = TableDefinition::new("cubes");
 
 /// Current on-disk format version; a database written by a newer format is
-/// rejected with [`StorageError::VersionTooNew`] instead of misread.
+/// rejected with [`StorageError::VersionTooNew`] instead of misread. Stays
+/// 1 with the LOD records of task 2.7: databases written before 2.7 hold no
+/// key with kind ≥ 1, so they open unchanged.
 const FORMAT_VERSION: u32 = 1;
 
-/// Cube record schema byte stored in front of every value in `cubes`.
+/// Cube record schema byte in front of every LOD0 value in `cubes`.
 const RECORD_SCHEMA: u8 = 1;
+
+/// Record schema byte in front of every LOD value in `cubes` (task 2.7):
+/// `[2][known: u8][zstd frame of the cube codec bytes]`, where `known` is
+/// the LOD cube's real-octant bitmask. A record that fails to decode is
+/// logged by the caller and treated as absent.
+const LOD_RECORD_SCHEMA: u8 = 2;
+
+/// `meta` key holding the worldgen fingerprint stored LOD was written
+/// under: `hash(compiled graph fingerprint, seed)` as u64 LE. A mismatch
+/// means a different worldgen produced the stored LOD, so it is ignored
+/// and overwritten; LOD0 records are never deleted.
+const LOD_FINGERPRINT_KEY: &str = "lod_fingerprint";
 
 /// zstd level for cube records.
 const ZSTD_LEVEL: i32 = 3;
@@ -139,6 +157,18 @@ fn meta_corrupt(key: &'static str) -> StorageError {
     StorageError::CorruptMeta(key)
 }
 
+/// The stored-LOD worldgen fingerprint: the compiled graph's fingerprint
+/// mixed with the world seed (the same graph under a different seed is
+/// different worldgen). `DefaultHasher` has fixed keys, so the mix is
+/// stable across runs.
+fn lod_fingerprint(graph_fingerprint: u64, seed: u64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    graph_fingerprint.hash(&mut hasher);
+    seed.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Upper bound on a cube's codec bytes (header, a full palette, and one
 /// word per block — looser than any real width), so a corrupt frame header
 /// cannot make decode allocate without limit.
@@ -158,7 +188,7 @@ fn db_err(path: &Path, error: redb::DatabaseError) -> StorageError {
 
 /// 13-byte cube key: `[kind][x][y][z]`, each coordinate an i32 big-endian
 /// with the sign bit flipped so keys sort by coordinate value. `kind = 0` is
-/// a LOD0 cube; 1..=255 are reserved (LOD cubes come in task 2.7).
+/// a LOD0 cube; kind *n* in `1..=4` is a LOD level-*n* cube (task 2.7).
 fn cube_key(pos: CubePos) -> [u8; 13] {
     fn field(out: &mut [u8], v: i32) {
         let bytes = v.to_be_bytes();
@@ -169,6 +199,13 @@ fn cube_key(pos: CubePos) -> [u8; 13] {
     field(&mut key[1..5], pos.x);
     field(&mut key[5..9], pos.y);
     field(&mut key[9..13], pos.z);
+    key
+}
+
+/// The LOD twin of [`cube_key`]: kind = `level` (the scheme 2.3 reserved).
+fn lod_key(level: u8, pos: CubePos) -> [u8; 13] {
+    let mut key = cube_key(pos);
+    key[0] = level;
     key
 }
 
@@ -266,6 +303,10 @@ pub struct Storage {
     runtime_to_disk: Vec<u32>,
     /// On-disk id → runtime state id.
     disk_to_runtime: HashMap<u32, BlockStateId>,
+    /// Whether stored LOD records match the current worldgen fingerprint
+    /// (absent until [`Storage::set_worldgen_fingerprint`] says otherwise).
+    /// Interior-mutability: load paths take `&self`.
+    lod_usable: AtomicBool,
     hooks: Arc<Hooks>,
 }
 
@@ -402,8 +443,44 @@ impl Storage {
             seed: effective_seed,
             runtime_to_disk,
             disk_to_runtime,
+            lod_usable: AtomicBool::new(false),
             hooks: Arc::new(Hooks::default()),
         })
+    }
+
+    /// Declares the compiled worldgen graph the server runs, after open
+    /// (the stored seed is part of the fingerprint, and only open knows
+    /// it). The stored fingerprint in `meta` is compared with
+    /// `hash(graph_fingerprint, seed)`: on a match, stored LOD records are
+    /// usable; on a mismatch (different worldgen wrote them) they are
+    /// ignored — [`Storage::load_lod`] reads them as absent — and the
+    /// stored fingerprint is overwritten, so the next saves replace the
+    /// stale records. LOD0 records are never deleted either way. Databases
+    /// written before 2.7 have no fingerprint: it is simply written.
+    pub fn set_worldgen_fingerprint(&self, graph_fingerprint: u64) -> Result<(), StorageError> {
+        let expected = lod_fingerprint(graph_fingerprint, self.seed);
+        let stored = self.meta(LOD_FINGERPRINT_KEY)?;
+        match stored.as_deref() {
+            Some(bytes)
+                if bytes.len() == 8
+                    && u64::from_le_bytes(bytes.try_into().unwrap()) == expected =>
+            {
+                self.lod_usable.store(true, Ordering::Release);
+            }
+            _ => {
+                let mut txn = self.db.begin_write().map_err(io_err)?;
+                txn.set_durability(Durability::Immediate).map_err(io_err)?;
+                txn.open_table(META)
+                    .map_err(io_err)?
+                    .insert(LOD_FINGERPRINT_KEY, expected.to_le_bytes().as_slice())
+                    .map_err(io_err)?;
+                txn.commit().map_err(io_err)?;
+                // Records written under a different (or no) fingerprint are
+                // stale: leave them unread until this run overwrites them.
+                self.lod_usable.store(stored.is_none(), Ordering::Release);
+            }
+        }
+        Ok(())
     }
 
     /// The seed this world generates with: the stored one when reopening,
@@ -428,12 +505,54 @@ impl Storage {
         self.decode_record(pos, record.value()).map(Some)
     }
 
+    /// Loads the stored LOD cube at `(level, pos)` with its real-octant
+    /// mask, or `None` when never saved — or when the worldgen fingerprint
+    /// does not match (stored LOD from a different worldgen is ignored).
+    /// A damaged record returns [`StorageError::Corrupt`]; the caller logs
+    /// it and samples the cube from worldgen instead. Never panics.
+    pub fn load_lod(&self, level: u8, pos: CubePos) -> Result<Option<(Cube, u8)>, StorageError> {
+        if !self.lod_usable.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let txn = self.db.begin_read().map_err(io_err)?;
+        let table = txn.open_table(CUBES).map_err(io_err)?;
+        let Some(record) = table.get(&lod_key(level, pos)).map_err(io_err)? else {
+            return Ok(None);
+        };
+        let bytes = record.value();
+        let corrupt = |reason: String| StorageError::Corrupt { pos, reason };
+        let Some((&schema, rest)) = bytes.split_first() else {
+            return Err(corrupt("empty record".into()));
+        };
+        if schema != LOD_RECORD_SCHEMA {
+            return Err(corrupt(format!("record schema {schema}")));
+        }
+        let Some((&known, frame)) = rest.split_first() else {
+            return Err(corrupt("missing known mask".into()));
+        };
+        let cube = self.decode_frame(frame).map_err(corrupt)?;
+        Ok(Some((cube, known)))
+    }
+
     /// Writes every cube in `batch` in one transaction committed with
     /// immediate durability: when this returns, the batch is on disk. A
     /// crash mid-commit leaves the previous state, never a half-written
     /// batch.
     pub fn save_batch(&self, batch: &[(CubePos, &Cube)]) -> Result<(), StorageError> {
         self.save_batch_with_meta(batch, &[])
+    }
+
+    /// LOD0 cubes, LOD cubes and player records in one transaction: an
+    /// edit's LOD0 record and the LOD records derived from it commit
+    /// together or not at all, so a crash never leaves stored LOD
+    /// disagreeing with stored LOD0 edits (task 2.7).
+    pub fn save_lod_batch(
+        &self,
+        lod0: &[(CubePos, &Cube)],
+        lod: &[(u8, CubePos, &Cube, u8)],
+        players: &[(String, PlayerRecord)],
+    ) -> Result<(), StorageError> {
+        self.save_batch_full(lod0, lod, players, &[])
     }
 
     /// [`Storage::save_batch`] plus `meta` writes inside the same
@@ -445,7 +564,7 @@ impl Storage {
         batch: &[(CubePos, &Cube)],
         meta: &[(&str, &[u8])],
     ) -> Result<(), StorageError> {
-        self.save_batch_full(batch, &[], meta)
+        self.save_batch_full(batch, &[], &[], meta)
     }
 
     /// [`Storage::save_batch`] plus player records, all in the one
@@ -456,7 +575,7 @@ impl Storage {
         batch: &[(CubePos, &Cube)],
         players: &[(String, PlayerRecord)],
     ) -> Result<(), StorageError> {
-        self.save_batch_full(batch, players, &[])
+        self.save_batch_full(batch, &[], players, &[])
     }
 
     /// The player record stored under `name`, if any.
@@ -479,6 +598,7 @@ impl Storage {
     fn save_batch_full(
         &self,
         batch: &[(CubePos, &Cube)],
+        lod: &[(u8, CubePos, &Cube, u8)],
         players: &[(String, PlayerRecord)],
         meta: &[(&str, &[u8])],
     ) -> Result<(), StorageError> {
@@ -489,9 +609,12 @@ impl Storage {
         let mut record = Vec::new();
         {
             let mut cubes = txn.open_table(CUBES).map_err(io_err)?;
-            for &(pos, cube) in batch {
+            let encode = |cube: &Cube, plain: &mut Vec<u8>| {
                 plain.clear();
-                cube.encode_with(|state| self.runtime_to_disk[state.0 as usize], &mut plain);
+                cube.encode_with(|state| self.runtime_to_disk[state.0 as usize], plain);
+            };
+            for &(pos, cube) in batch {
+                encode(cube, &mut plain);
                 record.clear();
                 record.push(RECORD_SCHEMA);
                 // Bulk compression records the content size in the frame
@@ -500,6 +623,17 @@ impl Storage {
                 record.extend_from_slice(&frame);
                 cubes
                     .insert(&cube_key(pos), record.as_slice())
+                    .map_err(io_err)?;
+            }
+            for &(level, pos, cube, known) in lod {
+                encode(cube, &mut plain);
+                record.clear();
+                record.push(LOD_RECORD_SCHEMA);
+                record.push(known);
+                let frame = zstd::bulk::compress(&plain, ZSTD_LEVEL).map_err(io_err)?;
+                record.extend_from_slice(&frame);
+                cubes
+                    .insert(&lod_key(level, pos), record.as_slice())
                     .map_err(io_err)?;
             }
         }
@@ -585,22 +719,73 @@ impl Storage {
         if schema != RECORD_SCHEMA {
             return Err(corrupt(format!("record schema {schema}")));
         }
+        self.decode_frame(frame).map_err(corrupt)
+    }
+
+    /// The zstd + codec half both record schemas share.
+    fn decode_frame(&self, frame: &[u8]) -> Result<Cube, String> {
         // Frames carry their content size (bulk compression), so one exact
         // bulk decompress replaces a streaming decoder and its window
         // buffers (~10x faster on a surface cube). A frame without a size
         // (written by a streaming encoder) still decodes, the slow way.
         let plain = match zstd::zstd_safe::get_frame_content_size(frame) {
             Ok(Some(size)) if size <= MAX_PLAIN_BYTES as u64 => {
-                zstd::bulk::decompress(frame, size as usize)
-                    .map_err(|e| corrupt(format!("zstd: {e}")))?
+                zstd::bulk::decompress(frame, size as usize).map_err(|e| e.to_string())?
             }
-            Ok(Some(size)) => return Err(corrupt(format!("zstd content size {size}"))),
-            Ok(None) => decode_all(frame).map_err(|e| corrupt(format!("zstd: {e}")))?,
-            Err(_) => return Err(corrupt("zstd: bad frame header".into())),
+            Ok(Some(size)) => return Err(format!("zstd content size {size}")),
+            Ok(None) => decode_all(frame).map_err(|e| e.to_string())?,
+            Err(_) => return Err("zstd: bad frame header".into()),
         };
         let disk_to_runtime = &self.disk_to_runtime;
         Cube::decode_with(&plain, |disk| disk_to_runtime.get(&disk).copied())
-            .map_err(|e| corrupt(e.to_string()))
+            .map_err(|e| e.to_string())
+    }
+
+    /// How many LOD records (key kind ≥ 1) the database holds.
+    /// Diagnostic: the stored-LOD size report.
+    pub fn lod_record_count(&self) -> Result<u64, StorageError> {
+        Ok(self.lod_positions()?.len() as u64)
+    }
+
+    /// Every stored LOD key as `(level, position)`. Diagnostic/test hook:
+    /// the crash test verifies every stored LOD record after a kill.
+    pub fn lod_positions(&self) -> Result<Vec<(u8, CubePos)>, StorageError> {
+        let txn = self.db.begin_read().map_err(io_err)?;
+        let table = txn.open_table(CUBES).map_err(io_err)?;
+        let mut out = Vec::new();
+        for row in table.iter().map_err(io_err)? {
+            let (key, _) = row.map_err(io_err)?;
+            let key = key.value();
+            if key[0] >= 1 {
+                let field = |bytes: &[u8]| {
+                    let mut raw = [0u8; 4];
+                    raw.copy_from_slice(bytes);
+                    raw[0] ^= 0x80;
+                    i32::from_be_bytes(raw)
+                };
+                out.push((
+                    key[0],
+                    CubePos {
+                        x: field(&key[1..5]),
+                        y: field(&key[5..9]),
+                        z: field(&key[9..13]),
+                    },
+                ));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Test hook: overwrites the LOD record at `(level, pos)` with
+    /// undecodable garbage, as a torn write would leave behind.
+    pub fn damage_lod_record(&self, level: u8, pos: CubePos) -> Result<(), StorageError> {
+        let mut txn = self.db.begin_write().map_err(io_err)?;
+        txn.set_durability(Durability::Immediate).map_err(io_err)?;
+        txn.open_table(CUBES)
+            .map_err(io_err)?
+            .insert(&lod_key(level, pos), [9u8, 9, 9, 9].as_slice())
+            .map_err(io_err)?;
+        txn.commit().map_err(io_err)
     }
 }
 
@@ -940,5 +1125,97 @@ mod tests {
         storage.release_saves();
         saver.join().unwrap().unwrap();
         assert_eq!(storage.load(pos(2, 2, 2)).unwrap(), Some(cube));
+    }
+
+    // ------------------------------------------------------------------
+    // Stored LOD (task 2.7)
+
+    fn lod_record() -> (Cube, u8) {
+        let mut cube = edited_cube();
+        cube.set(
+            LocalPos::new_unchecked(9, 9, 9),
+            jbm_core::block::BlockStateId(3),
+        );
+        // A realistic mask: three real octants, five filled.
+        (cube, 0b0001_0110)
+    }
+
+    #[test]
+    fn lod_records_round_trip_in_the_same_transaction_as_lod0() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = storage_in(&dir);
+        storage
+            .set_worldgen_fingerprint(0xABCD_EF01_2345_6789)
+            .unwrap();
+        let (cube, known) = lod_record();
+        let lod0 = edited_cube();
+        let lod_batch = [(2u8, pos(1, 2, 3), &cube, known)];
+        storage
+            .save_lod_batch(&[(pos(0, 0, 0), &lod0)], &lod_batch, &[])
+            .unwrap();
+        let (loaded, loaded_known) = storage.load_lod(2, pos(1, 2, 3)).unwrap().unwrap();
+        assert_eq!(loaded, cube);
+        assert_eq!(loaded_known, known);
+        // The counts see both kinds.
+        assert_eq!(storage.cube_count().unwrap(), 2);
+        assert_eq!(storage.lod_record_count().unwrap(), 1);
+        assert_eq!(storage.lod_positions().unwrap(), vec![(2, pos(1, 2, 3))]);
+        // LOD0 keys are untouched by LOD records at the same coordinates.
+        let lod0_at_same_pos = edited_cube();
+        storage
+            .save_lod_batch(&[(pos(1, 2, 3), &lod0_at_same_pos)], &[], &[])
+            .unwrap();
+        assert_eq!(storage.load(pos(1, 2, 3)).unwrap(), Some(lod0_at_same_pos));
+        let (loaded, _) = storage.load_lod(2, pos(1, 2, 3)).unwrap().unwrap();
+        assert_eq!(loaded, cube, "the LOD record survived");
+    }
+
+    #[test]
+    fn lod_loads_are_absent_until_a_fingerprint_matches() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = storage_in(&dir);
+        // No fingerprint yet: nothing is readable (a fresh 2.7 database).
+        assert_eq!(storage.load_lod(1, pos(0, 0, 0)).unwrap(), None);
+        let (cube, known) = lod_record();
+        // Without a matching fingerprint, saving is still allowed but the
+        // record stays unreadable — as if absent.
+        storage
+            .save_lod_batch(&[], &[(1, pos(4, 5, 6), &cube, known)], &[])
+            .unwrap();
+        assert_eq!(
+            storage.load_lod(1, pos(4, 5, 6)).unwrap(),
+            None,
+            "no fingerprint declared: records read as absent"
+        );
+        storage.set_worldgen_fingerprint(42).unwrap();
+        let (loaded, loaded_known) = storage.load_lod(1, pos(4, 5, 6)).unwrap().unwrap();
+        assert_eq!((loaded, loaded_known), (cube, known));
+        // A different worldgen fingerprint ignores (and, on the next save,
+        // overwrites) the stored records; LOD0 records stay.
+        storage.set_worldgen_fingerprint(43).unwrap();
+        assert_eq!(
+            storage.load_lod(1, pos(4, 5, 6)).unwrap(),
+            None,
+            "stale fingerprint: records read as absent"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_lod_record_is_a_typed_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = storage_in(&dir);
+        storage.set_worldgen_fingerprint(7).unwrap();
+        let (cube, known) = lod_record();
+        storage
+            .save_lod_batch(&[], &[(3, pos(7, 7, 7), &cube, known)], &[])
+            .unwrap();
+        storage.damage_lod_record(3, pos(7, 7, 7)).unwrap();
+        let error = storage.load_lod(3, pos(7, 7, 7)).unwrap_err();
+        assert!(
+            matches!(&error, StorageError::Corrupt { pos: at, .. } if *at == pos(7, 7, 7)),
+            "{error}"
+        );
+        // A LOD0 record at the same position is unaffected.
+        assert_eq!(storage.load(pos(7, 7, 7)).unwrap(), None);
     }
 }

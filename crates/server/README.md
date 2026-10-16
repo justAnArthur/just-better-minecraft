@@ -101,6 +101,15 @@ sample_grid(seed, origin, step, out)` fills a 32³ grid of densities at
 runs once per grid column; step 1 at a cube origin gives exactly the
 densities `generate`'s solidity decisions use.
 
+**LOD sampling** (task 2.7): `Generator::sample_lod(level, pos) -> Cube`
+produces the worldgen half of a LOD cube without generating any LOD0
+terrain. It reuses the bounds fast paths (uniform air above, stone
+below), otherwise samples density on the level-(*n*−1) grid — 64³ points
+at one child-cell stride, surface lookahead included — runs the surface
+stage in block units and downsamples each 2×2×2 group with the shared
+rule. Level 1 is exact: it equals the downsample of the eight generated
+LOD0 cubes. It never calls `generate` and never touches the world.
+
 **Adding a node:** add the variant to `Node` (with its serde shape), parse
 it in `parse_node` (allow-list its fields), add an `Op` variant plus its
 `operands`/`remap` arms, evaluate it in `eval_op`, give it an interval rule
@@ -115,7 +124,10 @@ workers `jbm-gen-N`, or inline mode with `threads == 0` (requests queue;
 `try_recv` generates on the calling thread — the deterministic mode tests
 and benches use).
 
-- `request(pos)` / `try_recv() -> Option<(CubePos, Cube)>`. Requests are
+- `request(pos)` / `try_recv() -> Option<(CubePos, Cube, Cube)>`: the
+  generated (or loaded) cube **plus its precomputed level-1 octant**
+  (task 2.7) — the worker downsamples off-thread, so LOD ingest on the
+  tick thread is a `copy_octant`, never a downsample. Requests are
   deduplicated while in flight (queued, generating, or done-but-uncollected).
 - **Load-or-generate** (task 2.3): when a `Storage` is attached, every
   request reads the cube from disk first and generates only when it was
@@ -141,14 +153,28 @@ never corrupts the database or waits.
 
 | table | key → value |
 | --- | --- |
-| `meta` | `&str → &[u8]`: `format_version` (`u32` = 1) and `seed` (`u64`) |
+| `meta` | `&str → &[u8]`: `format_version` (`u32` = 1), `seed` (`u64`) and `lod_fingerprint` (`u64`, task 2.7) |
 | `block_states` | on-disk `u32` → canonical `namespace:path[prop=value,…]` (properties in declaration order) |
-| `cubes` | 13-byte position key → `[record schema u8 = 1][zstd level-3 frame of the cube codec bytes]` |
+| `cubes` | 13-byte position key → cube record (below) |
 | `players` | player name → `[schema u8 = 1][x y z: f64][yaw pitch: f32][flying u8]` (34 bytes, little-endian) |
 
 The **cube key** is `[kind: u8][x][y][z]`, each coordinate an i32
 big-endian with the sign bit flipped, so keys sort by coordinate value.
-`kind = 0` is a LOD0 cube; 1..=255 are reserved for LOD cubes (task 2.7).
+`kind = 0` is a LOD0 cube; kind *n* in `1..=4` is a LOD level-*n* cube
+(task 2.7, `lod_levels`'s range).
+
+**Cube records.** LOD0 (kind 0): `[schema u8 = 1][zstd level-3 frame of
+the cube codec bytes]`. LOD (kind ≥ 1): `[schema u8 = 2][known u8][zstd
+frame of the same codec]`, where `known` is the cube's real-octant
+bitmask. A LOD record that fails to decode is logged and treated as
+absent — never a panic. The format version stays 1: databases written
+before 2.7 hold no key with kind ≥ 1, so they open unchanged.
+
+**Worldgen fingerprint.** Stored LOD is only valid under the worldgen
+that wrote it: `meta.lod_fingerprint` holds `hash(compiled graph
+fingerprint, seed)`, written on every open. On a mismatch the stored LOD
+records read as absent and the next saves overwrite them; LOD0 records
+are never deleted.
 
 **State remapping:** runtime `BlockStateId`s are re-assigned every start;
 on-disk ids are stable. On open, both remap tables are built in one
@@ -163,11 +189,14 @@ logged once); `Storage::seed()` returns it so `Server::try_with_config`
 builds the generator from it.
 
 **API:** `load(pos)` (missing → `None`, damaged record → `Corrupt`),
-`save_batch(&[(CubePos, &Cube)])` — one transaction committed with redb's
+`load_lod(level, pos)`, `save_batch(&[(CubePos, &Cube)])` and
+`save_lod_batch(lod0, lod, players)` — LOD0 cubes, LOD cubes and player
+records in **one** transaction, so an edit's LOD0 record and the LOD
+records derived from it commit together — committed with redb's
 immediate durability, so when it returns the batch is on disk — plus
-`cube_count()` and the diagnostic/test hooks `meta`, `cube_positions` and
-`save_batch_with_meta` (the crash test stamps `last_batch` atomically with
-its cubes).
+`cube_count()`, `lod_record_count()` and the diagnostic/test hooks
+`meta`, `cube_positions`, `lod_positions` and `save_batch_with_meta`
+(the crash test stamps `last_batch` atomically with its cubes).
 
 ### Players
 
@@ -404,51 +433,101 @@ never stale. Test reads: `pinned_count()`, `block(pos)`.
 **Disconnect:** the player's sent-set is freed and its cubes are evicted
 on the next tick unless another player keeps them.
 
-## LOD pyramid (`lod`, task 2.4)
+## LOD pyramid (`lod`, tasks 2.4 and 2.7)
 
-`LodPyramid` keeps levels `1..=lod_levels`, each a map of `LodCube { cube:
-Cube, known: u8 }`, built from the real world by the core's
-`jbm_core::lod` downsampling rule. A level-*n* cube covers the same
-volume as a 2×2×2 group of level-(*n*−1) cubes; nothing is streamed or
-rendered yet (2.6), and LOD from worldgen sampling is 2.7.
+`LodPyramid` keeps levels `1..=lod_levels`, each a map of
+`LodCube { cube: Cube, known: u8, filled: u8, pending: u8 }`, built from
+the real world by the core's `jbm_core::lod` downsampling rule. A
+level-*n* cube covers the same volume as a 2×2×2 group of
+level-(*n*−1) cubes.
 
-- **`known`** is an octant bitmask: bit *o* is set once that octant's
-  child has been downsampled into the cube at least once. Octants never
-  written read as air, so `known` says which octants hold real data and
-  **nothing else may be assumed about the unknown ones** — their air is
-  placeholder, not measured emptiness. An inserted cube marks its whole
-  ancestor chain known; a partially known child propagates its
-  placeholder air for its own unknown octants (a deliberate
-  simplification for 2.7 to revisit).
+**Content model (2.7).** Each octant of a level-*n* cube is in exactly
+one of four states:
+
+- **real** (`known`): the level-(*n*−1) child holds real data — at level
+  1 a LOD0 cube that has been in the world, above that a child with at
+  least one real octant. The octant is the downsample of the child's
+  *full* content (worldgen-filled octants included, never placeholder
+  air).
+- **pending**: real by definition, but the child is not ready yet. The
+  content is computed when the child readies; until then the octant
+  holds nothing, and the pyramid internally requests the child's fill
+  so the walk can continue. Placeholder air is never propagated.
+- **filled** (`filled`): worldgen (or a stored record) supplied the
+  content for a child with no real data — `Generator::sample_lod`
+  sampled straight from the density graph at the child's resolution,
+  never by generating LOD0 cubes.
+- empty: no content yet; a fill job can supply it.
+
+A cube is **ready** when every octant is real or filled
+(`known | filled == 0xFF`); `ready(level, pos)` returns `Some` only
+then, and `take_changed()` reports a cube when it becomes ready and on
+every later content change — streaming (2.6) never sees a partial cube.
+The model is a pure function of the LOD0 cubes ever seen and the
+worldgen; `LodPyramid::rebuild(max_levels, &generator, lod0)` is its
+reference implementation, and the incremental paths (inserts, edits,
+requests, fills, storage loads, in any order) must equal it cell for
+cell and `known` for `known`.
+
 - **Ingest:** `insert_lod0(pos, &Cube) -> LodChanges` downsamples a cube
   entering the world into its level-1 parent (created as uniform air if
-  absent) and propagates the changed region up until a level reports no
-  change. The server calls it in the streaming pass only when
-  `entry().or_insert` actually inserts — a stale generated copy dropped
-  because an edited cube is present never touches the pyramid.
+  absent) and propagates up. `insert_lod0_octant` takes the cube plus a
+  precomputed level-1 octant — generation workers return both, so the
+  tick thread never pays the level-1 downsample. The server ingests
+  only on an actual `entry().or_insert` insert; a stale generated copy
+  dropped because an edited cube is present never touches the pyramid.
 - **Edits:** `edit_lod0(BlockPos, &Cube) -> LodChanges` recomputes the
-  one affected cell per level (`downsample_region` on a single cell) and
-  stops at the first unchanged level. The server calls it from
-  `apply_edit` after setting the block.
-- **`LodChanges`** lists the `(level, CubePos)` cubes whose content
-  changed, in level order — 2.6 will stream exactly these.
+  one affected cell per level and stops at the first unchanged level;
+  under a not-ready cube the pending propagation carries the edit up
+  when the child readies.
+
+**Fill pipeline (2.7).** `request(level, pos)` queues a deduplicated
+**load-or-sample** job: the stored record when there is one, otherwise
+`sample_lod`. Jobs run off the tick thread on the pyramid's own small
+worker pool (`jbm-lod-N`, `config.gen_threads` of them, a separate pool
+from the LOD0 `GenPool` on purpose — no queue is shared, so LOD work can
+never delay a LOD0 generation worker). `poll()` (called by the server
+after LOD0 ingest, before streaming) merges finished jobs — real octants
+always win over job content — and completes the pending propagations
+that became possible. The pyramid's own requests (deferred propagations)
+are **uncapped and excluded from `in_flight()`**: they are self-limiting
+(one job per cube, deduplicated) and must never consume the streaming
+budget `in_flight()` reports, so a burst of LOD0 ingest during
+exploration cannot crowd streaming's own requests out of their cap.
+
+**Inline mode** (`gen_threads == 0`): no workers; `poll()` runs up to
+`gen_budget_per_tick` LOD jobs synchronously per call, after the LOD0
+budget. Deterministic — what tests and benches use. Panics in a LOD job
+are forwarded and re-raised by `poll` on the tick thread; drop joins
+every worker promptly even with a deep backlog or a held test hook.
+
+**Stored LOD (2.7).** Every ready cube is saved when it becomes ready
+and after each content change, batched through the `jbm-save` thread in
+the same transaction as the LOD0 edits they derive from (a crash never
+leaves stored LOD disagreeing with stored LOD0). Records live in the
+`cubes` table under key kind = level (schema 2: `[2][known u8][zstd
+frame]`); see Persistence. A **worldgen fingerprint**
+(`hash(graph fingerprint, seed)` in `meta`) guards them: on mismatch —
+a different worldgen wrote them — stored LOD reads as absent and the
+next saves overwrite it; LOD0 records are never deleted. A cube that
+changes again while its previous save is in flight stays dirty, so the
+next interval after that save's ack stores the newer content.
+
 - **Eviction never touches the pyramid.** LOD cubes outlive their LOD0
   children, so player builds stay visible from far away; re-inserting a
-  regenerated or reloaded cube reports no changes. The cost: the pyramid
-  grows with the explored area until 2.6 (clipmap rings) and 2.7 (stored
-  LOD) give it bounds.
-- `LodPyramid::rebuild(max_levels, lod0)` rebuilds every level bottom-up
-  from scratch — the reference the incremental paths are tested against
-  (they must match cell for cell and `known` for `known`). Accessors:
-  `get(level, pos)`, `len(level)`, `total_cubes()`, `heap_bytes()`.
+  regenerated or reloaded cube reports no changes. The pyramid still
+  grows with the explored area (see docs/progress.md, Known issues);
+  stored cubes could be evicted and reloaded, but in-memory eviction is
+  still open.
 
 `lod_levels: u8` (default 4 = LOD1–LOD4) tops the pyramid; **0 disables
-it entirely** — no allocation, no per-cube or per-edit work
-(`protocol_only()` uses 0). `insert_lod0` runs on the tick thread for
-every collected cube; its cost is bounded by the `lod/insert_lod0/*`
-and `lod/edit` benches in `benches/lod_bench.rs`. Server read accessors:
-`lod_cube(level, pos)`, `lod_known(level, pos)`, `lod_cube_count()`,
-`lod_heap_bytes()`.
+it entirely** — no allocation, no jobs, no storage writes, no samples.
+`insert_lod0` runs on the tick thread for every collected cube; its cost
+is bounded by the `lod/insert_lod0/*`, `lod/edit` and `lod/fill_poll`
+benches in `benches/lod_bench.rs`. Server read accessors:
+`lod_cube(level, pos)`, `lod_ready(level, pos)`, `lod_known(level, pos)`,
+`lod_cube_count()`, `lod_heap_bytes()`, `lod_samples()`,
+`request_lod(level, pos)`, `lod_in_flight()`.
 
 ## Run loop (`run`)
 
@@ -505,6 +584,9 @@ Current cases:
 - `worldgen/sample_grid/{1,2,4,8,32}` — one 32³ density grid near the
   surface per LOD step; step 32 spans 1,024 blocks (every column a cache
   miss, the worst case).
+- `worldgen/sample_lod/{1,2,4}/surface` (task 2.7) — `sample_lod` on a
+  mixed surface cube per level, asserted mixed in setup.
+- `worldgen/sample_lod/2/air` — the uniform-air fast path.
 - `storage/encode_surface_cube` ≈ 9 µs — codec plus zstd level 3 (bulk
   frames, which record their content size).
 - `storage/decode_surface_cube` ≈ 30 µs — exact-size zstd decompress plus
@@ -515,6 +597,8 @@ Current cases:
   surface cube's record is 199 bytes against 8.2 kB of heap storage (air
   and uniform-stone records are 18 bytes), and one flush-sized commit of
   1,000 cubes takes ≈ 24 ms.
+- `storage/load_lod` (task 2.7) ≈ 18 µs — one stored surface LOD record
+  (schema 2), decode included.
 - `lod/insert_lod0/{surface,air}` (task 2.4, `lod_bench.rs`) — a
   generated surface cube (mixed, asserted) or an air cube inserted into
   an existing 4-level pyramid.
@@ -524,6 +608,8 @@ Current cases:
   floor.
 - `lod/stream_moving` — a player sprint-flying across level-1 boundaries
   every second cube: center moves, cursor resets and keep-set unloads.
+- `lod/fill_poll` (task 2.7) — one inline poll that fills one requested
+  surface cube (one `sample_lod` plus the merge).
 
 **Invariants**
 
