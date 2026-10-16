@@ -77,10 +77,12 @@ fn bench(c: &mut Criterion) {
     let stone = Arc::new(Cube::filled(blocks.stone));
 
     let terrain_input = MeshInput {
+        level: 0,
         center: Arc::new(terrain_like_cube(&blocks)),
         neighbors: terrain_neighbors(&air, &stone),
     };
     let checker_input = MeshInput {
+        level: 0,
         center: Arc::new(Cube::from_fn(|p| {
             if (p.x + p.y + p.z) % 2 == 0 {
                 blocks.stone
@@ -91,10 +93,12 @@ fn bench(c: &mut Criterion) {
         neighbors: uniform_neighbors(Some(Arc::clone(&air))),
     };
     let uniform_input = MeshInput {
+        level: 0,
         center: Arc::new(Cube::filled(blocks.stone)),
         neighbors: uniform_neighbors(Some(Arc::clone(&air))),
     };
     let padded_input = MeshInput {
+        level: 0,
         center: Arc::new(terrain_like_cube(&blocks)),
         neighbors: uniform_neighbors(Some(Arc::clone(&stone))),
     };

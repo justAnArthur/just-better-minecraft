@@ -15,7 +15,7 @@ Do:
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace
   plus any extra command the spec lists.
-- Commit your work on branch task/{{ID}} with plain imperative commit messages. NEVER add Co-Authored-By trailers, "Generated with" lines, or any AI/agent attribution. Do not push. Do not merge.
+- Commit your work on branch task/{{ID}} with scoped Conventional Commit messages, `type(scope): subject`. Scopes are the crates you changed (core, client, server, game, modhost, testkit; comma-separate several, e.g. `fix(client,server): ...`). Types: feat, fix, perf, refactor, test, docs, chore, ci, build. Never edit `version` in Cargo.toml or Cargo.lock, and never push tags. NEVER add Co-Authored-By trailers, "Generated with" lines, or any AI/agent attribution. Do not push. Do not merge.
 
 {{EXTRA}}
 

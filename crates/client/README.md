@@ -48,6 +48,8 @@ coordinates and cfg-gated off under the crate's own `cube16` passthrough;
   behind the pages (pure logic, no wgpu).
 - `render::overlay` — debug overlay (`OverlayText`, `OverlayRenderer`,
   `FrameStats`).
+- `lod` — the client's LOD state (task 2.6): the `CubeKey` every level
+  shares and the coverage rule (`Coverage`).
 - `render::texture_array::BlockTextures` + `placeholder_layers(n)` —
   block texture array with CPU-generated mipmaps (repeat addressing so
   merged faces tile per block).
@@ -57,7 +59,14 @@ coordinates and cfg-gated off under the crate's own `cube16` passthrough;
 - `predict::Predictor` — client-side prediction of the shared physics
   (see below).
 - `app::run(link)` — opens the window and runs the frame loop against a
-  server link.
+  server link. `JBM_AUTOFLY=<blocks>` (task 2.6 gate) turns the app into
+  an autopilot: once spawned it toggles flying, climbs 40 blocks above
+  spawn, flies straight at sprint speed for `<blocks>` blocks through
+  the normal `PlayerInput` path (prediction and the server both see a
+  real player), then exits printing a frame-time summary (count, mean,
+  p50, p95, p99, max, frames over 33 ms and 50 ms). The autopilot
+  ignores the window-occlusion pause so an unattended gate run
+  finishes even when its window is never shown.
 - `testing::screenshot` (only with `--features testing` or in unit tests)
   — golden-image comparison helpers, see below.
 
@@ -187,6 +196,98 @@ buttons repeat every 0.25 s; the first press acts at once. A rejected
 edit comes back as a `BlockChange` with the real state and is reverted
 like any other change. Hotbar, repeat timers and the place decision live
 in `edit.rs`, winit-free and unit-tested.
+
+### The LOD world and the coverage rule (task 2.6)
+
+`ClientWorld` stores LOD ring cubes beside the LOD0 cubes, keyed by
+`lod::CubeKey { level, pos }` — mesh jobs, mesh results, versions,
+dirt and GPU residency all use that one key (LOD0 is level 0).
+`LodCubeData` inserts or replaces the cube and dirties it and its 26
+loaded **same-level** neighbors; `UnloadLodCube` removes it. Mesh
+scheduling keeps LOD0 priority (edits first, then nearest), takes LOD0
+streaming dirt nearest-first, then LOD dirt nearest-first by distance in
+blocks divided by 2^level — one budget, split 3:1 in LOD0's favor when
+both have dirt (a guaranteed quarter for LOD, minimum one of any budget;
+each class yields its whole share when idle), so neither starves.
+
+**The coverage rule** (`lod::Coverage`): every volume is drawn by
+exactly one cube — the finest ready one along its chain of ancestors.
+`drawn(c)` holds iff `ready(c)`, and either `drawn(parent(c))`, or no
+ancestor of *c* is ready. A drawn cube at level ≥ 1 **masks** octant *o*
+when the child at *o* is ready (that child is then itself drawn and
+covers the octant); a drawn cube draws exactly its unmasked octants, and
+a fully masked one draws nothing (it reads inactive to the cull pass;
+the vertex shader also collapses masked faces to degenerate quads as a
+second line of defense). *Why exactly one:* along a point's chain, the
+topmost ready cube *T* is drawn (nothing above it is ready); drawing
+passes down while the chain stays ready and stops at the first
+not-ready cube, whose parent draws the point — every step hands the
+point to exactly one child, so nothing is skipped or doubled. Points in
+no ready cube are drawn by nothing. Readiness comes from the app: a
+cube is ready when loaded and its mesh is uploaded (empty meshes count;
+a re-mesh in flight keeps the old mesh). Updates are incremental — a
+readiness change touches the parent's mask, the cube itself and its
+descendants, nothing else — and a frame with no change does no work
+(`Coverage::work()`). The accepted transient: a coarse cube briefly
+covers a finer one when the cube between them arrives late, typically
+for a moment at startup.
+
+### Octant-split meshing and skirts (task 2.6)
+
+The same greedy mesher serves every level; cells are cells whatever
+their world size. Two rules switch on for level ≥ 1 (LOD0 output is
+byte-for-byte the pre-2.6 mesher's, pinned by a test against a copied
+reference):
+
+- **Octant-split merging.** Greedy rectangles never cross the cell
+  planes x/y/z = `CUBE_SIZE / 2`, so every face lies in exactly one
+  octant, which masking needs. (In mask space the halves stay
+  `[0, half)`/`[half, size)` however the u/v strides are signed.)
+- **Skirts** (±X/±Z only), the crack hider at level seams. Emit cell
+  *c*'s face in direction *d* even though the cell across is filled
+  when: *c* is filled; the cell across lies in a different octant or a
+  different cube; that cell is filled or in a missing neighbor cube;
+  and *c* is one of the top two filled cells of its column run (air
+  above, or air two above; at the cube's top row the two-above look
+  reads as filled). The faces stand in for the coarse cell's side when
+  the volume across is drawn by finer cubes whose surface sits lower
+  (the downsampling rule leans solid, so the coarse surface can be up
+  to 2^n − 1 blocks above the fine one; two coarse cells of skirt cover
+  that). When the octant across is drawn by the same coarse cube the
+  skirt sits inside terrain, hidden by the neighbor's top face. Skirt
+  faces are ordinary faces (same AO from same-level neighbors, same
+  texture, greedy-merged within the octant rule); `MeshOutput::skirts`
+  counts them for the overhead report.
+
+The mesher also feeds the renderer a per-face skirt bit and counts
+skirt faces; the render expands level ≥ 1 quads by ~1/512 block
+(sub-pixel) to close T-junction hairlines that greedy merging leaves
+where a merged quad's edge abuts smaller quads — an invisible overlap
+between coplanar same-texture neighbours. LOD0 skips the expansion to
+keep its goldens bit-stable; its pinholes are single pixels, bounded by
+the rings hole tests.
+
+### Rendering LOD cubes
+
+- **CubeMeta flags** (`start_flags.y`): bit 0 active (drawn by the
+  coverage rule; freed slots and fully masked cubes read inactive), bit
+  1 visible-last-frame, bits 8–12 the LOD level, bits 16–24 the octant
+  mask. The 80-byte layout is pinned by the layout test; `set_draw_state`
+  rewrites a slot only when its level, mask or mesh changes.
+- **One scaled origin formula**, shared exactly by the shader, the cull
+  shader and `cube_origin` on the CPU:
+  `origin = (pos·2^level − camera_cube) · CUBE_SIZE − camera_frac`; cell
+  offsets multiply by 2^level, and `pos·2^level` is asserted to stay in
+  i32 for streamable positions. UVs stay one tile per **block**
+  (multiplied by 2^level), so textures line up across ring borders.
+- **Masked octants** collapse to degenerate quads (no fragments), and a
+  fully masked cube emits no commands on any path. AABBs are
+  `CUBE_SIZE·2^level` wide everywhere (frustum, direction skipping,
+  Hi-Z).
+- The three paths stay pixel-identical with LOD scenes (proven by the
+  rings tests); the 2.6 re-measurement of gpu-cull at ring scale
+  (cpu-cull ≈ 621 µs vs gpu-cull ≈ 948 µs, Apple M5 Pro / Metal) is in
+  the game README.
 
 ### Terrain rendering
 
@@ -559,7 +660,24 @@ stone floor; glass and leaves cutout visible), `mesh_ao` (stepped
 pyramid with AO in the inner corners), `mesh_cube_border` (a building
 crossing the boundary between two cubes — no seam),
 `mesh_far_origin` (the `mesh_ao` scene ~10⁹ blocks out; matches the same
-`mesh_ao` golden, proving camera-relative rendering).
+`mesh_ao` golden, proving camera-relative rendering), and the task 2.6
+rings goldens `rings_close` / `rings_border12` / `rings_corner3`.
+
+`tests/lod_rings.rs` (task 2.6) has no golden of its own for most
+cameras: it builds a synthetic heightfield's rings (levels 0..=3, level
+1 by the real downsampling rule over level-0 data, levels 2–3 sampled
+at their own resolution with a child-corner-dominating max), feeds them
+through the real client world, coverage rule, mesher and renderer, and
+asserts **zero sentinel pixels** below a per-camera horizon margin
+(computed from the sky's ~15° below-horizon fade and the rings' far-edge
+drop angle) for eight cameras — close, zoomed and steep-down views at
+the LOD0/LOD1 and LOD1/LOD2 borders, a corner where three levels meet,
+horizon, high and outside-in views — with a small documented allowance
+for pre-existing single-pixel T-junction pinholes. The three draw paths
+must render the scene pixel-identically; a LOD1 cube renders like its
+LOD0 pattern at the same camera (the ×2 scale invariance), and masking
+hides exactly the masked volume with fully masked cubes emitting no
+commands.
 
 `tests/terrain_pages.rs` (task 2.2, extended by 2.5) has no golden of
 its own: it churns 200 cubes through tiny face pages (re-uploads that

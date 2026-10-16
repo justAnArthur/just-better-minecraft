@@ -166,7 +166,11 @@ of parent cells that actually changed — the next level's input, so
 propagation stays proportional to what changed; `None` means no change.
 `downsample_octant(child, parent, octant)` is the whole-cube case with
 fast paths: a uniform child fills its octant with its own state, and a
-parent already uniform and equal to that fill is never unpacked. Both
+parent already uniform and equal to that fill is never unpacked.
+`copy_octant(src, parent, octant) -> Option<CellBox>` (task 2.7) installs
+an octant precomputed elsewhere — a generation worker downsamples the
+LOD0 cube off-thread and the tick thread only copies — returning the
+changed box like the other writers. All of them
 call `Cube::compact` after a write, so a parent that went uniform again
 returns to its cheapest storage (that cost is in the `lod/*` benches).
 
@@ -254,7 +258,7 @@ through); per-state outline shapes are later.
 ## Protocol and links
 
 `protocol` holds the message enums the client and server exchange
-(`PROTOCOL_VERSION = 5`): `ClientMsg` (`Hello`, `PlayerInput { seq,
+(`PROTOCOL_VERSION = 6`): `ClientMsg` (`Hello`, `PlayerInput { seq,
 input, pitch }`, `BreakBlock { pos }`, `PlaceBlock { pos, state }`,
 `Ping`, `Disconnect`) and `ServerMsg` (`Welcome` with
 the spawn feet position, look `yaw`/`pitch` and `flying` — the initial
@@ -262,7 +266,9 @@ state: velocity 0, not on ground; a returning player gets their saved
 position and look, v5 — `PlayerState { ack_seq, state }` sent before `Tick` in ticks
 where the server processed at least one input, `Rejected`, `Tick`,
 `Pong`, `Disconnected`, `CubeData { pos, cube }`, `UnloadCube { pos }`,
-`BlockChange { pos, state }` — the authoritative state of one block).
+`BlockChange { pos, state }` — the authoritative state of one block,
+`LodCubeData { level, pos, cube }` and `UnloadLodCube { level, pos }` —
+LOD ring cubes, v6).
 `PlayerInput.seq` starts at 1 and increments per client tick; the server
 ignores seqs ≤ the last processed one. Pitch is display-only; physics
 ignores it. Messages are plain owned data — no `Arc`, no references, no

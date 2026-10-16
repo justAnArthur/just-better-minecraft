@@ -20,7 +20,9 @@ use jbm_core::raycast::REACH;
 use crate::gen_pool::GenPool;
 use crate::lod::LodPyramid;
 use crate::storage::{PlayerRecord, Storage, StorageError};
-use crate::streaming::{Offset, desired_offsets, in_keep, offset_pos};
+use crate::streaming::{
+    LodWalkEntry, Offset, desired_offsets, in_keep, level_center, lod_walk, offset_pos,
+};
 use crate::terrain::Generator;
 use crate::tick::{TICK_PERIOD, TICKS_PER_SECOND, TickClock};
 
@@ -40,6 +42,12 @@ const INPUTS_PER_TICK: usize = 4;
 /// trip later.
 const REACH_MARGIN: f64 = 1.0;
 
+/// Entries of the merged LOD walk one player may scan past its cursor per
+/// tick while cubes are missing (the cost-contract bound for unsettled
+/// rings; a settled player's cursor sits at the end of the walk and costs
+/// nothing).
+const LOD_SKIP_WINDOW: usize = 512;
+
 /// One queued outgoing block edit. `None` broadcasts to every player with
 /// the cube loaded; `Some(id)` sends to that player only (a rejection
 /// revert).
@@ -55,26 +63,33 @@ pub const DEFAULT_SEED: u64 = 0x0055_EED1_5EED;
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One snapshot batch handed to the save thread: cube clones with the edit
-/// version they were taken at, and player records, committed together.
+/// version they were taken at, LOD cube clones, and player records —
+/// committed together, so LOD derived from an edit never lands on disk
+/// without the LOD0 edit it came from.
 #[derive(Default)]
 struct SaveBatch {
     cubes: Vec<(CubePos, jbm_core::cube::Cube, u64)>,
+    lod: Vec<(u8, CubePos, jbm_core::cube::Cube, u8)>,
     players: Vec<(String, PlayerRecord)>,
 }
 
 impl SaveBatch {
     fn is_empty(&self) -> bool {
-        self.cubes.is_empty() && self.players.is_empty()
+        self.cubes.is_empty() && self.lod.is_empty() && self.players.is_empty()
     }
 }
 
 /// The save thread's reply to a batch.
 enum SaveAck {
-    /// The batch committed; these cube versions and player records are now
-    /// on disk.
-    Committed(Vec<(CubePos, u64)>, Vec<(String, PlayerRecord)>),
+    /// The batch committed; these cube versions, LOD cubes and player
+    /// records are now on disk.
+    Committed(
+        Vec<(CubePos, u64)>,
+        Vec<(u8, CubePos)>,
+        Vec<(String, PlayerRecord)>,
+    ),
     /// The batch failed; these cubes stay dirty and retry next interval.
-    Failed(Vec<CubePos>),
+    Failed(Vec<CubePos>, Vec<(u8, CubePos)>),
 }
 
 /// Per-cube edit bookkeeping (persistence only): the edit version, bumped by
@@ -116,6 +131,18 @@ pub struct ServerConfig {
     /// Top LOD level the server keeps (4 keeps LOD1–LOD4). `0` disables
     /// the pyramid entirely: no allocation, no work per cube or edit.
     pub lod_levels: u8,
+    /// Horizontal radius of every LOD ring, in cubes of that ring's level
+    /// (task 2.6). Each level streams a full disk; the client draws the
+    /// finest ready level per octant.
+    pub lod_view_radius: u32,
+    /// Vertical radius of every LOD ring, in cubes of that ring's level.
+    pub lod_vertical_radius: u32,
+    /// Most `LodCubeData` messages sent to one player per tick, re-sends
+    /// of changed cubes included.
+    pub lod_send_budget_per_tick: usize,
+    /// Cap on LOD cubes requested from the pyramid but not yet ready
+    /// ([`LodPyramid::in_flight`]).
+    pub lod_max_in_flight: usize,
 }
 
 impl Default for ServerConfig {
@@ -133,6 +160,10 @@ impl Default for ServerConfig {
             world_dir: None,
             save_interval: Duration::from_secs(5),
             lod_levels: 4,
+            lod_view_radius: 8,
+            lod_vertical_radius: 3,
+            lod_send_budget_per_tick: 32,
+            lod_max_in_flight: 256,
         }
     }
 }
@@ -187,6 +218,13 @@ pub struct PlayerView {
     pub input_count: u64,
 }
 
+/// Per-level LOD ring streaming state for one player (task 2.6): the
+/// level's center cube and the cubes already sent.
+struct PlayerLodLevel {
+    center: CubePos,
+    sent: HashSet<CubePos>,
+}
+
 /// State the server tracks for one joined player.
 struct Player {
     id: PlayerId,
@@ -217,6 +255,17 @@ struct Player {
     /// with the player and handed back in the next `Welcome`.
     yaw: f32,
     pitch: f32,
+    /// LOD ring state per level (`lod[l - 1]` is level `l`); empty when
+    /// the pyramid is off (`lod_levels == 0`).
+    lod: Vec<PlayerLodLevel>,
+    /// Cursor into the merged LOD walk: every entry before it is sent.
+    /// Reset whenever any level's center moves; while cubes are missing
+    /// it sits at the first unsent entry.
+    lod_cursor: usize,
+    /// Queued re-sends: cubes the pyramid changed that this player
+    /// already has. Drained ahead of the walk within the LOD budget, and
+    /// persistent across ticks so nothing starves.
+    lod_resend: VecDeque<(u8, CubePos)>,
 }
 
 impl Player {
@@ -272,6 +321,9 @@ pub struct Server {
     next_player_id: u32,
     config: ServerConfig,
     pool: GenPool,
+    /// The generator the pool and the LOD pipeline sample from; kept for
+    /// the test counters (`Server::lod_samples`).
+    generator: Arc<Generator>,
     /// Generated cubes the server keeps in memory, keyed by position.
     world: HashMap<CubePos, jbm_core::cube::Cube>,
     /// Per-state solidity for physics; built once from the same registry
@@ -289,6 +341,9 @@ pub struct Server {
     /// Edit versions handed to the save thread and not yet acknowledged.
     /// A cube listed here stays pinned until its batch commits.
     pending_save: HashMap<CubePos, u64>,
+    /// LOD cubes handed to the save thread and not yet acknowledged
+    /// (task 2.7); a failed batch puts them back dirty for the next one.
+    lod_pending_save: HashSet<(u8, CubePos)>,
     /// Open world database; `None` when persistence is off.
     storage: Option<Arc<Storage>>,
     /// Sends snapshot batches to the save thread.
@@ -330,6 +385,8 @@ pub struct Server {
     /// never touches it: LOD cubes outlive their LOD0 children, so builds
     /// stay visible from far away.
     lod: LodPyramid,
+    /// The merged LOD ring walk (task 2.6), precomputed from the config.
+    lod_walk: Vec<LodWalkEntry>,
 }
 
 impl Server {
@@ -364,6 +421,23 @@ impl Server {
         let spawn = generator.spawn();
         let solid = SolidTable::new(&registry);
         let state_count = registry.state_count();
+        // Stored LOD only counts under the worldgen it was written with:
+        // a mismatching fingerprint makes every stored LOD record read as
+        // absent (and the next saves overwrite them).
+        if let Some(storage) = &storage
+            && config.lod_levels > 0
+            && let Err(error) =
+                storage.set_worldgen_fingerprint(crate::worldgen::overworld().fingerprint())
+        {
+            return Err(error);
+        }
+        let lod = LodPyramid::with_workers(
+            config.lod_levels,
+            Arc::clone(&generator),
+            storage.clone(),
+            config.gen_threads,
+            config.gen_budget_per_tick,
+        );
 
         let (save_tx, save_rx) = std::sync::mpsc::channel::<SaveBatch>();
         let (ack_tx, ack_rx) = std::sync::mpsc::channel::<SaveAck>();
@@ -373,7 +447,11 @@ impl Server {
                 .spawn(move || save_loop(storage, save_rx, ack_tx))
                 .expect("spawning the jbm-save thread")
         });
-        let lod = LodPyramid::new(config.lod_levels);
+        let lod_walk = lod_walk(
+            config.lod_levels,
+            config.lod_view_radius,
+            config.lod_vertical_radius,
+        );
 
         Ok(Self {
             clock: TickClock::new(),
@@ -382,12 +460,14 @@ impl Server {
             next_player_id: 1,
             config,
             pool,
+            generator,
             world: HashMap::new(),
             solid,
             state_count,
             pinned: HashSet::new(),
             versions: HashMap::new(),
             pending_save: HashMap::new(),
+            lod_pending_save: HashSet::new(),
             storage,
             save_tx: Some(save_tx),
             ack_rx,
@@ -404,6 +484,7 @@ impl Server {
             eviction_dirty: true,
             joined_count: 0,
             lod,
+            lod_walk,
         })
     }
 
@@ -477,10 +558,56 @@ impl Server {
         self.world.len()
     }
 
+    /// Test and bench access: teleport the player to `position`, bypassing
+    /// physics. The next tick's streaming phases observe the moved center
+    /// exactly as they would after a real teleport; no inputs are queued,
+    /// so the state sits at `position` until the next call.
+    pub fn teleport_player(&mut self, id: PlayerId, position: DVec3) {
+        for conn in &mut self.connections {
+            if let ConnectionState::Joined(player) = &mut conn.state
+                && player.id == id
+            {
+                player.state.position = position;
+                return;
+            }
+        }
+    }
+
     /// The level-`level` LOD cube at `pos`, when the pyramid holds one
     /// (levels are 1-based; `lod_levels` bounds the top).
     pub fn lod_cube(&self, level: u8, pos: CubePos) -> Option<&jbm_core::cube::Cube> {
         self.lod.get(level, pos).map(|lc| &lc.cube)
+    }
+
+    /// The cube at `(level, pos)` when it is ready to stream — every
+    /// octant real or filled (task 2.7). Test and streaming access.
+    pub fn lod_ready(&self, level: u8, pos: CubePos) -> Option<&jbm_core::cube::Cube> {
+        self.lod.ready(level, pos)
+    }
+
+    /// Forwards to [`LodPyramid::request`]: queue `(level, pos)` for
+    /// load-or-sample. Test and streaming access.
+    pub fn request_lod(&mut self, level: u8, pos: CubePos) {
+        self.lod.request(level, pos);
+    }
+
+    /// LOD jobs queued, running or finished-but-uncollected. The pyramid's
+    /// own (internal) jobs are excluded, as [`LodPyramid::in_flight`]
+    /// documents.
+    pub fn lod_in_flight(&self) -> usize {
+        self.lod.in_flight()
+    }
+
+    /// Internal (pending-propagation) LOD jobs the pyramid has queued in
+    /// total — the load-report number for the default view.
+    pub fn lod_internal_requests(&self) -> u64 {
+        self.lod.internal_requests()
+    }
+
+    /// How many `sample_lod` sampling runs the generator has done — the
+    /// test hook that proves storage reloads do not sample.
+    pub fn lod_samples(&self) -> u64 {
+        self.generator.lod_sample_calls()
     }
 
     /// The known-octant mask of the level-`level` LOD cube at `pos`, when
@@ -510,6 +637,38 @@ impl Server {
     /// collected.
     pub fn in_flight(&self) -> usize {
         self.pool.in_flight()
+    }
+
+    /// LOD ring completeness for the fly test: how many of the player's
+    /// desired ring cubes are not yet sent, summed over levels (a cube is
+    /// only ever sent once ready, so this covers "not ready and sent").
+    /// Zero once every ring the pyramid can fill has streamed.
+    pub fn lod_ring_pending(&self, id: PlayerId) -> usize {
+        let Some(player) = self
+            .connections
+            .iter()
+            .filter_map(Connection::joined_player)
+            .find(|player| player.id == id)
+        else {
+            return 0;
+        };
+        player
+            .lod
+            .iter()
+            .enumerate()
+            .map(|(index, level_state)| {
+                let level = index as u8 + 1;
+                self.lod_walk
+                    .iter()
+                    .filter(|(l, _)| *l == level)
+                    .filter(|&(_, offset)| {
+                        !level_state
+                            .sent
+                            .contains(&offset_pos(level_state.center, *offset))
+                    })
+                    .count()
+            })
+            .sum()
     }
 
     /// Cubes currently sent to (and not unloaded from) the player.
@@ -699,6 +858,10 @@ impl Server {
                     flying: false,
                 });
                 let spawn = record.position;
+                let lod_levels = self.config.lod_levels;
+                let lod0_center = cube_containing(DVec3::from(spawn));
+                let lod_r = self.config.lod_view_radius;
+                let lod_v = self.config.lod_vertical_radius;
                 conn.state = ConnectionState::Joined(Box::new(Player {
                     id: player_id,
                     name,
@@ -719,7 +882,16 @@ impl Server {
                     cursor: 0,
                     yaw: record.yaw,
                     pitch: record.pitch,
+                    lod: (1..=lod_levels)
+                        .map(|level| PlayerLodLevel {
+                            center: level_center(lod0_center, level),
+                            sent: HashSet::new(),
+                        })
+                        .collect(),
+                    lod_cursor: 0,
+                    lod_resend: VecDeque::new(),
                 }));
+                let _ = (lod_r, lod_v);
                 let welcome = ServerMsg::Welcome {
                     player_id,
                     server_tick: self.tick_number,
@@ -898,7 +1070,8 @@ impl Server {
 
     /// Persistence slice of the tick, run right before phase 5: apply the
     /// save thread's acknowledgements, then every `save_interval` snapshot
-    /// dirty cubes and hand them off. No-op without a world directory.
+    /// dirty cubes and LOD and hand them off. No-op without a world
+    /// directory.
     fn phase_save(&mut self) {
         if self.storage.is_none() {
             return;
@@ -919,8 +1092,28 @@ impl Server {
                 batch.cubes.push((*pos, cube.clone(), edit.version));
             }
         }
+        self.collect_lod_dirty(&mut batch);
         batch.players = self.player_snapshot();
         self.send_save_batch(batch);
+    }
+
+    /// Snapshots every LOD cube the pyramid marked dirty (ready cubes whose
+    /// content changed) and not already in flight. A cube whose older save
+    /// is still in flight is kept dirty, so the interval after that save's
+    /// ack writes the newer content — dropping it here would lose it.
+    fn collect_lod_dirty(&mut self, batch: &mut SaveBatch) {
+        let dirty = self.lod.take_store_dirty();
+        for (level, pos) in dirty {
+            if self.lod_pending_save.contains(&(level, pos)) {
+                self.lod.mark_store_dirty(&[(level, pos)]);
+                continue;
+            }
+            if let Some(lc) = self.lod.get(level, pos)
+                && lc.ready()
+            {
+                batch.lod.push((level, pos, lc.cube.clone(), lc.known));
+            }
+        }
     }
 
     /// Records of every joined player plus everyone who left since the last
@@ -967,7 +1160,7 @@ impl Server {
 
     fn apply_save_ack(&mut self, ack: SaveAck) {
         match ack {
-            SaveAck::Committed(acks, players) => {
+            SaveAck::Committed(acks, lod, players) => {
                 self.saved_batches += 1;
                 self.saved_players.extend(players);
                 for (pos, version) in acks {
@@ -981,21 +1174,33 @@ impl Server {
                         self.pending_save.remove(&pos);
                     }
                 }
+                for key in lod {
+                    self.lod_pending_save.remove(&key);
+                }
             }
             // A failed batch is logged and retried next interval: the cubes
             // stay dirty (never evicted), so edits are never dropped
-            // silently.
+            // silently. The batch's LOD cubes go back to the dirty set the
+            // same way.
             // Players are re-sent next interval: `saved_players` only moves
             // on a commit, so their records still differ.
-            SaveAck::Failed(positions) => {
+            SaveAck::Failed(positions, lod) => {
                 self.failed_batches += 1;
                 eprintln!(
-                    "jbm: saving a batch of {} cubes failed; retrying next interval",
-                    positions.len()
+                    "jbm: saving a batch of {} cubes and {} LOD cubes failed; retrying next interval",
+                    positions.len(),
+                    lod.len()
                 );
                 for pos in positions {
                     self.pending_save.remove(&pos);
                 }
+                // Only this batch's keys: other batches may still be in
+                // flight behind it, and forgetting theirs would let a later
+                // interval snapshot them again while their save still runs.
+                for key in &lod {
+                    self.lod_pending_save.remove(key);
+                }
+                self.lod.mark_store_dirty(&lod);
             }
         }
     }
@@ -1010,6 +1215,8 @@ impl Server {
         for (pos, _, version) in &batch.cubes {
             self.pending_save.insert(*pos, *version);
         }
+        self.lod_pending_save
+            .extend(batch.lod.iter().map(|&(level, pos, _, _)| (level, pos)));
         match &self.save_tx {
             Some(tx) if tx.send(batch).is_ok() => self.sent_batches += 1,
             _ => eprintln!("jbm: the save thread is gone; unsaved edits may be lost"),
@@ -1034,6 +1241,7 @@ impl Server {
                 batch.cubes.push((*pos, cube.clone(), edit.version));
             }
         }
+        self.collect_lod_dirty(&mut batch);
         batch.players = self.player_snapshot();
         self.send_save_batch(batch);
         // The saver answers batches in order, so once every batch sent so
@@ -1181,12 +1389,12 @@ impl Server {
         if inline {
             for _ in 0..budget {
                 match pool.try_recv() {
-                    Some((pos, cube)) => {
+                    Some((pos, cube, octant)) => {
                         collected = true;
                         if let std::collections::hash_map::Entry::Vacant(slot) = world.entry(pos) {
                             let inserted = slot.insert(cube);
                             if lod_on {
-                                lod.insert_lod0(pos, inserted);
+                                lod.insert_lod0_octant(pos, inserted, Some(&octant));
                             }
                         }
                     }
@@ -1194,12 +1402,41 @@ impl Server {
                 }
             }
         } else {
-            while let Some((pos, cube)) = pool.try_recv() {
+            while let Some((pos, cube, octant)) = pool.try_recv() {
                 collected = true;
                 if let std::collections::hash_map::Entry::Vacant(slot) = world.entry(pos) {
                     let inserted = slot.insert(cube);
                     if lod_on {
-                        lod.insert_lod0(pos, inserted);
+                        lod.insert_lod0_octant(pos, inserted, Some(&octant));
+                    }
+                }
+            }
+        }
+
+        // Background LOD work (2.7) lands after LOD0 ingest and before
+        // streaming reads the pyramid.
+        lod.poll();
+
+        // LOD step 2 (2.6): drain the pyramid's changed set once per tick,
+        // before the per-player pass, queueing a re-send for every changed
+        // cube a player already has.
+        let lod_streaming = self.config.streaming && self.config.lod_levels > 0;
+        let lod_changed = if lod_streaming {
+            self.lod.take_changed()
+        } else {
+            Vec::new()
+        };
+        if !lod_changed.is_empty() {
+            for conn in &mut self.connections {
+                let ConnectionState::Joined(player) = &mut conn.state else {
+                    continue;
+                };
+                for &(level, pos) in &lod_changed {
+                    let Some(lvl) = player.lod.get(level as usize - 1) else {
+                        continue;
+                    };
+                    if lvl.sent.contains(&pos) && !player.lod_resend.contains(&(level, pos)) {
+                        player.lod_resend.push_back((level, pos));
                     }
                 }
             }
@@ -1232,6 +1469,18 @@ impl Server {
                 &self.desired,
                 &mut eviction_dirty,
             ) {
+                dropped.push(idx);
+                continue;
+            }
+            if lod_streaming
+                && stream_player_lod(
+                    &mut conn.link,
+                    player,
+                    &mut self.lod,
+                    &self.config,
+                    &self.lod_walk,
+                )
+            {
                 dropped.push(idx);
             }
         }
@@ -1409,6 +1658,143 @@ fn stream_player(
     false
 }
 
+/// One player's slice of LOD ring streaming (task 2.6). Returns `true`
+/// when the link closed and the connection must be dropped.
+///
+/// Cost contract, like the LOD0 one: a settled player whose rings are
+/// complete costs a few center comparisons per level per tick — the
+/// cursor sits at the end of the walk, so nothing is scanned. While cubes
+/// are missing, the per-tick scan is bounded by [`LOD_SKIP_WINDOW`]
+/// entries past the cursor plus the send budget; the cursor only advances
+/// over sent entries, so a gap in the pyramid costs a bounded look-ahead,
+/// never a full rescan (a level-center move resets it, like LOD0).
+fn stream_player_lod(
+    link: &mut ServerLink,
+    player: &mut Player,
+    lod: &mut LodPyramid,
+    config: &ServerConfig,
+    walk: &[LodWalkEntry],
+) -> bool {
+    let lod0_center = cube_containing(player.state.position);
+    let (r, v) = (config.lod_view_radius, config.lod_vertical_radius);
+
+    // 1. Level centers: unload what left that level's keep set (the
+    //    desired shape at +1 in both radii), then reset the walk cursor.
+    let mut center_moved = false;
+    for (index, level_state) in player.lod.iter_mut().enumerate() {
+        let center = level_center(lod0_center, index as u8 + 1);
+        if center == level_state.center {
+            continue;
+        }
+        level_state.center = center;
+        let to_unload: Vec<CubePos> = level_state
+            .sent
+            .iter()
+            .copied()
+            .filter(|&pos| !in_keep(pos, center, r, v))
+            .collect();
+        for pos in to_unload {
+            level_state.sent.remove(&pos);
+            if link
+                .send(ServerMsg::UnloadLodCube {
+                    level: index as u8 + 1,
+                    pos,
+                })
+                .is_err()
+            {
+                return true;
+            }
+        }
+        center_moved = true;
+    }
+    if center_moved {
+        player.lod_cursor = 0;
+    }
+
+    // 2. Queued re-sends first, within the budget: an edit's LOD change
+    //    reaches the player within one tick whenever the budget allows.
+    let mut budget = config.lod_send_budget_per_tick;
+    while budget > 0 {
+        let Some(&(level, pos)) = player.lod_resend.front() else {
+            break;
+        };
+        let Some(level_state) = player.lod.get(level as usize - 1) else {
+            player.lod_resend.pop_front();
+            continue;
+        };
+        // Dropped since queuing (unloaded or no longer ours): skip it.
+        if !level_state.sent.contains(&pos) {
+            player.lod_resend.pop_front();
+            continue;
+        }
+        let Some(cube) = lod.ready(level, pos) else {
+            // No longer ready: nothing true to send, drop the entry.
+            player.lod_resend.pop_front();
+            continue;
+        };
+        if link
+            .send(ServerMsg::LodCubeData {
+                level,
+                pos,
+                cube: Box::new(cube.clone()),
+            })
+            .is_err()
+        {
+            return true;
+        }
+        player.lod_resend.pop_front();
+        budget -= 1;
+    }
+
+    // 3. The merged walk. Sent entries advance the head cursor for free;
+    //    a not-ready cube is requested and skipped (the client's coverage
+    //    rule makes any arrival order hole-free); the scan stops at the
+    //    skip window even when the near cubes stay missing.
+    let mut head = player.lod_cursor.min(walk.len());
+    let mut i = head;
+    let end = (head + LOD_SKIP_WINDOW).min(walk.len());
+    while i < end && budget > 0 {
+        let (level, offset) = walk[i];
+        let level_state = &mut player.lod[level as usize - 1];
+        let pos = offset_pos(level_state.center, offset);
+        if level_state.sent.contains(&pos) {
+            if i == head {
+                head += 1;
+            }
+            i += 1;
+            continue;
+        }
+        match lod.ready(level, pos) {
+            Some(cube) => {
+                if link
+                    .send(ServerMsg::LodCubeData {
+                        level,
+                        pos,
+                        cube: Box::new(cube.clone()),
+                    })
+                    .is_err()
+                {
+                    player.lod_cursor = head;
+                    return true;
+                }
+                level_state.sent.insert(pos);
+                if i == head {
+                    head += 1;
+                }
+                budget -= 1;
+            }
+            None => {
+                if lod.in_flight() < config.lod_max_in_flight {
+                    lod.request(level, pos);
+                }
+            }
+        }
+        i += 1;
+    }
+    player.lod_cursor = head;
+    false
+}
+
 impl Default for Server {
     fn default() -> Self {
         Self::new()
@@ -1423,6 +1809,13 @@ impl Drop for Server {
         // received is applied first so nothing the player saw is lost.
         if self.storage.is_some() {
             self.settle_received_input();
+        }
+        // A held save (the storage test hook) parks the save thread in
+        // `enter_save` indefinitely; release it so the flush and the join
+        // below can finish — shutdown must never hang on the hook. A
+        // no-op when nothing is held.
+        if let Some(storage) = &self.storage {
+            storage.release_saves();
         }
         self.flush();
         self.save_tx = None;
@@ -1442,18 +1835,29 @@ fn save_loop(storage: Arc<Storage>, batches: Receiver<SaveBatch>, acks: Sender<S
             .iter()
             .map(|(pos, cube, _)| (*pos, cube))
             .collect();
-        let ack = match storage.save_batch_with_players(&refs, &batch.players) {
+        let lod_refs: Vec<(u8, CubePos, &jbm_core::cube::Cube, u8)> = batch
+            .lod
+            .iter()
+            .map(|&(level, pos, ref cube, known)| (level, pos, cube, known))
+            .collect();
+        let lod_keys: Vec<(u8, CubePos)> = batch
+            .lod
+            .iter()
+            .map(|&(level, pos, _, _)| (level, pos))
+            .collect();
+        let ack = match storage.save_lod_batch(&refs, &lod_refs, &batch.players) {
             Ok(()) => SaveAck::Committed(
                 batch
                     .cubes
                     .iter()
                     .map(|(pos, _, version)| (*pos, *version))
                     .collect(),
+                lod_keys,
                 batch.players,
             ),
             Err(error) => {
                 eprintln!("jbm: committing a save batch failed: {error}");
-                SaveAck::Failed(refs.into_iter().map(|(pos, _)| pos).collect())
+                SaveAck::Failed(refs.into_iter().map(|(pos, _)| pos).collect(), lod_keys)
             }
         };
         if acks.send(ack).is_err() {
@@ -1469,7 +1873,7 @@ mod tests {
     use jbm_core::coords::{BlockPos, CubePos};
     use jbm_core::link::{ClientLink, in_process_pair};
     use jbm_core::physics::MoveInput;
-    use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION, ServerMsg};
+    use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION, PlayerId, ServerMsg};
 
     /// Every unit test here asserts exact message sequences, so it runs the
     /// server with streaming off (no CubeData noise).
@@ -1533,6 +1937,23 @@ mod tests {
             messages.push(msg);
         }
         messages
+    }
+
+    /// A drain with LOD ring traffic filtered out, for asserting exact
+    /// edit sequences. These servers keep their (default) LOD rings on, so
+    /// under 2.7 `LodCubeData` legitimately interleaves with `BlockChange`
+    /// for many ticks after a join; the edit contract itself — the change
+    /// lands before `Tick` — is unchanged.
+    fn drain_edits(client: &mut ClientLink) -> Vec<ServerMsg> {
+        drain(client)
+            .into_iter()
+            .filter(|m| {
+                !matches!(
+                    m,
+                    ServerMsg::LodCubeData { .. } | ServerMsg::UnloadLodCube { .. }
+                )
+            })
+            .collect()
     }
 
     /// Joins, settles terrain loading, and returns the spawn state.
@@ -1995,7 +2416,7 @@ mod tests {
         // Both players (both have the cube loaded) learn it before Tick.
         for client in [&mut a, &mut b] {
             assert!(matches!(
-                drain(client).as_slice(),
+                drain_edits(client).as_slice(),
                 [
                     ServerMsg::BlockChange {
                         pos,
@@ -2016,7 +2437,7 @@ mod tests {
         server.tick();
         assert_eq!(server.block(ground), Some(stone));
         assert!(matches!(
-            drain(&mut a).as_slice(),
+            drain_edits(&mut a).as_slice(),
             [
                 ServerMsg::BlockChange { state, .. },
                 ServerMsg::Tick { .. }
@@ -2105,7 +2526,7 @@ mod tests {
             server.tick();
             assert!(
                 matches!(
-                    drain(&mut a).as_slice(),
+                    drain_edits(&mut a).as_slice(),
                     [
                         ServerMsg::BlockChange { state, .. },
                         ServerMsg::Tick { .. }
@@ -2114,7 +2535,7 @@ mod tests {
                 "sender must be reverted for {msg:?}"
             );
             assert_eq!(
-                drain(&mut b).as_slice(),
+                drain_edits(&mut b).as_slice(),
                 &[ServerMsg::Tick {
                     tick: server.tick_count()
                 }],
@@ -2135,7 +2556,7 @@ mod tests {
         a.send(ClientMsg::BreakBlock { pos: unloaded }).unwrap();
         server.tick();
         assert_eq!(
-            drain(&mut a).as_slice(),
+            drain_edits(&mut a).as_slice(),
             &[ServerMsg::Tick {
                 tick: server.tick_count()
             }]
@@ -2289,6 +2710,531 @@ mod tests {
             1,
             "only the pinned cube survives the player leaving"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // LOD ring streaming (task 2.6)
+
+    /// A streaming server with small LOD rings and inline generation, the
+    /// deterministic mode these tests use.
+    fn lod_config(lod_budget: usize) -> ServerConfig {
+        ServerConfig {
+            streaming: true,
+            view_radius: 1,
+            vertical_radius: 1,
+            send_budget_per_tick: 64,
+            gen_threads: 0,
+            gen_budget_per_tick: 64,
+            max_in_flight: 512,
+            lod_levels: 3,
+            lod_view_radius: 3,
+            lod_vertical_radius: 2,
+            lod_send_budget_per_tick: lod_budget,
+            lod_max_in_flight: 256,
+            ..ServerConfig::default()
+        }
+    }
+
+    fn lod_server(lod_budget: usize) -> Server {
+        Server::with_config(lod_config(lod_budget))
+    }
+
+    fn split_lod(messages: &[ServerMsg]) -> Vec<(u8, CubePos)> {
+        messages
+            .iter()
+            .filter_map(|m| match m {
+                ServerMsg::LodCubeData { level, pos, .. } => Some((*level, *pos)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Joins one player and ticks until the LOD rings settle: no LOD
+    /// message for `rounds` full ticks **and** no fill work left anywhere
+    /// in the pyramid's pipeline. Under 2.7 the pyramid keeps filling (and
+    /// re-sending changed cubes) long after the first rings land, so quiet
+    /// alone is not "settled". Returns every message seen.
+    fn settle_lod(server: &mut Server, client: &mut ClientLink, rounds: usize) -> Vec<ServerMsg> {
+        let mut seen = Vec::new();
+        let mut quiet = 0;
+        while quiet < rounds {
+            server.tick();
+            let messages = drain(client);
+            let busy = messages.iter().any(|m| {
+                matches!(
+                    m,
+                    ServerMsg::LodCubeData { .. } | ServerMsg::UnloadLodCube { .. }
+                )
+            }) || server.lod_pyramid().in_flight_total() > 0;
+            quiet = if busy { 0 } else { quiet + 1 };
+            seen.extend(messages);
+        }
+        seen
+    }
+
+    #[test]
+    fn settled_rings_send_every_ready_desired_cube_exactly_once() {
+        let (mut server, mut client) = pending_hello_on(lod_server(32));
+        let seen = settle_lod(&mut server, &mut client, 10);
+        let sent = split_lod(&seen);
+
+        let state = server.players().next().unwrap().state;
+        let lod0_center = cube_containing(state.position);
+        let player = server
+            .connections
+            .iter()
+            .filter_map(|c| c.joined_player())
+            .next()
+            .unwrap();
+        // Nothing outside the desired disks was sent, and every cube the
+        // server recorded as sent was received. A cube can appear more
+        // than once in the fill history: under 2.7 a cube's content
+        // changes when real data replaces a worldgen guess (the
+        // `merge` → `touch` → `take_changed` chain in lod.rs), and
+        // changed cubes are re-sent by design via the re-send queue in
+        // stream_player_lod step 2. Exactly-once is therefore asserted on
+        // the settled window below, where those re-sends are provably
+        // done.
+        let mut counts = std::collections::HashMap::new();
+        for &(level, pos) in &sent {
+            *counts.entry((level, pos)).or_insert(0usize) += 1;
+            let center = crate::streaming::level_center(lod0_center, level);
+            assert!(
+                crate::streaming::in_desired(pos, center, 3, 2),
+                "sent outside the desired disk: level {level} {pos:?}"
+            );
+        }
+        for (index, level_state) in player.lod.iter().enumerate() {
+            let level = index as u8 + 1;
+            for &pos in &level_state.sent {
+                assert!(
+                    counts.get(&(level, pos)).is_some_and(|&n| n >= 1),
+                    "a cube in the sent set was never received: level {level} {pos:?}"
+                );
+                assert!(
+                    server.lod_ready(level, pos).is_some(),
+                    "a sent cube is no longer ready (level {level})"
+                );
+            }
+        }
+        // The bookkeeping agrees two-sidedly: every cube received is one
+        // the server recorded as sent. With no inputs the level centers
+        // never move, so nothing was unloaded out of the sent sets — a
+        // received-but-unrecorded cube would be an untracked send.
+        for &(level, pos) in counts.keys() {
+            assert!(
+                player.lod[level as usize - 1].sent.contains(&pos),
+                "a cube was received but never recorded as sent: level {level} {pos:?}"
+            );
+        }
+        // Every cube in the desired disks whose ready is Some is in the
+        // sent set. Held-but-not-ready cubes are correctly not sent.
+        for (level, pos) in server
+            .lod_pyramid()
+            .iter(1)
+            .map(|(pos, _)| (1u8, *pos))
+            .chain(
+                server
+                    .lod_pyramid()
+                    .iter(2)
+                    .map(|(pos, _)| (2u8, *pos))
+                    .chain(server.lod_pyramid().iter(3).map(|(pos, _)| (3u8, *pos))),
+            )
+        {
+            let center = crate::streaming::level_center(lod0_center, level);
+            if crate::streaming::in_desired(pos, center, 3, 2)
+                && server.lod_ready(level, pos).is_some()
+            {
+                assert!(
+                    player.lod[level as usize - 1].sent.contains(&pos),
+                    "ready desired cube never sent: level {level} {pos:?}"
+                );
+            }
+        }
+
+        // Exactly-once, settled window: after the pyramid is quiet, no
+        // cube may be sent again. Zero LOD traffic here is a
+        // code-guaranteed absence, not a guess: settle_lod returned only
+        // after no LOD traffic for 10 full ticks with in_flight_total()
+        // at zero, so no fill job can land to change a cube (`merge` →
+        // `touch` → `take_changed` reports nothing) — and any leftover
+        // re-send queue entry would itself have been traffic, since step 2
+        // drains the queue first within the budget. Every desired cube is
+        // already sent (asserted above), which leaves the walk cursor at
+        // the end of the walk with nothing to scan. And with no inputs the
+        // level centers never move, so step 1 unloads nothing. Any
+        // LodCubeData in this window is a re-send of an unchanged cube;
+        // any UnloadLodCube, an unload without a center move — both bugs.
+        // 20 ticks is a full walk pass either way: 435 entries at the
+        // budget of 32 need 14.
+        let mut window = Vec::new();
+        for _ in 0..20 {
+            server.tick();
+            window.extend(drain(&mut client));
+        }
+        let resent = split_lod(&window);
+        assert!(
+            resent.is_empty(),
+            "{resent:?} re-sent after the pyramid settled"
+        );
+        assert!(
+            !window
+                .iter()
+                .any(|m| matches!(m, ServerMsg::UnloadLodCube { .. })),
+            "an unload happened with a static center"
+        );
+    }
+
+    #[test]
+    fn lod_messages_respect_the_budget_and_the_merged_walk_order() {
+        let (mut server, mut client) = pending_hello_on(lod_server(3));
+        // First sends only. The re-send queue (stream_player_lod step 2,
+        // drained ahead of the walk) only ever carries cubes already in a
+        // player's sent set — phase_streaming queues an entry only when
+        // `lvl.sent.contains(&pos)` — so a re-send is never a first send,
+        // and first sends come only from the walk itself, in walk order.
+        // Under 2.7 re-sends are expected: real data replaces worldgen
+        // guesses (`merge` → `touch` → `take_changed`), and those cubes
+        // re-send at an arbitrary walk position. They are excluded from
+        // the order check but still counted for the budget check, whose
+        // contract includes re-sends. The state never moves here — no
+        // input is ever sent, and physics steps only on inputs — so the
+        // level centers and the walk cursor stay fixed for the whole run
+        // and no walk segmentation is needed.
+        // 400 ticks: 435 walk entries at a budget of 3 (re-sends included)
+        // need ~145 ticks even without fill latency.
+        let mut first_sent = std::collections::HashSet::new();
+        let mut order: Vec<(u8, (i32, i32, i32))> = Vec::new();
+        let mut per_tick_over = 0;
+        for _ in 0..400 {
+            server.tick();
+            let messages = drain(&mut client);
+            let lod_count = split_lod(&messages).len();
+            if lod_count > 3 {
+                per_tick_over += 1;
+            }
+            let state = server.players().next().unwrap().state;
+            let lod0_center = cube_containing(state.position);
+            for (level, pos) in split_lod(&messages) {
+                if !first_sent.insert((level, pos)) {
+                    continue;
+                }
+                let center = crate::streaming::level_center(lod0_center, level);
+                order.push((
+                    level,
+                    (pos.x - center.x, pos.y - center.y, pos.z - center.z),
+                ));
+            }
+            if server.lod_ring_pending(PlayerId(1)) == 0 {
+                break;
+            }
+        }
+        assert_eq!(per_tick_over, 0, "the per-tick budget was exceeded");
+        assert!(!order.is_empty());
+
+        // The first-send order is a subsequence of the merged walk.
+        let walk = crate::streaming::lod_walk(3, 3, 2);
+        let mut walk_index = 0;
+        for entry in &order {
+            let mut found = false;
+            while walk_index < walk.len() {
+                if walk[walk_index] == *entry {
+                    found = true;
+                    walk_index += 1;
+                    break;
+                }
+                walk_index += 1;
+            }
+            assert!(
+                found,
+                "send {entry:?} is out of the merged walk order (at walk index {walk_index})"
+            );
+        }
+    }
+
+    #[test]
+    fn crossing_a_level2_boundary_unloads_exactly_the_left_keep_set() {
+        let (mut server, mut client) = pending_hello_on(lod_server(64));
+        let _ = settle_lod(&mut server, &mut client, 10);
+        let start = server.players().next().unwrap().state;
+        let lod0 = cube_containing(start.position);
+        let center2 = crate::streaming::level_center(lod0, 2);
+
+        // Fly east (yaw pi/2) until the level-2 center moves.
+        let mut seq = 0u64;
+        let mut new_center2 = center2;
+        let crossed = fly_until(
+            &mut server,
+            &mut client,
+            std::f32::consts::FRAC_PI_2,
+            start.position.y + 40.0,
+            &mut seq,
+            |server, _| {
+                let state = server.players().next().unwrap().state;
+                new_center2 = crate::streaming::level_center(cube_containing(state.position), 2);
+                new_center2 != center2
+            },
+            6000,
+        );
+        assert!(crossed, "never crossed a level-2 boundary");
+
+        // Everything the player still holds at level 2 is in the new keep
+        // set; everything that left it was unloaded exactly once.
+        let player = server
+            .connections
+            .iter()
+            .filter_map(|c| c.joined_player())
+            .next()
+            .unwrap();
+        for pos in &player.lod[1].sent {
+            assert!(
+                crate::streaming::in_keep(*pos, new_center2, 3, 2),
+                "kept cube outside the new keep set: {pos:?}"
+            );
+        }
+        // Settle again and collect the unloads that happened during the
+        // flight (drained inside fly_until), so tally them from a fresh
+        // move instead: walk back west and watch the messages.
+        let before: std::collections::HashSet<CubePos> =
+            player.lod[1].sent.iter().copied().collect();
+        let back_center2 = new_center2;
+        let mut unloaded = Vec::new();
+        let returned = fly_until(
+            &mut server,
+            &mut client,
+            -std::f32::consts::FRAC_PI_2,
+            start.position.y + 40.0,
+            &mut seq,
+            |server, messages| {
+                unloaded.extend(messages.iter().filter_map(|m| match m {
+                    ServerMsg::UnloadLodCube { level: 2, pos } => Some(*pos),
+                    _ => None,
+                }));
+                let state = server.players().next().unwrap().state;
+                let c = crate::streaming::level_center(cube_containing(state.position), 2);
+                c != back_center2
+            },
+            6000,
+        );
+        assert!(returned, "never crossed back");
+        // Every unloaded cube left the then-current keep set and was held
+        // before the flight.
+        for pos in &unloaded {
+            assert!(
+                before.contains(pos),
+                "unloaded a cube the player never had: {pos:?}"
+            );
+        }
+        let _ = settle_lod(&mut server, &mut client, 10);
+        // The new ones arrived: the sent set is non-empty and inside the
+        // new keep set.
+        let player = server
+            .connections
+            .iter()
+            .filter_map(|c| c.joined_player())
+            .next()
+            .unwrap();
+        assert!(!player.lod[1].sent.is_empty());
+    }
+
+    /// Two stacked stone blocks above the surface, aligned into one
+    /// 2x2x2 group: a 2-of-8 fill that turns its LOD1 cell from air to
+    /// stone — an edit that provably changes the pyramid whatever the
+    /// surface height's parity. Reachable from spawn, beside (not into)
+    /// the player's box.
+    fn lod_changing_placements(server: &Server) -> [BlockPos; 2] {
+        let feet = server.players().next().unwrap().state.position;
+        let mut y = feet.y.floor() as i64 + 2;
+        if y % 2 != 0 {
+            y += 1;
+        }
+        [
+            BlockPos { x: 0, y, z: 2 },
+            BlockPos {
+                x: 0,
+                y: y + 1,
+                z: 2,
+            },
+        ]
+    }
+
+    #[test]
+    fn an_edit_re_sends_changed_lod_cubes_within_one_tick() {
+        let (mut server, mut client) = pending_hello_on(lod_server(64));
+        let _ = settle_lod(&mut server, &mut client, 10);
+        let _ = drain(&mut client);
+
+        // An edit near the player: the LOD cubes it changes must be
+        // re-sent in the same tick, with content equal to the pyramid's.
+        let blocks = Blocks::register(&mut jbm_core::block::BlockRegistry::new());
+        let [a, b] = lod_changing_placements(&server);
+        client
+            .send(ClientMsg::PlaceBlock {
+                pos: a,
+                state: blocks.stone,
+            })
+            .unwrap();
+        client
+            .send(ClientMsg::PlaceBlock {
+                pos: b,
+                state: blocks.stone,
+            })
+            .unwrap();
+        server.tick();
+        let messages = drain(&mut client);
+        let resent = split_lod(&messages);
+        assert!(
+            !resent.is_empty(),
+            "the edit changed no LOD cube that was re-sent"
+        );
+        for (level, pos) in &resent {
+            let cube = server
+                .lod_cube(*level, *pos)
+                .expect("changed cube is ready");
+            assert!(
+                messages.iter().any(|m| matches!(
+                    m,
+                    ServerMsg::LodCubeData {
+                        level: l,
+                        pos: p,
+                        cube: c,
+                    } if l == level && p == pos && c.as_ref() == cube
+                )),
+                "re-send content differs from the pyramid at level {level} {pos:?}"
+            );
+        }
+        // All of it landed before the Tick message.
+        assert!(matches!(messages.last(), Some(ServerMsg::Tick { .. })));
+    }
+
+    #[test]
+    fn re_send_queue_never_starves_under_a_saturated_budget() {
+        // One LOD message per tick and a stream of further changes: the
+        // first edit's re-send must still arrive within a bounded wait.
+        let (mut server, mut client) = pending_hello_on(lod_server(1));
+        let _ = settle_lod(&mut server, &mut client, 10);
+        let _ = drain(&mut client);
+
+        let blocks = Blocks::register(&mut jbm_core::block::BlockRegistry::new());
+        let [a, b] = lod_changing_placements(&server);
+        for pos in [a, b] {
+            client
+                .send(ClientMsg::PlaceBlock {
+                    pos,
+                    state: blocks.stone,
+                })
+                .unwrap();
+        }
+        server.tick();
+
+        // The parent of the placed column is the changed level-1 cube.
+        let lod0 = a.split().0;
+        let parent = CubePos {
+            x: lod0.x.div_euclid(2),
+            y: lod0.y.div_euclid(2),
+            z: lod0.z.div_euclid(2),
+        };
+
+        // A churn of changes keeps the one-per-tick budget saturated,
+        // while the first edit's re-send must come through anyway.
+        let mut arrived_at = None;
+        let mut ticks_since_edit = 0;
+        for round in 0..32 {
+            if round < 8 {
+                let msg = if round % 2 == 0 {
+                    ClientMsg::BreakBlock { pos: b }
+                } else {
+                    ClientMsg::PlaceBlock {
+                        pos: b,
+                        state: blocks.stone,
+                    }
+                };
+                client.send(msg).unwrap();
+            }
+            server.tick();
+            ticks_since_edit += 1;
+            let messages = drain(&mut client);
+            if messages.iter().any(
+                |m| matches!(m, ServerMsg::LodCubeData { level: 1, pos, .. } if *pos == parent),
+            ) && arrived_at.is_none()
+            {
+                arrived_at = Some(ticks_since_edit);
+            }
+        }
+        assert!(
+            arrived_at.is_some_and(|ticks| ticks <= 16),
+            "the saturated budget starved the first edit's re-send (arrived {arrived_at:?})"
+        );
+    }
+
+    #[test]
+    fn no_lod_messages_without_streaming_or_levels_or_a_join() {
+        // lod_levels = 0.
+        let (mut server, mut client) = pending_hello_on(Server::with_config(ServerConfig {
+            gen_threads: 0,
+            lod_levels: 0,
+            ..lod_config(64)
+        }));
+        for _ in 0..10 {
+            server.tick();
+            for msg in drain(&mut client) {
+                assert!(
+                    !matches!(
+                        msg,
+                        ServerMsg::LodCubeData { .. } | ServerMsg::UnloadLodCube { .. }
+                    ),
+                    "LOD message with the pyramid off: {msg:?}"
+                );
+            }
+        }
+
+        // streaming = false.
+        let (mut server, mut client) = pending_hello_on(Server::with_config(ServerConfig {
+            streaming: false,
+            gen_threads: 0,
+            ..lod_config(64)
+        }));
+        for _ in 0..10 {
+            server.tick();
+            for msg in drain(&mut client) {
+                assert!(
+                    !matches!(
+                        msg,
+                        ServerMsg::LodCubeData { .. } | ServerMsg::UnloadLodCube { .. }
+                    ),
+                    "LOD message with streaming off: {msg:?}"
+                );
+            }
+        }
+
+        // A pending connection (no Hello yet) receives nothing at all.
+        let mut server = lod_server(64);
+        let (mut client, server_end) = in_process_pair();
+        server.add_connection(server_end);
+        for _ in 0..10 {
+            server.tick();
+            assert!(drain(&mut client).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_settled_idle_player_gets_zero_lod_messages_for_100_ticks() {
+        let (mut server, mut client) = pending_hello_on(lod_server(64));
+        let _ = settle_lod(&mut server, &mut client, 10);
+        for _ in 0..100 {
+            server.tick();
+            let messages = drain(&mut client);
+            let lod = messages
+                .iter()
+                .filter(|m| {
+                    matches!(
+                        m,
+                        ServerMsg::LodCubeData { .. } | ServerMsg::UnloadLodCube { .. }
+                    )
+                })
+                .count();
+            assert_eq!(lod, 0, "idle player got LOD traffic: {messages:?}");
+        }
     }
 
     #[test]

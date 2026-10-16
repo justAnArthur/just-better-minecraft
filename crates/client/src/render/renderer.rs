@@ -137,6 +137,8 @@ pub struct Renderer {
     overlay: OverlayRenderer,
     outline: OutlinePass,
     viewport: (u32, u32),
+    /// Sky color overrides (task 2.6 hole tests): linear RGB per slot.
+    sky_override: Option<([f32; 4], [f32; 4], [f32; 4])>,
 }
 
 impl Renderer {
@@ -225,7 +227,17 @@ impl Renderer {
             overlay,
             outline,
             viewport: (1, 1),
+            sky_override: None,
         }
+    }
+
+    /// Overrides the sky colors (horizon, zenith, ground haze; linear
+    /// RGB). Test hook for hole detection: set the **ground** color —
+    /// the sky below the horizon — to a sentinel such as pure magenta
+    /// and count sentinel pixels; any hole in the terrain below the
+    /// horizon shows it. Pass `None` to restore the built-in colors.
+    pub fn set_sky_colors(&mut self, colors: Option<([f32; 4], [f32; 4], [f32; 4])>) {
+        self.sky_override = colors;
     }
 
     /// The frame-uniform bind group layout (binding 0 in every pipeline),
@@ -248,14 +260,17 @@ impl Renderer {
         let view_proj = camera.view_proj();
         let hi = camera.position.as_vec3();
         let lo = (camera.position - hi.as_dvec3()).as_vec3();
+        let (horizon, zenith, ground) =
+            self.sky_override
+                .unwrap_or((HORIZON_COLOR, ZENITH_COLOR, GROUND_HAZE_COLOR));
         FrameUniforms {
             view_proj,
             inv_view_proj: view_proj.inverse(),
             camera_pos_hi: [hi.x, hi.y, hi.z, 0.0],
             camera_pos_lo: [lo.x, lo.y, lo.z, 0.0],
-            horizon_color: HORIZON_COLOR,
-            zenith_color: ZENITH_COLOR,
-            ground_color: GROUND_HAZE_COLOR,
+            horizon_color: horizon,
+            zenith_color: zenith,
+            ground_color: ground,
             viewport: [self.viewport.0 as f32, self.viewport.1 as f32, 0.0, 0.0],
         }
     }

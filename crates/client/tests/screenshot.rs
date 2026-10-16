@@ -145,7 +145,7 @@ fn render_scene(golden_name: &str, scene: &[(CubePos, Cube)], camera: &Camera) {
             }
         }
         let output = greedy::mesh(&input, &appearance);
-        terrain.upload(&gpu, *pos, &output);
+        terrain.upload(&gpu, jbm_client::lod::CubeKey::lod0(*pos), &output);
     }
 
     renderer.render(

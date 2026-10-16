@@ -25,6 +25,11 @@ tempfile.workspace = true
 name = "lod_bench"
 harness = false
 
+# Task 2.6: one streaming tick of settled and boundary-crossing rings.
+[[bench]]
+name = "lod_stream_bench"
+harness = false
+
 [[bench]]
 name = "tick_bench"
 harness = false

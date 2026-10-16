@@ -15,7 +15,7 @@ Run (filter output with | tail -30):
 
 Check:
 - Every acceptance test in the spec exists and actually tests the claim (not a trivially passing test).
-- Nothing out of scope was changed. Coding rules in CLAUDE.md are followed (no unsafe without opt-out, no bare #[allow], client/server don't depend on each other, no AI attribution in commit messages: check git log main..task/{{ID}}).
+- Nothing out of scope was changed. Coding rules in CLAUDE.md are followed (no unsafe without opt-out, no bare #[allow], client/server don't depend on each other, no AI attribution in commit messages, and every commit is a scoped Conventional Commit `type(scope): subject`: check git log main..task/{{ID}}).
 - Bugs: panics on edge cases, wrong error handling, race conditions, resource leaks, platform assumptions.
 - READMEs of changed crates are updated.
 

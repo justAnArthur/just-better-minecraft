@@ -11,8 +11,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use jbm_core::coords::CubePos;
-
+use crate::lod::CubeKey;
 use crate::mesh::appearance::BlockAppearance;
 use crate::mesh::greedy::{self, MeshInput, MeshOutput};
 
@@ -24,7 +23,7 @@ const QUEUE_POLL: Duration = Duration::from_millis(50);
 /// A finished mesh, stamped with the cube's version at submit time. The
 /// client drops any result whose version is older than the cube's latest.
 pub struct MeshResult {
-    pub pos: CubePos,
+    pub key: CubeKey,
     pub version: u32,
     pub output: MeshOutput,
 }
@@ -43,7 +42,7 @@ enum Job {
 }
 
 struct MeshJob {
-    pos: CubePos,
+    key: CubeKey,
     version: u32,
     input: MeshInput,
 }
@@ -97,15 +96,16 @@ impl MeshPool {
         }
     }
 
-    /// Queues one mesh job. Non-blocking; never detaches work.
-    pub fn submit(&mut self, pos: CubePos, version: u32, input: MeshInput) {
+    /// Queues one mesh job at any level. Non-blocking; never detaches
+    /// work.
+    pub fn submit(&mut self, key: CubeKey, version: u32, input: MeshInput) {
         let sender = self
             .jobs
             .as_ref()
             .expect("the job queue lives until the pool is dropped");
         sender
             .send(Job::Mesh(Box::new(MeshJob {
-                pos,
+                key,
                 version,
                 input,
             })))
@@ -189,7 +189,7 @@ fn run_job(job: Job, appearance: &BlockAppearance) -> Outcome {
         Job::Mesh(job) => {
             let output = greedy::mesh(&job.input, appearance);
             Outcome::Done(MeshResult {
-                pos: job.pos,
+                key: job.key,
                 version: job.version,
                 output,
             })
@@ -216,6 +216,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 mod tests {
     use super::*;
     use jbm_core::block::{BlockRegistry, BlockStateId, builtin};
+    use jbm_core::coords::CubePos;
     use jbm_core::cube::Cube;
 
     fn appearance() -> Arc<BlockAppearance> {
@@ -236,8 +237,8 @@ mod tests {
         }))
     }
 
-    fn pos(i: i32) -> CubePos {
-        CubePos { x: i, y: 0, z: 0 }
+    fn pos(i: i32) -> CubeKey {
+        CubeKey::lod0(CubePos { x: i, y: 0, z: 0 })
     }
 
     #[test]
@@ -255,7 +256,7 @@ mod tests {
             if let Some(result) = pool.try_recv() {
                 // Versions are stamped per job; arrival order is not.
                 assert!((1..=1000).contains(&result.version));
-                results.insert(result.pos, result.output);
+                results.insert(result.key, result.output);
             } else {
                 thread::sleep(Duration::from_millis(1));
             }
@@ -277,7 +278,7 @@ mod tests {
         let mut seen = Vec::new();
         while seen.len() < 2 {
             if let Some(result) = pool.try_recv() {
-                assert_eq!(result.pos, p);
+                assert_eq!(result.key, p);
                 seen.push(result.version);
             }
         }
@@ -333,7 +334,7 @@ mod tests {
                 got = Some(result);
             }
         }
-        assert_eq!(got.unwrap().pos, pos(0));
+        assert_eq!(got.unwrap().key, pos(0));
     }
 
     #[test]
