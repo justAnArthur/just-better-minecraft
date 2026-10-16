@@ -55,26 +55,33 @@ pub const DEFAULT_SEED: u64 = 0x0055_EED1_5EED;
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One snapshot batch handed to the save thread: cube clones with the edit
-/// version they were taken at, and player records, committed together.
+/// version they were taken at, LOD cube clones, and player records —
+/// committed together, so LOD derived from an edit never lands on disk
+/// without the LOD0 edit it came from.
 #[derive(Default)]
 struct SaveBatch {
     cubes: Vec<(CubePos, jbm_core::cube::Cube, u64)>,
+    lod: Vec<(u8, CubePos, jbm_core::cube::Cube, u8)>,
     players: Vec<(String, PlayerRecord)>,
 }
 
 impl SaveBatch {
     fn is_empty(&self) -> bool {
-        self.cubes.is_empty() && self.players.is_empty()
+        self.cubes.is_empty() && self.lod.is_empty() && self.players.is_empty()
     }
 }
 
 /// The save thread's reply to a batch.
 enum SaveAck {
-    /// The batch committed; these cube versions and player records are now
-    /// on disk.
-    Committed(Vec<(CubePos, u64)>, Vec<(String, PlayerRecord)>),
+    /// The batch committed; these cube versions, LOD cubes and player
+    /// records are now on disk.
+    Committed(
+        Vec<(CubePos, u64)>,
+        Vec<(u8, CubePos)>,
+        Vec<(String, PlayerRecord)>,
+    ),
     /// The batch failed; these cubes stay dirty and retry next interval.
-    Failed(Vec<CubePos>),
+    Failed(Vec<CubePos>, Vec<(u8, CubePos)>),
 }
 
 /// Per-cube edit bookkeeping (persistence only): the edit version, bumped by
@@ -288,6 +295,9 @@ pub struct Server {
     next_player_id: u32,
     config: ServerConfig,
     pool: GenPool,
+    /// The generator the pool and the LOD pipeline sample from; kept for
+    /// the test counters (`Server::lod_samples`).
+    generator: Arc<Generator>,
     /// Generated cubes the server keeps in memory, keyed by position.
     world: HashMap<CubePos, jbm_core::cube::Cube>,
     /// Per-state solidity for physics; built once from the same registry
@@ -305,6 +315,9 @@ pub struct Server {
     /// Edit versions handed to the save thread and not yet acknowledged.
     /// A cube listed here stays pinned until its batch commits.
     pending_save: HashMap<CubePos, u64>,
+    /// LOD cubes handed to the save thread and not yet acknowledged
+    /// (task 2.7); a failed batch puts them back dirty for the next one.
+    lod_pending_save: HashSet<(u8, CubePos)>,
     /// Open world database; `None` when persistence is off.
     storage: Option<Arc<Storage>>,
     /// Sends snapshot batches to the save thread.
@@ -380,6 +393,23 @@ impl Server {
         let spawn = generator.spawn();
         let solid = SolidTable::new(&registry);
         let state_count = registry.state_count();
+        // Stored LOD only counts under the worldgen it was written with:
+        // a mismatching fingerprint makes every stored LOD record read as
+        // absent (and the next saves overwrite them).
+        if let Some(storage) = &storage
+            && config.lod_levels > 0
+            && let Err(error) =
+                storage.set_worldgen_fingerprint(crate::worldgen::overworld().fingerprint())
+        {
+            return Err(error);
+        }
+        let lod = LodPyramid::with_workers(
+            config.lod_levels,
+            Arc::clone(&generator),
+            storage.clone(),
+            config.gen_threads,
+            config.gen_budget_per_tick,
+        );
 
         let (save_tx, save_rx) = std::sync::mpsc::channel::<SaveBatch>();
         let (ack_tx, ack_rx) = std::sync::mpsc::channel::<SaveAck>();
@@ -389,7 +419,6 @@ impl Server {
                 .spawn(move || save_loop(storage, save_rx, ack_tx))
                 .expect("spawning the jbm-save thread")
         });
-        let lod = LodPyramid::new(config.lod_levels);
 
         Ok(Self {
             clock: TickClock::new(),
@@ -398,12 +427,14 @@ impl Server {
             next_player_id: 1,
             config,
             pool,
+            generator,
             world: HashMap::new(),
             solid,
             state_count,
             pinned: HashSet::new(),
             versions: HashMap::new(),
             pending_save: HashMap::new(),
+            lod_pending_save: HashSet::new(),
             storage,
             save_tx: Some(save_tx),
             ack_rx,
@@ -497,6 +528,37 @@ impl Server {
     /// (levels are 1-based; `lod_levels` bounds the top).
     pub fn lod_cube(&self, level: u8, pos: CubePos) -> Option<&jbm_core::cube::Cube> {
         self.lod.get(level, pos).map(|lc| &lc.cube)
+    }
+
+    /// The cube at `(level, pos)` when it is ready to stream — every
+    /// octant real or filled (task 2.7). Test and streaming access.
+    pub fn lod_ready(&self, level: u8, pos: CubePos) -> Option<&jbm_core::cube::Cube> {
+        self.lod.ready(level, pos)
+    }
+
+    /// Forwards to [`LodPyramid::request`]: queue `(level, pos)` for
+    /// load-or-sample. Test and streaming access.
+    pub fn request_lod(&mut self, level: u8, pos: CubePos) {
+        self.lod.request(level, pos);
+    }
+
+    /// LOD jobs queued, running or finished-but-uncollected. The pyramid's
+    /// own (internal) jobs are excluded, as [`LodPyramid::in_flight`]
+    /// documents.
+    pub fn lod_in_flight(&self) -> usize {
+        self.lod.in_flight()
+    }
+
+    /// Internal (pending-propagation) LOD jobs the pyramid has queued in
+    /// total — the load-report number for the default view.
+    pub fn lod_internal_requests(&self) -> u64 {
+        self.lod.internal_requests()
+    }
+
+    /// How many `sample_lod` sampling runs the generator has done — the
+    /// test hook that proves storage reloads do not sample.
+    pub fn lod_samples(&self) -> u64 {
+        self.generator.lod_sample_calls()
     }
 
     /// The known-octant mask of the level-`level` LOD cube at `pos`, when
@@ -914,7 +976,8 @@ impl Server {
 
     /// Persistence slice of the tick, run right before phase 5: apply the
     /// save thread's acknowledgements, then every `save_interval` snapshot
-    /// dirty cubes and hand them off. No-op without a world directory.
+    /// dirty cubes and LOD and hand them off. No-op without a world
+    /// directory.
     fn phase_save(&mut self) {
         if self.storage.is_none() {
             return;
@@ -935,8 +998,28 @@ impl Server {
                 batch.cubes.push((*pos, cube.clone(), edit.version));
             }
         }
+        self.collect_lod_dirty(&mut batch);
         batch.players = self.player_snapshot();
         self.send_save_batch(batch);
+    }
+
+    /// Snapshots every LOD cube the pyramid marked dirty (ready cubes whose
+    /// content changed) and not already in flight. A cube whose older save
+    /// is still in flight is kept dirty, so the interval after that save's
+    /// ack writes the newer content — dropping it here would lose it.
+    fn collect_lod_dirty(&mut self, batch: &mut SaveBatch) {
+        let dirty = self.lod.take_store_dirty();
+        for (level, pos) in dirty {
+            if self.lod_pending_save.contains(&(level, pos)) {
+                self.lod.mark_store_dirty(&[(level, pos)]);
+                continue;
+            }
+            if let Some(lc) = self.lod.get(level, pos)
+                && lc.ready()
+            {
+                batch.lod.push((level, pos, lc.cube.clone(), lc.known));
+            }
+        }
     }
 
     /// Records of every joined player plus everyone who left since the last
@@ -983,7 +1066,7 @@ impl Server {
 
     fn apply_save_ack(&mut self, ack: SaveAck) {
         match ack {
-            SaveAck::Committed(acks, players) => {
+            SaveAck::Committed(acks, lod, players) => {
                 self.saved_batches += 1;
                 self.saved_players.extend(players);
                 for (pos, version) in acks {
@@ -997,21 +1080,33 @@ impl Server {
                         self.pending_save.remove(&pos);
                     }
                 }
+                for key in lod {
+                    self.lod_pending_save.remove(&key);
+                }
             }
             // A failed batch is logged and retried next interval: the cubes
             // stay dirty (never evicted), so edits are never dropped
-            // silently.
+            // silently. The batch's LOD cubes go back to the dirty set the
+            // same way.
             // Players are re-sent next interval: `saved_players` only moves
             // on a commit, so their records still differ.
-            SaveAck::Failed(positions) => {
+            SaveAck::Failed(positions, lod) => {
                 self.failed_batches += 1;
                 eprintln!(
-                    "jbm: saving a batch of {} cubes failed; retrying next interval",
-                    positions.len()
+                    "jbm: saving a batch of {} cubes and {} LOD cubes failed; retrying next interval",
+                    positions.len(),
+                    lod.len()
                 );
                 for pos in positions {
                     self.pending_save.remove(&pos);
                 }
+                // Only this batch's keys: other batches may still be in
+                // flight behind it, and forgetting theirs would let a later
+                // interval snapshot them again while their save still runs.
+                for key in &lod {
+                    self.lod_pending_save.remove(key);
+                }
+                self.lod.mark_store_dirty(&lod);
             }
         }
     }
@@ -1026,6 +1121,8 @@ impl Server {
         for (pos, _, version) in &batch.cubes {
             self.pending_save.insert(*pos, *version);
         }
+        self.lod_pending_save
+            .extend(batch.lod.iter().map(|&(level, pos, _, _)| (level, pos)));
         match &self.save_tx {
             Some(tx) if tx.send(batch).is_ok() => self.sent_batches += 1,
             _ => eprintln!("jbm: the save thread is gone; unsaved edits may be lost"),
@@ -1050,6 +1147,7 @@ impl Server {
                 batch.cubes.push((*pos, cube.clone(), edit.version));
             }
         }
+        self.collect_lod_dirty(&mut batch);
         batch.players = self.player_snapshot();
         self.send_save_batch(batch);
         // The saver answers batches in order, so once every batch sent so
@@ -1197,12 +1295,12 @@ impl Server {
         if inline {
             for _ in 0..budget {
                 match pool.try_recv() {
-                    Some((pos, cube)) => {
+                    Some((pos, cube, octant)) => {
                         collected = true;
                         if let std::collections::hash_map::Entry::Vacant(slot) = world.entry(pos) {
                             let inserted = slot.insert(cube);
                             if lod_on {
-                                lod.insert_lod0(pos, inserted);
+                                lod.insert_lod0_octant(pos, inserted, Some(&octant));
                             }
                         }
                     }
@@ -1210,12 +1308,12 @@ impl Server {
                 }
             }
         } else {
-            while let Some((pos, cube)) = pool.try_recv() {
+            while let Some((pos, cube, octant)) = pool.try_recv() {
                 collected = true;
                 if let std::collections::hash_map::Entry::Vacant(slot) = world.entry(pos) {
                     let inserted = slot.insert(cube);
                     if lod_on {
-                        lod.insert_lod0(pos, inserted);
+                        lod.insert_lod0_octant(pos, inserted, Some(&octant));
                     }
                 }
             }
@@ -1444,6 +1542,13 @@ impl Drop for Server {
         if self.storage.is_some() {
             self.settle_received_input();
         }
+        // A held save (the storage test hook) parks the save thread in
+        // `enter_save` indefinitely; release it so the flush and the join
+        // below can finish — shutdown must never hang on the hook. A
+        // no-op when nothing is held.
+        if let Some(storage) = &self.storage {
+            storage.release_saves();
+        }
         self.flush();
         self.save_tx = None;
         if let Some(thread) = self.save_thread.take() {
@@ -1462,18 +1567,29 @@ fn save_loop(storage: Arc<Storage>, batches: Receiver<SaveBatch>, acks: Sender<S
             .iter()
             .map(|(pos, cube, _)| (*pos, cube))
             .collect();
-        let ack = match storage.save_batch_with_players(&refs, &batch.players) {
+        let lod_refs: Vec<(u8, CubePos, &jbm_core::cube::Cube, u8)> = batch
+            .lod
+            .iter()
+            .map(|&(level, pos, ref cube, known)| (level, pos, cube, known))
+            .collect();
+        let lod_keys: Vec<(u8, CubePos)> = batch
+            .lod
+            .iter()
+            .map(|&(level, pos, _, _)| (level, pos))
+            .collect();
+        let ack = match storage.save_lod_batch(&refs, &lod_refs, &batch.players) {
             Ok(()) => SaveAck::Committed(
                 batch
                     .cubes
                     .iter()
                     .map(|(pos, _, version)| (*pos, *version))
                     .collect(),
+                lod_keys,
                 batch.players,
             ),
             Err(error) => {
                 eprintln!("jbm: committing a save batch failed: {error}");
-                SaveAck::Failed(refs.into_iter().map(|(pos, _)| pos).collect())
+                SaveAck::Failed(refs.into_iter().map(|(pos, _)| pos).collect(), lod_keys)
             }
         };
         if acks.send(ack).is_err() {
