@@ -266,19 +266,6 @@ fn render_all_paths(
             render_frame(gpu, &mut renderer, &target, &depth, &mut terrain, camera);
         }
         let image = render_frame(gpu, &mut renderer, &target, &depth, &mut terrain, camera);
-        let st = terrain.read_cull_stats_blocking(gpu);
-        println!(
-            "PATHDBG {path:?} candidates {} frustum {} occluded {} drawn {} commands {} faces {} overflow {}",
-            st.candidates,
-            st.frustum_culled,
-            st.occluded,
-            st.drawn(),
-            st.commands,
-            st.faces,
-            st.region_overflow
-        );
-        let _ = std::fs::create_dir_all("target");
-        let _ = image.save(format!("target/pathdbg2_{golden}_{active:?}.png"));
         match &reference {
             None => reference = Some((active, image)),
             Some((reference_path, reference_image)) => {
