@@ -55,6 +55,8 @@ struct FlyClient {
     pool: MeshPool,
     coverage: Coverage,
     in_flight: usize,
+    /// The authoritative player position, from the last `PlayerState`.
+    server_pos: Option<DVec3>,
     renderer: Renderer,
     terrain: TerrainPass,
     target: OffscreenTarget,
@@ -77,6 +79,7 @@ impl FlyClient {
             pool: MeshPool::new(appearance, 0),
             coverage: Coverage::default(),
             in_flight: 0,
+            server_pos: None,
             renderer,
             terrain,
             target,
@@ -101,6 +104,9 @@ impl FlyClient {
                     }
                     ServerMsg::Welcome { spawn: s, .. } => {
                         *spawn = Some(*s);
+                    }
+                    ServerMsg::PlayerState { state, .. } => {
+                        self.server_pos = Some(state.position);
                     }
                     ServerMsg::CubeData { .. }
                     | ServerMsg::UnloadCube { .. }
@@ -144,6 +150,15 @@ impl FlyClient {
         }
         for (key, drawn, mask) in self.coverage.take_changed() {
             self.terrain.set_draw_state(gpu, key, drawn, mask);
+        }
+    }
+
+    /// One 50 ms server tick's worth of client frames: meshing pumped at
+    /// about 60 fps, as the app does (one submit/upload budget per frame).
+    fn frames_for_one_tick(&mut self, gpu: &Gpu, camera: &Camera) {
+        for _ in 0..3 {
+            self.pump_meshing(gpu, camera);
+            std::thread::sleep(Duration::from_millis(16));
         }
     }
 
@@ -218,11 +233,6 @@ fn sentinels_near(image: &image::RgbaImage) -> usize {
     count
 }
 
-fn forward_offset(yaw: f32, distance: f64) -> DVec3 {
-    let yaw = f64::from(yaw);
-    DVec3::new(yaw.sin() * distance, 0.0, -yaw.cos() * distance)
-}
-
 #[test]
 #[ignore = "needs 2.7 (worldgen LOD fill) merged; run with --ignored after stage-2/wave-c"]
 fn fly_1p5km_over_real_rings_shows_no_holes() {
@@ -275,14 +285,70 @@ fn fly_1p5km_over_real_rings_shows_no_holes() {
     }
     let spawn_at = DVec3::from(spawn.unwrap());
 
-    // The client camera follows the flown course; the server sees the
-    // same inputs (its own physics flies the same path).
+    // The camera sits at the server's authoritative player position (the
+    // eye above the feet), so the client renders exactly where the server
+    // streams.
+    const EYE: f64 = 1.62;
     let mut camera = Camera::new(
-        spawn_at + DVec3::new(0.0, 44.0, 0.0),
+        spawn_at + DVec3::new(0.0, EYE, 0.0),
         70.0_f32.to_radians(),
         WIDTH as f32 / HEIGHT as f32,
     );
     camera.set_pitch(-15.0_f32.to_radians());
+
+    // Climb to cruise altitude, 40 blocks over spawn.
+    while fly.server_pos.is_none_or(|p| p.y < spawn_at.y + 40.0) {
+        seq += 1;
+        client
+            .send(ClientMsg::PlayerInput {
+                seq,
+                input: jbm_core::physics::MoveInput {
+                    up: 1,
+                    ..jbm_core::physics::MoveInput::IDLE
+                },
+                pitch: -15.0_f32.to_radians(),
+            })
+            .unwrap();
+        fly.frames_for_one_tick(&gpu, &camera);
+        if let Some(reason) = fly.pump_link(&gpu, &mut client, &mut spawn) {
+            panic!("link died while climbing: {reason}");
+        }
+        if let Some(p) = fly.server_pos {
+            camera.position = p + DVec3::new(0.0, EYE, 0.0);
+        }
+        assert!(
+            start.elapsed() < TEST_TIMEOUT,
+            "never reached cruise altitude"
+        );
+    }
+
+    // Settle the initial view: the queue stays clear for a full second.
+    let settle_deadline = Instant::now() + Duration::from_secs(60);
+    let mut clear_ticks = 0;
+    while clear_ticks < 20 {
+        fly.frames_for_one_tick(&gpu, &camera);
+        if let Some(reason) = fly.pump_link(&gpu, &mut client, &mut spawn) {
+            panic!("link died while settling: {reason}");
+        }
+        clear_ticks = if fly.queue_clear() {
+            clear_ticks + 1
+        } else {
+            0
+        };
+        assert!(
+            Instant::now() < settle_deadline,
+            "initial view never settled"
+        );
+    }
+    let settled_in = start.elapsed();
+    let image = fly.render(&gpu, &camera);
+    std::fs::create_dir_all("target/fly").ok();
+    image.save("target/fly/start.png").ok();
+    println!(
+        "initial view settled after {:.1} s: {} sentinel pixels below the margin",
+        settled_in.as_secs_f64(),
+        sentinel_count_below(&image, margin_rows(&camera))
+    );
 
     let mut course_flown = [0.0f64; 2];
     for (leg_index, &(yaw, leg)) in COURSE.iter().enumerate() {
@@ -304,28 +370,33 @@ fn fly_1p5km_over_real_rings_shows_no_holes() {
                         pitch: -15.0_f32.to_radians(),
                     })
                     .unwrap();
-                std::thread::sleep(Duration::from_millis(50));
+                fly.frames_for_one_tick(&gpu, &camera);
                 if let Some(reason) = fly.pump_link(&gpu, &mut client, &mut spawn) {
                     panic!("link died mid-flight: {reason}");
                 }
-                fly.pump_meshing(&gpu, &camera);
+                if let Some(p) = fly.server_pos {
+                    camera.position = p + DVec3::new(0.0, EYE, 0.0);
+                }
                 assert!(start.elapsed() < TEST_TIMEOUT, "timeout mid-flight");
             }
             course_flown[leg_index] += 100.0;
             let flown_total: f64 = course_flown.iter().sum();
-            camera.position = spawn_at
-                + DVec3::new(0.0, 44.0, 0.0)
-                + COURSE
-                    .iter()
-                    .zip(course_flown.iter())
-                    .map(|(&(yaw, _), &d)| forward_offset(yaw, d))
-                    .sum::<DVec3>();
+            let flown_real = fly.server_pos.map_or(0.0, |p| {
+                (DVec3::new(p.x, 0.0, p.z) - DVec3::new(spawn_at.x, 0.0, spawn_at.z)).length()
+            });
 
             // One frame WITHOUT waiting: holes near the camera are
             // asserted away; farther ones are only reported.
             let impatient = fly.render(&gpu, &camera);
+            impatient
+                .save(format!("target/fly/stop_{flown_total:.0}_unwaited.png"))
+                .ok();
             let near = sentinels_near(&impatient);
-            println!("fly {flown_total:.0} blocks: unwaited sentinels near camera: {near}");
+            println!(
+                "fly {flown_total:.0} blocks (server {flown_real:.0} from spawn, at {:.0?}): unwaited sentinels near camera: {near}, below margin: {}",
+                camera.position,
+                sentinel_count_below(&impatient, margin_rows(&camera))
+            );
             assert_eq!(
                 near, 0,
                 "unwaited frame has holes within 512 blocks at {flown_total:.0}"
@@ -334,11 +405,10 @@ fn fly_1p5km_over_real_rings_shows_no_holes() {
             // Wait (bounded) for the rings and the mesh queue.
             let deadline = Instant::now() + STOP_TIMEOUT;
             loop {
-                std::thread::sleep(Duration::from_millis(50));
+                fly.frames_for_one_tick(&gpu, &camera);
                 if let Some(reason) = fly.pump_link(&gpu, &mut client, &mut spawn) {
                     panic!("link died at a stop: {reason}");
                 }
-                fly.pump_meshing(&gpu, &camera);
                 if fly.queue_clear() || Instant::now() > deadline {
                     break;
                 }
