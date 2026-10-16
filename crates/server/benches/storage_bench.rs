@@ -25,7 +25,11 @@ fn surface_cube(generator: &Generator) -> Cube {
 fn bench(c: &mut Criterion) {
     let mut registry = BlockRegistry::new();
     Blocks::register(&mut registry);
-    let generator = Generator::new(DEFAULT_SEED, Blocks::register(&mut BlockRegistry::new()));
+    let generator = Generator::with_preset(
+        DEFAULT_SEED,
+        Blocks::register(&mut BlockRegistry::new()),
+        jbm_server::worldgen::Preset::Classic,
+    );
     let cube = surface_cube(&generator);
     let dir = tempfile::TempDir::new().unwrap();
     let storage = Storage::open(dir.path(), &registry, DEFAULT_SEED).unwrap();

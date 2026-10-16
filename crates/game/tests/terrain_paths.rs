@@ -26,6 +26,7 @@ use jbm_core::block::{BlockRegistry, BlockStateId, builtin};
 use jbm_core::coords::{BlockPos, CUBE_SIZE};
 use jbm_core::protocol::{ClientMsg, ServerMsg};
 use jbm_server::terrain::Generator;
+use jbm_server::worldgen::Preset;
 use jbm_server::{DEFAULT_SEED, ServerConfig};
 use jbm_testkit::HeadlessServer;
 
@@ -46,6 +47,7 @@ fn looking_at(eye: DVec3, look_at: DVec3) -> Camera {
 fn server_config() -> ServerConfig {
     ServerConfig {
         seed: DEFAULT_SEED,
+        worldgen: Preset::Classic, // mirrors the terrain_screenshot scene
         streaming: true,
         lod_levels: 0, // this scene predates LOD rings; 2.6 keeps it LOD0-only
         view_radius: 3,
@@ -116,9 +118,10 @@ fn streamed_scene(
 /// at (8, 8): 8 wide in x and z, 5 tall in y, ceiling 20 blocks below the
 /// surface height there. Mid-cube, so the whole room is one mesh.
 fn room_bounds() -> (Range<i64>, Range<i64>, Range<i64>) {
-    let generator = Generator::new(
+    let generator = Generator::with_preset(
         DEFAULT_SEED,
         builtin::Blocks::register(&mut BlockRegistry::new()),
+        Preset::Classic,
     );
     let ceiling = generator.surface_height(8, 8) - 20;
     (4..12, ceiling - 5..ceiling, 4..12)
@@ -316,9 +319,10 @@ fn edit_spawn_paths_render_pixel_identical() {
         return;
     };
     let mut server = HeadlessServer::with_config(server_config());
-    let generator = Generator::new(
+    let generator = Generator::with_preset(
         DEFAULT_SEED,
         builtin::Blocks::register(&mut BlockRegistry::new()),
+        Preset::Classic,
     );
     let surface = |x: i64, z: i64| generator.surface_height(x, z);
 

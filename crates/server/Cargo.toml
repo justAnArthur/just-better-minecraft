@@ -20,6 +20,9 @@ zstd.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 tempfile.workspace = true
+# The worldgen preview example's PNG output; the workspace's pinned
+# version, already a dependency of the client and game crates.
+image.workspace = true
 
 [[bench]]
 name = "lod_bench"

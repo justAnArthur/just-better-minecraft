@@ -367,6 +367,44 @@ pub fn fbm(seed: u64, x: f64, z: f64, octaves: u32) -> f64 {
     sum / norm
 }
 
+/// One sample of the ridged multifractal (the classic Musgrave form) at
+/// `(x, z)`, exactly in `[0, 1]`. Per octave, with amplitude `amp` halving
+/// and frequency `freq` doubling like [`fbm`]:
+///
+/// ```text
+/// ridge   = 1 − |noise2(x·freq, z·freq)|        (in (0, 1]: |noise| ≤ √2/2 < 1)
+/// signal  = ridge² · weight                      (weight starts at 1)
+/// sum    += amp · signal;  norm += amp
+/// weight  = clamp(signal · gain, 0, 1)           (the next octave's weight)
+/// ```
+///
+/// The ridgeline lives at `noise = 0`, where `ridge` peaks; squaring
+/// sharpens the crest and the previous octave's weight erodes detail off
+/// valley floors, so crests stay sharp and floors stay smooth. Bound: each
+/// `signal ≤ ridge² ≤ 1` and `≥ 0` with `weight ∈ [0, 1]`, so
+/// `0 ≤ sum ≤ Σamp = norm` and `sum / norm ∈ [0, 1]` — exact, not just
+/// sound. Built from `+`, `*`, `abs` and clamp comparisons only, so it
+/// keeps the determinism rule above. A pure function of
+/// `(seed, x, z, octaves, gain)`.
+#[doc(hidden)]
+pub fn ridged2(seed: u64, x: f64, z: f64, octaves: u32, gain: f64) -> f64 {
+    let mut sum = 0.0;
+    let mut amp = 1.0;
+    let mut freq = 1.0;
+    let mut norm = 0.0;
+    let mut weight = 1.0;
+    for _ in 0..octaves {
+        let ridge = 1.0 - noise2(seed, x * freq, z * freq).abs();
+        let signal = ridge * ridge * weight;
+        sum += amp * signal;
+        norm += amp;
+        weight = (signal * gain).clamp(0.0, 1.0);
+        amp *= 0.5;
+        freq *= 2.0;
+    }
+    sum / norm
+}
+
 /// Clamps `t` into `[0, 1]`. `clamp` is a pure comparison — bit-exact.
 #[inline]
 fn clamp01(t: f64) -> f64 {

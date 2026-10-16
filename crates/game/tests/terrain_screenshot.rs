@@ -16,6 +16,7 @@ use jbm_client::world::ClientWorld;
 use jbm_core::block::BlockRegistry;
 use jbm_core::block::builtin::Blocks;
 use jbm_core::protocol::ServerMsg;
+use jbm_server::worldgen::Preset;
 use jbm_server::{DEFAULT_SEED, ServerConfig};
 use jbm_testkit::HeadlessServer;
 
@@ -42,6 +43,7 @@ fn streamed_terrain_matches_golden() {
 
     // Inline generation keeps the streamed set deterministic.
     let mut server = HeadlessServer::with_config(ServerConfig {
+        worldgen: Preset::Classic, // pin the pre-2.8 terrain: this golden predates it
         seed: DEFAULT_SEED,
         streaming: true,
         view_radius: 3,

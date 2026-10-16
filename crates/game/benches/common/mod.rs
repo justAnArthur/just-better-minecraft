@@ -23,6 +23,7 @@ use jbm_core::block::builtin::Blocks;
 use jbm_core::coords::{BlockPos, CUBE_SIZE, CubePos};
 use jbm_core::cube::Cube;
 use jbm_server::Generator;
+use jbm_server::worldgen::Preset;
 
 /// Sea level of the 1.5 layering: columns with h at or below it get sand.
 const SAND_LEVEL: i64 = 61;
@@ -87,7 +88,7 @@ impl Region {
         let mut registry = BlockRegistry::new();
         let blocks = Blocks::register(&mut registry);
         let appearance = BlockAppearance::new(&registry);
-        let generator = Generator::new(seed, blocks);
+        let generator = Generator::with_preset(seed, blocks, Preset::Classic);
 
         // Cube range covering the block bounds, plus the one-cube shell.
         // The horizontal range is cube-aligned and centered (to the cube)

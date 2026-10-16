@@ -12,6 +12,7 @@ use jbm_core::lod::parent;
 use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION};
 use jbm_server::lod::LodPyramid;
 use jbm_server::terrain::Generator;
+use jbm_server::worldgen::Preset;
 use jbm_server::{DEFAULT_SEED, Server, ServerConfig};
 use std::hint::black_box;
 use std::sync::Arc;
@@ -19,7 +20,7 @@ use std::sync::Arc;
 fn generator() -> Generator {
     let mut registry = BlockRegistry::new();
     let blocks = Blocks::register(&mut registry);
-    Generator::new(DEFAULT_SEED, blocks)
+    Generator::with_preset(DEFAULT_SEED, blocks, Preset::Classic)
 }
 
 /// A fresh generator behind an `Arc`, for pyramids (the local `generator`
@@ -67,6 +68,7 @@ fn sibling_pyramid(generator: &Generator, target: CubePos) -> LodPyramid {
 /// bench report, measured once outside any timing.
 fn report_default_view_heap() {
     let mut server = Server::with_config(ServerConfig {
+        worldgen: Preset::Classic, // keep the pre-2.8 terrain for comparability
         gen_threads: 0,
         ..ServerConfig::default()
     });

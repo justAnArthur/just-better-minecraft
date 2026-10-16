@@ -16,6 +16,7 @@ use jbm_core::coords::{BlockPos, CUBE_SIZE};
 use jbm_core::link::in_process_pair;
 use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION};
 use jbm_server::server::{Server, ServerConfig};
+use jbm_server::worldgen::Preset;
 
 /// Side length of a level-1 cube in blocks: two LOD0 cubes.
 const LEVEL1_BLOCKS: f64 = CUBE_SIZE as f64 * 2.0;
@@ -39,6 +40,7 @@ fn level1_of(pos: DVec3) -> [i32; 3] {
 
 fn lod_config() -> ServerConfig {
     ServerConfig {
+        worldgen: Preset::Classic, // keeps the pre-2.8 terrain comparable
         streaming: true,
         view_radius: 8,
         vertical_radius: 4,
