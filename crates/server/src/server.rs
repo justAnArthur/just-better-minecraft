@@ -2866,15 +2866,24 @@ mod tests {
     #[test]
     fn lod_messages_respect_the_budget_and_the_merged_walk_order() {
         let (mut server, mut client) = pending_hello_on(lod_server(3));
-        // First sends only: a cube the player already holds is a re-send
-        // of a changed cube (2.7 replaces worldgen guesses with real
-        // content), and re-sends deliberately go ahead of the walk within
-        // the budget, so they are excluded from the order check — but
-        // counted for it.
+        // First sends only. The re-send queue (stream_player_lod step 2,
+        // drained ahead of the walk) only ever carries cubes already in a
+        // player's sent set — phase_streaming queues an entry only when
+        // `lvl.sent.contains(&pos)` — so a re-send is never a first send,
+        // and first sends come only from the walk itself, in walk order.
+        // Under 2.7 re-sends are expected: real data replaces worldgen
+        // guesses (`merge` → `touch` → `take_changed`), and those cubes
+        // re-send at an arbitrary walk position. They are excluded from
+        // the order check but still counted for the budget check, whose
+        // contract includes re-sends. The state never moves here — no
+        // input is ever sent, and physics steps only on inputs — so the
+        // level centers and the walk cursor stay fixed for the whole run
+        // and no walk segmentation is needed.
+        // 400 ticks: 435 walk entries at a budget of 3 (re-sends included)
+        // need ~145 ticks even without fill latency.
         let mut first_sent = std::collections::HashSet::new();
         let mut order: Vec<(u8, (i32, i32, i32))> = Vec::new();
         let mut per_tick_over = 0;
-        let mut prev_lod0_center: Option<CubePos> = None;
         for _ in 0..400 {
             server.tick();
             let messages = drain(&mut client);
@@ -2884,13 +2893,6 @@ mod tests {
             }
             let state = server.players().next().unwrap().state;
             let lod0_center = cube_containing(state.position);
-            if prev_lod0_center.is_some_and(|prev| prev != lod0_center) {
-                // A center move resets the server's walk cursor, so the
-                // send order legitimately restarts from the walk's start.
-                // Level 0 marks the segment boundary (the walk is 1-based).
-                order.push((0, (0, 0, 0)));
-            }
-            prev_lod0_center = Some(lod0_center);
             for (level, pos) in split_lod(&messages) {
                 if !first_sent.insert((level, pos)) {
                     continue;
@@ -2908,16 +2910,10 @@ mod tests {
         assert_eq!(per_tick_over, 0, "the per-tick budget was exceeded");
         assert!(!order.is_empty());
 
-        // The first-send order is a subsequence of the merged walk. A
-        // level-0 marker segments it at center moves; each segment
-        // matches the walk from the start.
+        // The first-send order is a subsequence of the merged walk.
         let walk = crate::streaming::lod_walk(3, 3, 2);
         let mut walk_index = 0;
         for entry in &order {
-            if entry.0 == 0 {
-                walk_index = 0;
-                continue;
-            }
             let mut found = false;
             while walk_index < walk.len() {
                 if walk[walk_index] == *entry {
