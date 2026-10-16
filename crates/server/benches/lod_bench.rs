@@ -8,6 +8,7 @@ use jbm_core::block::BlockRegistry;
 use jbm_core::block::builtin::Blocks;
 use jbm_core::coords::{CubePos, LocalPos};
 use jbm_core::link::in_process_pair;
+use jbm_core::lod::parent;
 use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION};
 use jbm_server::lod::LodPyramid;
 use jbm_server::terrain::Generator;
@@ -136,8 +137,10 @@ fn bench(c: &mut Criterion) {
     group.bench_function("edit", |b| {
         // One edit through all levels, against a pyramid that already
         // holds the cube's downsample. The edit (breaking one block) is
-        // picked so that LOD1 really changes; a no-op edit would stop at
-        // the first level and measure nothing.
+        // picked so that LOD1's content really changes; a no-op edit would
+        // stop at the first level and measure nothing. (Compared on the
+        // cube, not on the returned changes: a bare pyramid's cubes are
+        // never ready, and LodChanges lists ready cubes only.)
         let cube = generator.generate(pos);
         // The pyramid owns worker plumbing and is not `Clone`; a bare one
         // is rebuilt per batch in the untimed setup instead.
@@ -153,8 +156,11 @@ fn bench(c: &mut Criterion) {
                 let mut edited = cube.clone();
                 edited.set(local, jbm_core::block::BlockStateId::AIR);
                 let mut pyramid = base();
-                (!pyramid.edit_lod0(pos.block(local), &edited).is_empty())
-                    .then_some((edited, local))
+                let parent_pos = parent(pos).0;
+                let before = pyramid.get(1, parent_pos).unwrap().clone();
+                pyramid.edit_lod0(pos.block(local), &edited);
+                let changed = pyramid.get(1, parent_pos).unwrap().cube != before.cube;
+                changed.then_some((edited, local))
             })
             .expect("some single break changes LOD1");
         let block = pos.block(local);

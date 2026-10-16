@@ -1795,6 +1795,13 @@ impl Drop for Server {
         if self.storage.is_some() {
             self.settle_received_input();
         }
+        // A held save (the storage test hook) parks the save thread in
+        // `enter_save` indefinitely; release it so the flush and the join
+        // below can finish — shutdown must never hang on the hook. A
+        // no-op when nothing is held.
+        if let Some(storage) = &self.storage {
+            storage.release_saves();
+        }
         self.flush();
         self.save_tx = None;
         if let Some(thread) = self.save_thread.take() {

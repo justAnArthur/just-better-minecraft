@@ -25,13 +25,18 @@
 //! A real octant at level *n ≥ 2* is the downsample of its child's full
 //! content, so it can be computed **only once the child is ready** —
 //! computing it earlier would read the child's not-yet-filled octants as
-//! placeholder air, which the model forbids. When a cube gains or changes a
-//! real octant while its child is not ready, the propagation is therefore
-//! **deferred**: the parent records a *pending* octant and internally
-//! requests the child's fill ([`LodPyramid::request`]); when the child
-//! becomes ready, the pending octant is computed from the child's then-full
-//! content and the walk continues upward. Pending octants never hold
-//! content and never make a cube ready.
+//! placeholder air, which the model forbids. Whenever a cube gains or
+//! changes a real octant while its child is not ready — an insert, an edit,
+//! a load — the propagation is therefore **deferred**: the parent marks the
+//! octant *pending* and internally requests the child's fill
+//! ([`LodPyramid::request`]); when the child becomes ready, a pending
+//! octant is (re)computed from the child's then-full content and the walk
+//! continues upward. The pending bit lands on octants that are already
+//! known too (a stored record loads with real octants while its children
+//! do not exist yet): a **stale** octant keeps its last real content —
+//! never placeholder air — until that same recompute replaces it, so an
+//! edit that landed while the child was filling is never lost. Pending
+//! octants that hold no content never make a cube ready.
 //!
 //! The model is a pure function of two inputs — the set of LOD0 cubes ever
 //! seen with their latest content, and the worldgen — and
@@ -80,17 +85,28 @@ use jbm_core::lod::{CellBox, copy_octant, downsample_octant, downsample_region, 
 use crate::storage::{Storage, StorageError};
 use crate::terrain::Generator;
 
-/// One cube of a LOD level plus its per-octant bookkeeping. Each octant is
-/// in exactly one of four states:
+/// One cube of a LOD level plus its per-octant bookkeeping. Each octant
+/// holds content in one of three states — `known`, `filled` or empty — and
+/// the `pending` bit can additionally mark a real octant whose content is
+/// not final:
 ///
-/// - `known` — real: the downsample of its full child (`known` bit set).
-/// - `pending` — real by definition (the child holds real data) but the
-///   child is not ready yet; the content is computed when it readies. No
-///   content, and never placeholder air.
+/// - `known` — real: the downsample of its child's full content
+///   (`known` bit set).
 /// - `filled` — worldgen or stored content for a child with no real data.
 /// - empty — nothing yet; a fill job can supply it.
+/// - `pending` — real by definition (the child holds real data) but the
+///   child is not ready yet, so the content cannot be computed from the
+///   child's full content. On an empty octant this means "computed when
+///   the child readies"; on a `known` octant (both bits set) it means
+///   **stale**: the child changed while it was not ready — an edit, a
+///   re-insert or a load landed under it — so the octant keeps its last
+///   real content, never placeholder air, until the child readies and the
+///   octant is recomputed in full. Either way a pending octant never takes
+///   content from a fill job.
 ///
-/// A cube is ready exactly when every octant is `known` or `filled`.
+/// A cube is ready exactly when every octant is `known` or `filled`; a
+/// stale octant keeps the cube ready with its last real content until the
+/// recompute lands (and the change it brings is reported).
 #[derive(Debug, Clone)]
 pub struct LodCube {
     pub cube: Cube,
@@ -115,8 +131,14 @@ impl LodCube {
     }
 }
 
-/// The cubes whose content changed in one operation, in level order.
-/// 2.6 streams exactly these.
+/// The **ready** cubes whose content changed in one operation, in level
+/// order — the no-partial-cubes contract, so an insert or edit never lists
+/// a cube whose octants are not all filled yet. This is the internal delta
+/// of [`LodPyramid::insert_lod0`] and [`LodPyramid::edit_lod0`]; streaming
+/// (2.6) consumes [`LodPyramid::take_changed`] instead, which reports a
+/// cube when it becomes ready and on every later change — so a cube left
+/// out here because it was not ready yet is still delivered when it
+/// readies, and neither channel ever carries a partial cube.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LodChanges {
     pub cubes: Vec<(u8, CubePos)>,
@@ -368,16 +390,24 @@ impl LodPyramid {
         changes
             .cubes
             .extend(self.propagate(1, parent_pos, region).cubes);
+        // The no-partial-cubes contract: list ready cubes only. A cube
+        // filtered out here is still reported by `take_changed` when it
+        // becomes ready (`touch` above recorded nothing for it yet).
+        changes
+            .cubes
+            .retain(|&(level, pos)| self.ready(level, pos).is_some());
         changes
     }
 
     /// One accepted edit of the LOD0 block at `pos` (in the post-edit
     /// `cube`): recompute the single affected cell at level 1 and continue
     /// up while levels change, each level costing one cell. The walk stops
-    /// at a level whose cube is missing, whose octant is not real, or whose
-    /// child is not ready (a pending octant picks the edit up from the
-    /// child's full content when the child readies). Edits in an area with
-    /// no pyramid cubes report no changes.
+    /// at a level whose cube is missing or whose octant is not real — and
+    /// at a child that is not ready: the parent's octant is marked pending
+    /// (a *stale* mark when the octant is already known, as after a storage
+    /// load) and the child's fill is requested, so the pending propagation
+    /// recomputes the octant in full — edit included — when the child
+    /// readies. Edits in an area with no pyramid cubes report no changes.
     pub fn edit_lod0(&mut self, pos: BlockPos, cube: &Cube) -> LodChanges {
         if !self.enabled() {
             return LodChanges::default();
@@ -403,21 +433,43 @@ impl LodPyramid {
         let mut region = region;
         for level in 2..=self.max_levels() {
             let (pos, octant) = parent(child);
-            let (below, above) = self.levels.split_at_mut(level as usize - 1);
-            let (Some(child_lc), Some(lc)) = (
-                below[level as usize - 2].get(&child),
-                above[0].get_mut(&pos),
-            ) else {
+            let bit = 1 << octant;
+            // Set when the child is not ready: after the level borrows end,
+            // the loop requests the child's fill and stops — the pending
+            // propagation picks the edit up when the child readies.
+            let mut deferred = false;
+            let walked = {
+                let (below, above) = self.levels.split_at_mut(level as usize - 1);
+                let (Some(child_lc), Some(lc)) = (
+                    below[level as usize - 2].get(&child),
+                    above[0].get_mut(&pos),
+                ) else {
+                    break;
+                };
+                if !child_lc.ready() {
+                    // The edit cannot be recomputed from the child's full
+                    // content yet. Mark the parent's octant pending — even
+                    // when it is already known, so the ready branch of
+                    // `propagate` recomputes it in full instead of taking
+                    // the unchanged-region shortcut.
+                    lc.pending |= bit;
+                    deferred = true;
+                    None
+                } else if lc.known & bit == 0 {
+                    break;
+                } else {
+                    let was_ready = lc.ready();
+                    let changed = downsample_region(&child_lc.cube, &mut lc.cube, octant, region);
+                    Some((was_ready, changed))
+                }
+            };
+            if deferred {
+                self.request_internal(level - 1, child);
+                break;
+            }
+            let Some((was_ready, changed)) = walked else {
                 break;
             };
-            if !child_lc.ready() {
-                break; // the pending propagation carries the edit up later
-            }
-            if lc.known & (1 << octant) == 0 {
-                break;
-            }
-            let was_ready = lc.ready();
-            let changed = downsample_region(&child_lc.cube, &mut lc.cube, octant, region);
             match changed {
                 Some(boxed) => {
                     changes.cubes.push((level, pos));
@@ -428,6 +480,11 @@ impl LodPyramid {
                 None => break,
             }
         }
+        // As in `insert_lod0_octant`: ready cubes only, and `take_changed`
+        // still delivers the rest when they ready.
+        changes
+            .cubes
+            .retain(|&(level, pos)| self.ready(level, pos).is_some());
         changes
     }
 
@@ -436,8 +493,9 @@ impl LodPyramid {
     /// when the content did not change): while the child holds real data
     /// and is ready, its parent's octant holds (or gains) real content —
     /// recomputed from the child's full content when the octant was not
-    /// real yet, otherwise only over `region`. A child that holds real
-    /// data but is not ready defers: the parent's octant goes pending and
+    /// real yet or is stale (pending), otherwise only over `region`. A
+    /// child that holds real data but is not ready defers: the parent's
+    /// octant goes pending — a stale mark when it was already known — and
     /// the child's fill is requested internally. A child with no real data
     /// stops the walk — its parent's octant is worldgen, not real.
     fn propagate(
@@ -465,11 +523,12 @@ impl LodPyramid {
             }
             if !child_lc.ready() {
                 // Real by definition but not computable yet: defer, and
-                // fill the child.
-                let lc = self.entry(parent_level, pos);
-                if lc.known & bit == 0 {
-                    lc.pending |= bit;
-                }
+                // fill the child. The pending bit lands on known octants
+                // too (a load or an earlier run made them real): such an
+                // octant is stale — its content predates the child's
+                // latest changes — and the ready branch below recomputes
+                // it in full.
+                self.entry(parent_level, pos).pending |= bit;
                 self.request_internal(level, child);
                 break;
             }
@@ -482,7 +541,11 @@ impl LodPyramid {
                 let lc = above[0].entry(pos).or_insert_with(LodCube::empty);
                 let was_ready = lc.ready();
                 let was_known = lc.known & bit != 0;
-                let changed = if was_known {
+                // A pending bit on a known octant marks it stale: the child
+                // changed while it was not ready, so never trust a partial
+                // region here — recompute the octant in full.
+                let stale = lc.pending & bit != 0;
+                let changed = if was_known && !stale {
                     region.and_then(|region| {
                         downsample_region(&child_lc.cube, &mut lc.cube, octant, region)
                     })
