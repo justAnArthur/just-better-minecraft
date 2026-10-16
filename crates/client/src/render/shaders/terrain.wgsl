@@ -91,9 +91,6 @@ fn cell_scale(level: u32) -> f32 {
     return f32(1u << level);
 }
 
-// The in-plane quad inset factor (see vs_main): 1 - 2^-16.
-const EDGE_INSET_BLOCKS: f32 = 0.0;
-
 // Per-direction frames, identical to the table in mesh/face.rs:
 // direction -> (normal, u axis, v axis), with cross(u, v) = normal.
 //   0 +X: u=(0,0,-1) v=(0,1,0)   1 -X: u=(0,0,1)  v=(0,1,0)
