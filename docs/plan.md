@@ -98,6 +98,8 @@ Blocks are hardcoded in Rust for now.
 | B | [x] 2.5 GPU frustum and Hi-Z occlusion culling in compute | `client` | Golden images match; bench shows culled counts in caves |
 | C | [ ] 2.6 Clipmap streaming of LOD rings, skirts at seams | `client`, `server` | Fly test: no holes at ring borders (screenshots) |
 | C | [ ] 2.7 LOD sampled straight from worldgen for unvisited terrain; stored LOD in redb | `server` | Far terrain appears without generating full detail; reload shows it instantly |
+| D | [ ] 2.8 Dramatic worldgen: continents, ridged mountain ranges a few hundred blocks tall, valleys and plateaus, domain warp — authored as a new density graph | `server` | Screenshots from altitude show mountain ranges and valleys; heights bounded by the graph's own interval bounds; gen bench within budget |
+| D | [ ] 2.9 Distant-Horizons-style far look: flat per-material colors on LOD ≥ 1, LOD0 textures fading to those colors with distance, sky-colored distance fog | `client` | Ring borders invisible in close-up screenshots; far view reads as smooth landscape (you approve) |
 
 **Gate:** fly across kilometres without frame hitches; bench records frame times. Then `/clear`.
 
