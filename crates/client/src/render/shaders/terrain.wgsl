@@ -39,10 +39,15 @@ struct FrameUniforms {
 };
 
 // Mirrored by `CubeMeta` in render/chunks.rs (80 bytes, 16-aligned; layout
-// test there). Written once per upload/re-mesh, never per frame.
+// test there). Written once per upload/re-meshesh or coverage change,
+// never per frame.
 struct CubeMeta {
     pos_page: vec4i,        // xyz = cube coordinates, w = page index
-    start_flags: vec4u,     // x = face range start in the page, y = flags
+    // x = face range start in the page; y = flags: bit 0 active (the
+    // coverage rule draws this cube), bit 1 visible-last-frame, bits
+    // 8..12 = LOD level, bits 16..24 = octant mask (bit o set when a
+    // ready child replaces octant o); z = skirt face count, w spare.
+    start_flags: vec4u,
     dirs: array<vec4u, 3>,  // six per-direction (offset, count) pairs
 };
 
@@ -60,15 +65,30 @@ struct TerrainUniforms {
 @group(2) @binding(2) var block_textures: texture_2d_array<f32>;
 @group(2) @binding(3) var block_sampler: sampler;
 
-// The one origin formula, shared by this shader, cull.wgsl and
-// `cube_origin` in render/chunks.rs: origin = (pos - camera_cube) *
-// CUBE_SIZE - camera_frac (CUBE_SIZE rides in camera_frac.w, so the
-// shader is cube-size agnostic). The multiply is exact (small integers),
-// so the only rounding is the final f32 subtract — one rounding total,
-// and the CPU path computes the very same value.
-fn cube_origin(pos: vec3i) -> vec3f {
-    let int_part = vec3f(pos - terrain.camera_cube.xyz) * terrain.camera_frac.w;
+// The one origin formula, scaled by the cube's LOD level and shared by
+// this shader, cull.wgsl and `cube_origin` in render/chunks.rs:
+// origin = (pos * 2^level - camera_cube) * CUBE_SIZE - camera_frac
+// (CUBE_SIZE rides in camera_frac.w, so the shader is cube-size
+// agnostic). A level-n cube at pos covers blocks pos*CUBE_SIZE*2^n
+// onwards. The integer product stays inside i32 for any position a
+// server can stream (the CPU mirror asserts it), and the only rounding
+// is the final f32 subtract — one rounding total, and the CPU path
+// computes the very same value.
+fn cube_origin(pos: vec3i, level: u32) -> vec3f {
+    // pos * 2^level stays inside i32 for any position a server can
+    // stream (the CPU mirror debug-asserts it).
+    let scaled = pos * vec3i(i32(1u << level)) - terrain.camera_cube.xyz;
+    let int_part = vec3f(scaled) * terrain.camera_frac.w;
     return int_part - terrain.camera_frac.xyz;
+}
+
+// The outward quad expansion, in blocks (see vs_main).
+const EDGE_EXPAND_BLOCKS: f32 = 1.0 / 512.0;
+
+// The cell scale of a level: cell offsets and UVs multiply by 2^level,
+// since one cell spans 2^level blocks.
+fn cell_scale(level: u32) -> f32 {
+    return f32(1u << level);
 }
 
 // Per-direction frames, identical to the table in mesh/face.rs:
@@ -161,15 +181,53 @@ fn vs_main(
     let block = vec3i(i32(bx), i32(by), i32(bz)) + max(n, vec3i(0))
         + max(-ua, vec3i(0)) + max(-va, vec3i(0));
     let offset = ua * i32(c.x * width) + va * i32(c.y * height);
-    let relative = cube_origin(m.pos_page.xyz) + vec3f(block + offset);
+
+    // The cube's LOD level (meta flags, bits 8..12) scales every cell
+    // to 2^level blocks (task 2.6).
+    let level = (m.start_flags.y >> 8u) & 15u;
+    let scale = cell_scale(level);
+    let relative = cube_origin(m.pos_page.xyz, level)
+        + vec3f(block + offset) * scale;
+    // Sub-pixel expansion (level >= 1 only): greedy merging leaves
+    // T-junctions where a merged quad's edge abuts smaller quads, and the
+    // two edges' interpolation can differ by ulps — a hairline crack the
+    // eye sees straight through (there is no face behind terrain).
+    // Pushing every corner ~1/512 block outward closes those cracks with
+    // an overlap that is invisible: coplanar neighbours carry the same
+    // texture, and the step-edge slivers are far below a pixel. LOD0
+    // skips it to keep the pre-LOD goldens bit-stable; its pinholes are
+    // single pixels and bounded by the hole tests instead.
+    let expand_blocks = select(0.0, EDGE_EXPAND_BLOCKS, level > 0u);
+    let expand = vec3f(ua) * ((c.x - 0.5) * 2.0 * expand_blocks)
+        + vec3f(va) * ((c.y - 0.5) * 2.0 * expand_blocks);
+    let relative_expanded = relative + expand;
 
     // v is world-up on side faces and texture v grows downward, so the
-    // image's top row lands at the block's top.
-    let uv = vec2f(c.x * width, (1.0 - c.y) * height);
+    // image's top row lands at the block's top. One texture tile per
+    // BLOCK (not per cell), so tiles line up across ring borders.
+    let uv = vec2f(c.x * width, (1.0 - c.y) * height) * scale;
+
+    // Octant masking (level >= 1): a ready child replaces this octant, so
+    // the cube's faces here must produce no fragments. Collapsing every
+    // vertex of the face to one point makes all triangles degenerate.
+    // Octants are indexed in CELL units: dx + 2*dz + 4*dy over the cell
+    // halves (CUBE_SIZE / 2 rides in camera_frac.w / 2).
+    let half_cell = u32(terrain.camera_frac.w / 2.0);
+    let octant = u32(bx >= f32(half_cell))
+        + 2u * u32(bz >= f32(half_cell))
+        + 4u * u32(by >= f32(half_cell));
+    if (level > 0u && ((m.start_flags.y >> 16u) >> octant & 1u) != 0u) {
+        var out: VsOut;
+        out.pos = vec4f(0.0, 0.0, 0.0, 1.0);
+        out.uv = vec2f(0.0);
+        out.layer = layer;
+        out.shade = 0.0;
+        return out;
+    }
 
     let ao_factor = array<f32, 4>(0.4, 0.6, 0.8, 1.0);
     var out: VsOut;
-    out.pos = u.view_proj * vec4f(relative, 1.0);
+    out.pos = u.view_proj * vec4f(relative_expanded, 1.0);
     out.uv = uv;
     out.layer = layer;
     out.shade = face_shade()[direction] * ao_factor[corner_ao[corner_index]];

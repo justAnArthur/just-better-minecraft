@@ -264,7 +264,9 @@ the `StorageError` instead, and opens storage *first* so the stored seed
 feeds the generator), `add_connection(ServerLink)`, `tick()` runs exactly
 one tick, `update(elapsed) -> u32` feeds the clock and runs every due tick. Read access for tests:
 `tick_count()`, `dropped_ticks()`, `players()`, `world_cube_count()`,
-`in_flight()`, `sent_count(PlayerId)`.
+`in_flight()`, `sent_count(PlayerId)`. Bench and test hook:
+`teleport_player(PlayerId, DVec3)` moves a player's authoritative state
+without physics; the next tick's streaming observes the new center.
 
 `ServerConfig` (all fields public):
 
@@ -325,6 +327,53 @@ returns) exposes `state`, `last_seq` and `input_count`.
 5. Light and outgoing changes — the streaming pass (below), then each
    player's `PlayerState` (if any input was processed), then `Tick` for
    every joined player (so cubes and state always precede their tick).
+
+## LOD ring streaming (phase 5, task 2.6)
+
+Per joined player and per level *n* in `1..=lod_levels`, the server keeps
+a **level center** (the level-*n* cube containing the player), a **sent
+set** and the walk state, and streams a full disk of
+`lod_view_radius`/`lod_vertical_radius` level-*n* cubes around the
+center — full disks, not annuli: the client needs the coarse cube under
+a finer one while the finer one loads, and to fill octants the finer
+level does not cover yet. That costs about a quarter more cubes per
+level than an annulus would (`disk(r) / (disk(r) - disk(r/2))`; at
+r = 8, v = 3: 1407 disk vs 1064 annulus cubes, +32%).
+
+- **Order.** One merged walk over `(level, offset)`, precomputed once
+  from the config: sorted by the offset's squared distance in level
+  units, then level **descending** (coarse first at equal distance),
+  then `(x, y, z)`.
+- **Sending.** A ready cube is sent as `LodCubeData` and recorded in
+  the sent set. A not-ready cube is requested (while
+  `in_flight < lod_max_in_flight`) and **skipped** — the walk does not
+  stop at gaps, because the client's coverage rule makes any arrival
+  order hole-free. At most `lod_send_budget_per_tick` LOD messages per
+  player per tick, re-sends included.
+- **Re-sends.** Once per tick, before the per-player pass, the pyramid's
+  changed set is drained (`take_changed`); every changed cube a player
+  has in its sent set is queued. Queued re-sends go first within the
+  budget and the queue persists across ticks, so an edit's LOD change
+  reaches every holder within one tick whenever the budget allows, and
+  nothing starves under saturation.
+- **Unloading.** When a level's center moves, `UnloadLodCube` goes out
+  for every sent cube that left that level's keep set (the disk shape at
+  +1 in both radii — the same hysteresis as LOD0), and the walk cursor
+  resets.
+- **Cost contract.** A settled player whose rings are complete costs a
+  few center comparisons per level per tick — the cursor sits at the end
+  of the walk, so nothing is scanned. While cubes are missing the
+  per-tick scan is bounded by the skip window (`LOD_SKIP_WINDOW` = 512
+  entries past the cursor) plus the send budget; the cursor only
+  advances over sent entries, so a permanent gap in the pyramid costs a
+  bounded look-ahead every tick, never a full rescan (a level-center
+  move resets it, like LOD0).
+- **Off switches.** No LOD messages at all when `streaming` is false,
+  `lod_levels == 0`, or the connection has not joined.
+
+LOD cubes are never evicted from the pyramid (2.7's known issue).
+`Server::lod_ring_pending(id)` reports how many desired ring cubes are
+unsent (test/fly-test hook).
 
 ## Cube streaming (phase 5)
 
@@ -556,6 +605,12 @@ Current cases:
   generated surface cube (mixed, asserted) or an air cube inserted into
   an existing 4-level pyramid.
 - `lod/edit` — one edit propagated through all levels.
+- `lod/stream_settled` (task 2.6, `lod_stream_bench.rs`) — one streaming
+  tick of a player whose rings have settled at game scale: the idle
+  floor.
+- `lod/stream_moving` — a player teleported one level-1 cube (64 blocks)
+  every iteration, alternating between two adjacent level-1 cubes so each
+  sample takes the center move, the cursor reset and the keep-set unloads.
 - `lod/fill_poll` (task 2.7) — one inline poll that fills one requested
   surface cube (one `sample_lod` plus the merge).
 

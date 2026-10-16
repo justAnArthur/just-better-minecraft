@@ -32,5 +32,9 @@ criterion.workspace = true
 jbm-client = { path = ".", features = ["testing"] }
 
 [[bench]]
+name = "coverage_bench"
+harness = false
+
+[[bench]]
 name = "mesh_bench"
 harness = false

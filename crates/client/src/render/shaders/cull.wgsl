@@ -36,12 +36,19 @@ struct FrameUniforms {
 
 // Mirrored by `CubeMeta` in render/chunks.rs (80 bytes, 16-aligned; layout
 // test there). dirs holds the six per-direction (offset, count) pairs,
-// offsets relative to the cube's face range start.
+// offsets relative to the cube's face range start. start_flags.y: bit 0
+// active (the coverage rule draws this cube), bit 1 visible-last-frame,
+// bits 8..12 = LOD level, bits 16..24 = octant mask.
 struct CubeMeta {
     pos_page: vec4i,        // xyz = cube coordinates, w = page index
     start_flags: vec4u,     // x = face range start in the page, y = flags
     dirs: array<vec4u, 3>,
 };
+
+// The LOD level of a slot (bits 8..12 of the flags word).
+fn level_of(m: CubeMeta) -> u32 {
+    return (m.start_flags.y >> 8u) & 15u;
+}
 
 const ACTIVE: u32 = 1u;
 const VISIBLE: u32 = 2u;
@@ -86,13 +93,24 @@ const NEAR: f32 = 0.05;
 @group(1) @binding(5) var<storage, read_write> stats: array<atomic<u32>>;
 @group(1) @binding(6) var pyramid: texture_2d<f32>;
 
-// The one origin formula, identical to the vertex shader in terrain.wgsl
-// and to `cube_origin` in render/chunks.rs: the integer part is exact, the
-// only rounding is the final f32 subtract, so CPU and GPU cull on the same
-// numbers and no absolute world coordinate ever reaches f32.
-fn cube_origin(pos: vec3i) -> vec3f {
-    let int_part = vec3f(pos - params.camera_cube.xyz) * f32(params.regions.w);
+// The one origin formula, scaled by the cube's level and identical to
+// the vertex shader in terrain.wgsl and `cube_origin` in
+// render/chunks.rs: origin = (pos*2^level - camera_cube) * CUBE_SIZE -
+// camera_frac. The integer product stays inside i32 for any streamable
+// position (the CPU mirror asserts it), the only rounding is the final
+// f32 subtract, so CPU and GPU cull on the same numbers and no absolute
+// world coordinate ever reaches f32.
+fn cube_origin(pos: vec3i, level: u32) -> vec3f {
+    // pos * 2^level stays inside i32 for any streamable position.
+    let scaled = pos * vec3i(i32(1u << level)) - params.camera_cube.xyz;
+    let int_part = vec3f(scaled) * f32(params.regions.w);
     return int_part - params.camera_frac.xyz;
+}
+
+// A level-n cube is CUBE_SIZE * 2^n wide: the AABB half of the cull
+// tests.
+fn cube_extent(level: u32) -> f32 {
+    return f32(params.regions.w) * f32(1u << level);
 }
 
 // The plane test of `Frustum::intersects_aabb` (render/chunks.rs), ported
@@ -168,6 +186,11 @@ fn dir_visible(dirs: VisibleDirs, d: u32) -> bool {
 // is a bound bug — it is counted in region_overflow for the tests to
 // catch instead of corrupting memory.
 fn emit(m: CubeMeta, slot: u32, phase_base: u32, rel_min: vec3f, rel_max: vec3f) {
+    // A fully masked drawn cube emits nothing (the coverage rule: all
+    // eight octants are replaced by ready children).
+    if ((m.start_flags.y >> 16u) & 0xFFu) == 0xFFu {
+        return;
+    }
     let page = u32(m.pos_page.w);
     let dirs = visible_dirs(rel_min, rel_max);
     let start = m.start_flags.x;
@@ -276,8 +299,9 @@ fn cull_early(@builtin(global_invocation_id) gid: vec3u) {
     if ((m.start_flags.y & ACTIVE) == 0u) {
         return;
     }
-    let rel_min = cube_origin(m.pos_page.xyz);
-    let rel_max = rel_min + vec3f(f32(params.regions.w));
+    let level = level_of(m);
+    let rel_min = cube_origin(m.pos_page.xyz, level);
+    let rel_max = rel_min + vec3f(cube_extent(level));
     // Draw what was visible last frame; the early phase never touches the
     // visible bit (the late phase needs last frame's value).
     if ((m.start_flags.y & VISIBLE) != 0u && frustum_visible(rel_min, rel_max)) {
@@ -297,8 +321,9 @@ fn cull_late(@builtin(global_invocation_id) gid: vec3u) {
         return;
     }
     atomicAdd(&stats[STAT_CANDIDATES], 1u);
-    let rel_min = cube_origin(m.pos_page.xyz);
-    let rel_max = rel_min + vec3f(f32(params.regions.w));
+    let level = level_of(m);
+    let rel_min = cube_origin(m.pos_page.xyz, level);
+    let rel_max = rel_min + vec3f(cube_extent(level));
     var visible = true;
     if (!frustum_visible(rel_min, rel_max)) {
         atomicAdd(&stats[STAT_FRUSTUM_CULLED], 1u);

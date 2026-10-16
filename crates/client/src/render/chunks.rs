@@ -24,10 +24,11 @@ use std::ops::Range;
 
 use bytemuck::{Pod, Zeroable};
 use glam::{DVec3, IVec3, Mat4, Vec3, Vec4};
-use jbm_core::coords::{CUBE_SIZE, CubePos};
+use jbm_core::coords::CUBE_SIZE;
 
 use crate::camera::Camera;
 use crate::gpu::Gpu;
+use crate::lod::CubeKey;
 use crate::mesh::face::PackedFace;
 use crate::mesh::greedy::MeshOutput;
 use crate::render::hiz::HizPyramid;
@@ -62,13 +63,43 @@ pub fn worst_case_faces() -> u32 {
     ((CUBE_SIZE as u64).pow(3) * 6 / 2) as u32
 }
 
-/// Meta flag: the slot holds a resident cube (a freed slot reads inactive
-/// and the cull thread exits early).
+/// Meta flag: the slot holds a resident cube that the coverage rule
+/// draws (a freed slot or an undrawn cube reads inactive and the cull
+/// thread exits early; task 2.6 clears it for cubes a finer level
+/// replaces).
 pub const META_ACTIVE: u32 = 1;
 /// Meta flag: the cube was visible last frame (two-phase culling state,
 /// written by the late cull, reset on upload so new and re-meshed cubes
 /// are picked up by the late pass of the same frame).
 pub const META_VISIBLE: u32 = 2;
+/// Meta bits 8..12 of `start_flags.y`: the cube's LOD level (0 = LOD0),
+/// scaling its origin and cell offsets by 2^level.
+pub const META_LEVEL_SHIFT: u32 = 8;
+/// Meta bits 16..24 of `start_flags.y`: the octant mask — bit *o* set
+/// when a ready child replaces octant *o*, so the vertex shader collapses
+/// faces whose owning cell sits in a masked octant.
+pub const META_MASK_SHIFT: u32 = 16;
+
+/// Packs the level and octant mask into the flag word. `drawn && mask ==
+/// 0xFF` — a cube whose every octant a ready child replaces — reads
+/// inactive, so the cull pass skips it like any undrawn cube (its mesh,
+/// if any, is fully collapsed by the vertex shader anyway).
+fn meta_flags(drawn: bool, level: u8, mask: u8) -> u32 {
+    let mut flags = u32::from(level) << META_LEVEL_SHIFT | u32::from(mask) << META_MASK_SHIFT;
+    if drawn && mask != 0xFF {
+        flags |= META_ACTIVE;
+    }
+    flags
+}
+
+/// Unpacks `(drawn-active, level, octant mask)` from the flag word.
+pub fn unpack_meta_flags(flags: u32) -> (bool, u8, u8) {
+    (
+        flags & META_ACTIVE != 0,
+        ((flags >> META_LEVEL_SHIFT) & 0xF) as u8,
+        (flags >> META_MASK_SHIFT) as u8,
+    )
+}
 
 /// One cube's uploaded mesh, mirrored on the GPU as `CubeMeta`
 /// (shaders/terrain.wgsl, shaders/cull.wgsl — keep all three in sync).
@@ -81,7 +112,9 @@ pub const META_VISIBLE: u32 = 2;
 pub struct CubeMeta {
     /// x, y, z = the cube coordinates; w = the page index.
     pub pos_page: [i32; 4],
-    /// x = the face range start in the page; y = flags (META_*); z, w spare.
+    /// x = the face range start in the page; y = flags (META_ACTIVE,
+    /// META_VISIBLE, level << 8, octant mask << 16); z = skirt faces, w
+    /// spare.
     pub start_flags: [u32; 4],
     /// The six per-direction (offset, count) pairs from
     /// `MeshOutput::ranges`, offsets relative to the cube's face range:
@@ -185,18 +218,35 @@ struct CubeMesh {
     /// Per-direction face ranges within the cube's faces
     /// (`MeshOutput::ranges`), so drawing can skip back-facing directions.
     ranges: [Range<u32>; 6],
+    /// Faces emitted under the skirt rule (level >= 1), from the mesher.
+    skirts: u32,
+    /// The coverage state riding in the meta flags: whether the cube
+    /// draws at all, and which octants a ready child replaces. Kept so a
+    /// re-mesh rewrites its slot with the same state.
+    drawn: bool,
+    mask: u8,
 }
 
-/// The meta image of one mesh (`pos` is kept in the map key).
-fn meta_for(pos: CubePos, page: usize, start: u32, ranges: &[Range<u32>; 6]) -> CubeMeta {
+/// The meta image of one mesh (`key` is kept in the map key). The flags
+/// carry the cube's level and coverage state (`drawn`, `mask`); `visible`
+/// starts cleared so the late cull picks new geometry up the same frame.
+fn meta_for(
+    key: CubeKey,
+    page: usize,
+    start: u32,
+    ranges: &[Range<u32>; 6],
+    skirts: u32,
+    drawn: bool,
+    mask: u8,
+) -> CubeMeta {
     let mut dirs = [[0u32; 4]; 3];
     for (d, range) in ranges.iter().enumerate() {
         dirs[d / 2][(d % 2) * 2] = range.start;
         dirs[d / 2][(d % 2) * 2 + 1] = range.len() as u32;
     }
     CubeMeta {
-        pos_page: [pos.x, pos.y, pos.z, page as i32],
-        start_flags: [start, META_ACTIVE, 0, 0],
+        pos_page: [key.pos.x, key.pos.y, key.pos.z, page as i32],
+        start_flags: [start, meta_flags(drawn, key.level, mask), skirts, 0],
         dirs,
     }
 }
@@ -213,7 +263,7 @@ fn non_empty_dirs(ranges: &[Range<u32>; 6]) -> u32 {
 /// logic, no wgpu — the churn unit test drives it directly.
 #[derive(Default)]
 struct MeshBookkeeping {
-    meshes: HashMap<CubePos, CubeMesh>,
+    meshes: HashMap<CubeKey, CubeMesh>,
     /// Slots handed out (high-water mark); slots below it are either in
     /// use or on the free list.
     meta_len: u32,
@@ -223,11 +273,14 @@ struct MeshBookkeeping {
     page_dir_counts: Vec<u32>,
 }
 
-/// What `release` freed for a cube being re-meshed or removed.
+/// What `release` freed for a cube being re-meshed or removed. The
+/// coverage state comes back only when the cube had a mesh entry.
 struct Released {
     page: Option<usize>,
     range: Option<Range<u32>>,
     slot: Option<u32>,
+    drawn: Option<bool>,
+    mask: Option<u8>,
 }
 
 impl MeshBookkeeping {
@@ -239,12 +292,14 @@ impl MeshBookkeeping {
     /// returning what the caller must free on the GPU. The direction
     /// count leaves the page's total here already, so `commit` can add it
     /// to whichever page the new mesh lands in.
-    fn release(&mut self, pos: &CubePos) -> Released {
-        let Some(mesh) = self.meshes.get(pos) else {
+    fn release(&mut self, key: &CubeKey) -> Released {
+        let Some(mesh) = self.meshes.get(key) else {
             return Released {
                 page: None,
                 range: None,
                 slot: None,
+                drawn: None,
+                mask: None,
             };
         };
         let (page, range) = match &mesh.alloc {
@@ -258,6 +313,8 @@ impl MeshBookkeeping {
             page,
             range,
             slot: mesh.slot,
+            drawn: Some(mesh.drawn),
+            mask: Some(mesh.mask),
         }
     }
 
@@ -278,38 +335,51 @@ impl MeshBookkeeping {
 
     /// Records a non-empty mesh at `(page, range)`, reusing `slot` when
     /// the cube had one (a re-mesh rewrites its slot in place). Returns
-    /// the slot the caller must write the meta to.
+    /// the slot the caller must write the meta to. `skirts`/`drawn`/`mask`
+    /// carry the mesher's skirt count and the cube's coverage state.
+    // The nine parameters are one upload's worth of bookkeeping; a bundling
+    // struct would only be unpacked again here.
+    #[allow(clippy::too_many_arguments)]
     fn commit(
         &mut self,
-        pos: CubePos,
+        key: CubeKey,
         page: usize,
         range: Range<u32>,
         ranges: [Range<u32>; 6],
         slot: Option<u32>,
+        skirts: u32,
+        drawn: bool,
+        mask: u8,
     ) -> u32 {
         let slot = slot.unwrap_or_else(|| self.alloc_meta_slot());
         self.page_dir_counts[page] += non_empty_dirs(&ranges);
         self.meshes.insert(
-            pos,
+            key,
             CubeMesh {
                 face_count: range.len() as u32,
                 alloc: Some((page, range)),
                 slot: Some(slot),
                 ranges,
+                skirts,
+                drawn,
+                mask,
             },
         );
         slot
     }
 
     /// An empty mesh: entry kept, no allocation, no slot.
-    fn commit_empty(&mut self, pos: CubePos) {
+    fn commit_empty(&mut self, key: CubeKey) {
         self.meshes.insert(
-            pos,
+            key,
             CubeMesh {
                 face_count: 0,
                 alloc: None,
                 slot: None,
                 ranges: std::array::from_fn(|_| 0u32..0),
+                skirts: 0,
+                drawn: true,
+                mask: 0,
             },
         );
     }
@@ -344,12 +414,18 @@ impl MeshBookkeeping {
         frustum: &Frustum,
     ) -> Vec<u32> {
         let mut bounds = vec![0u32; self.page_dir_counts.len()];
-        for (pos, mesh) in &self.meshes {
+        for (key, mesh) in &self.meshes {
             let Some((page, _)) = &mesh.alloc else {
                 continue;
             };
-            let min = cube_origin(*pos, camera_cube, camera_frac);
-            let max = min + Vec3::splat(CUBE_SIZE as f32);
+            // Cubes the coverage rule does not draw — fully masked ones
+            // included — emit nothing on any path, so they stay out of
+            // the bound too.
+            if !mesh.drawn || mesh.mask == 0xFF {
+                continue;
+            }
+            let min = cube_origin(*key, camera_cube, camera_frac);
+            let max = min + cube_size(key.level);
             if !frustum.intersects_aabb(min, max) {
                 continue;
             }
@@ -512,19 +588,56 @@ pub fn camera_split(camera: DVec3) -> (IVec3, Vec3) {
     (cube, frac)
 }
 
-/// The one origin formula, shared by the CPU paths here, `vs_main` in
-/// shaders/terrain.wgsl and `cull.wgsl`:
-/// `origin = (pos − camera_cube) · CUBE_SIZE − camera_frac`. The integer
-/// part is exact (small integers in f32); the only rounding is the final
-/// f32 subtract, and the shaders perform the very same two steps, so the
-/// CPU and GPU cull on the same numbers.
-pub fn cube_origin(pos: CubePos, camera_cube: IVec3, camera_frac: Vec3) -> Vec3 {
-    let int_part = Vec3::new(
-        (pos.x - camera_cube.x) as f32,
-        (pos.y - camera_cube.y) as f32,
-        (pos.z - camera_cube.z) as f32,
-    ) * CUBE_SIZE as f32;
-    int_part - camera_frac
+/// The one origin formula, scaled by the cube's level and shared by the
+/// CPU paths here, `vs_main` in shaders/terrain.wgsl and `cull.wgsl`:
+/// `origin = (pos·2^level − camera_cube) · CUBE_SIZE − camera_frac`. A
+/// level-*n* cube at `pos` covers blocks `pos * CUBE_SIZE * 2^n` onwards,
+/// so the integer part stays exact (the product is computed in i64; for
+/// any position a server can stream, `pos·2^n` is asserted to fit i32 —
+/// coordinates beyond that are unreachable at f64 camera precision); the
+/// only rounding is the final f32 subtract, and the shaders perform the
+/// very same steps, so the CPU and GPU cull on the same numbers.
+pub fn cube_origin(key: CubeKey, camera_cube: IVec3, camera_frac: Vec3) -> Vec3 {
+    let scale = 1i64 << key.level;
+    let int = Vec3::new(
+        scaled_cube(key.pos.x, scale, camera_cube.x),
+        scaled_cube(key.pos.y, scale, camera_cube.y),
+        scaled_cube(key.pos.z, scale, camera_cube.z),
+    );
+    int * CUBE_SIZE as f32 - camera_frac
+}
+
+/// One axis of [`cube_origin`]: `(pos·2^level − camera_cube)` as f32,
+/// asserted to be an i32-range integer for streamable positions.
+fn scaled_cube(pos: i32, scale: i64, camera_cube: i32) -> f32 {
+    let scaled = i64::from(pos) * scale;
+    debug_assert!(
+        scaled <= i64::from(i32::MAX) && scaled >= i64::from(i32::MIN),
+        "pos·2^level overflows i32: {pos}·{scale}"
+    );
+    (scaled - i64::from(camera_cube)) as f32
+}
+
+/// The camera-relative side length of a level-`level` cube.
+fn cube_size(level: u8) -> Vec3 {
+    Vec3::splat(CUBE_SIZE as f32 * (1u32 << level) as f32)
+}
+
+/// Per-LOD-level residency and coverage statistics (task 2.6), for the
+/// overlay and the metrics example.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LevelStats {
+    pub level: u8,
+    /// Cubes with an uploaded mesh (empty or not).
+    pub resident: u32,
+    /// Cubes the coverage rule draws.
+    pub drawn: u32,
+    /// Masked octants summed over drawn cubes (each cube 0..=8).
+    pub masked_octants: u32,
+    /// Faces held by resident meshes.
+    pub faces: u64,
+    /// Faces emitted under the skirt rule.
+    pub skirts: u32,
 }
 
 /// Per-frame terrain draw statistics, for the overlay and the metrics
@@ -1381,8 +1494,8 @@ impl TerrainPass {
     /// creates a buffer (except when no page fits, which adds one page). An
     /// empty mesh allocates nothing and holds no slot. The app enforces
     /// the per-frame upload budget before calling this.
-    pub fn upload(&mut self, gpu: &Gpu, pos: CubePos, output: &MeshOutput) {
-        let released = self.book.release(&pos);
+    pub fn upload(&mut self, gpu: &Gpu, key: CubeKey, output: &MeshOutput) {
+        let released = self.book.release(&key);
         if let (Some(page), Some(range)) = (released.page, released.range) {
             self.pages[page].suballoc.free(range);
         }
@@ -1393,7 +1506,7 @@ impl TerrainPass {
                 self.zero_meta_slot(gpu, slot);
                 self.book.free_meta_slot(slot);
             }
-            self.book.commit_empty(pos);
+            self.book.commit_empty(key);
             return;
         }
         let len = output.faces.len() as u32;
@@ -1411,26 +1524,40 @@ impl TerrainPass {
             bytemuck::cast_slice(&output.faces),
         );
         let slot = self.book.commit(
-            pos,
+            key,
             page,
             range.clone(),
             output.ranges.clone(),
             released.slot,
+            output.skirts,
+            // A fresh mesh draws (pre-2.6 behavior for callers without
+            // the coverage rule); a re-mesh keeps its coverage state.
+            released.drawn.unwrap_or(true),
+            released.mask.unwrap_or(0),
         );
         if slot >= self.meta_capacity {
             self.grow_meta_buffer(gpu);
         }
+        let mesh = &self.book.meshes[&key];
         gpu.queue.write_buffer(
             &self.meta_buffer,
             u64::from(slot) * std::mem::size_of::<CubeMeta>() as u64,
-            bytemuck::bytes_of(&meta_for(pos, page, range.start, &output.ranges)),
+            bytemuck::bytes_of(&meta_for(
+                key,
+                page,
+                range.start,
+                &output.ranges,
+                output.skirts,
+                mesh.drawn,
+                mesh.mask,
+            )),
         );
     }
 
-    /// Drops a cube's mesh (UnloadCube), freeing its page range and meta
-    /// slot. Pages themselves are never freed in this task.
-    pub fn remove(&mut self, gpu: &Gpu, pos: CubePos) {
-        let released = self.book.release(&pos);
+    /// Drops a cube's mesh (UnloadCube / UnloadLodCube), freeing its page
+    /// range and meta slot. Pages themselves are never freed in this task.
+    pub fn remove(&mut self, gpu: &Gpu, key: CubeKey) {
+        let released = self.book.release(&key);
         if let (Some(page), Some(range)) = (released.page, released.range) {
             self.pages[page].suballoc.free(range);
         }
@@ -1438,7 +1565,52 @@ impl TerrainPass {
             self.zero_meta_slot(gpu, slot);
             self.book.free_meta_slot(slot);
         }
-        self.book.meshes.remove(&pos);
+        self.book.meshes.remove(&key);
+    }
+
+    /// Applies the coverage rule's verdict for one cube: whether it draws
+    /// at all, and which octants a ready child replaces. Rewrites the
+    /// meta slot's flag word only when the state actually changed —
+    /// never per frame. No-op for cubes without a slot (empty meshes draw
+    /// nothing anyway).
+    pub fn set_draw_state(&mut self, gpu: &Gpu, key: CubeKey, drawn: bool, mask: u8) {
+        let Some(mesh) = self.book.meshes.get_mut(&key) else {
+            return;
+        };
+        if mesh.drawn == drawn && mesh.mask == mask {
+            return;
+        }
+        mesh.drawn = drawn;
+        mesh.mask = mask;
+        let Some(slot) = mesh.slot else {
+            return;
+        };
+        let (page, start, ranges, skirts) = match &mesh.alloc {
+            Some((page, range)) => (
+                Some(*page),
+                Some(range.start),
+                mesh.ranges.clone(),
+                mesh.skirts,
+            ),
+            None => (None, None, mesh.ranges.clone(), mesh.skirts),
+        };
+        if let (Some(page), Some(start)) = (page, start) {
+            let meta = meta_for(key, page, start, &ranges, skirts, drawn, mask);
+            gpu.queue.write_buffer(
+                &self.meta_buffer,
+                u64::from(slot) * std::mem::size_of::<CubeMeta>() as u64,
+                bytemuck::bytes_of(&meta),
+            );
+        } else {
+            // No allocation (should not happen for a slot holder): write
+            // the flag word alone.
+            let flags = meta_flags(drawn, key.level, mask);
+            gpu.queue.write_buffer(
+                &self.meta_buffer,
+                u64::from(slot) * std::mem::size_of::<CubeMeta>() as u64 + 16,
+                bytemuck::bytes_of(&flags),
+            );
+        }
     }
 
     /// A freed slot must read inactive: the cull threads dispatch over the
@@ -1463,13 +1635,21 @@ impl TerrainPass {
             mapped_at_creation: false,
         });
         let mut metas = vec![CubeMeta::zeroed(); self.meta_capacity as usize];
-        for (pos, mesh) in &self.book.meshes {
+        for (key, mesh) in &self.book.meshes {
             let Some(slot) = mesh.slot else { continue };
             let (page, range) = mesh
                 .alloc
                 .as_ref()
                 .expect("a mesh with a slot holds an allocation");
-            metas[slot as usize] = meta_for(*pos, *page, range.start, &mesh.ranges);
+            metas[slot as usize] = meta_for(
+                *key,
+                *page,
+                range.start,
+                &mesh.ranges,
+                mesh.skirts,
+                mesh.drawn,
+                mesh.mask,
+            );
         }
         gpu.queue
             .write_buffer(&self.meta_buffer, 0, bytemuck::cast_slice(&metas));
@@ -1504,6 +1684,27 @@ impl TerrainPass {
 
     pub fn stats(&self) -> TerrainStats {
         self.stats
+    }
+
+    /// Per-level residency, coverage and face counts, level-ascending.
+    pub fn level_stats(&self) -> Vec<LevelStats> {
+        let mut levels: Vec<LevelStats> = Vec::new();
+        for (key, mesh) in &self.book.meshes {
+            let level = key.level as usize;
+            if levels.len() <= level {
+                levels.resize_with(level + 1, LevelStats::default);
+            }
+            let entry = &mut levels[level];
+            entry.level = key.level;
+            entry.resident += 1;
+            if mesh.drawn && mesh.mask != 0xFF {
+                entry.drawn += 1;
+                entry.masked_octants += mesh.mask.count_ones();
+            }
+            entry.faces += u64::from(mesh.face_count);
+            entry.skirts += mesh.skirts;
+        }
+        levels
     }
 
     /// Whether the next draw issues multi_draw_indirect calls (the gpu-cull
@@ -1951,29 +2152,31 @@ impl TerrainPass {
 
         let frustum = Frustum::from_view_proj(&camera.view_proj());
         // Deterministic order: HashMap iteration is randomized.
-        let mut visible: Vec<(CubePos, Vec3, &CubeMesh)> = self
+        let mut visible: Vec<(CubeKey, Vec3, &CubeMesh)> = self
             .book
             .meshes
             .iter()
-            .filter(|(_, mesh)| mesh.face_count > 0)
-            .filter_map(|(pos, mesh)| {
-                let min = cube_origin(*pos, camera_cube, camera_frac);
-                let max = min + Vec3::splat(CUBE_SIZE as f32);
+            // Coverage: undrawn cubes (a finer level replaces them) and
+            // fully masked ones emit nothing on any path.
+            .filter(|(_, mesh)| mesh.face_count > 0 && mesh.drawn && mesh.mask != 0xFF)
+            .filter_map(|(key, mesh)| {
+                let min = cube_origin(*key, camera_cube, camera_frac);
+                let max = min + cube_size(key.level);
                 frustum
                     .intersects_aabb(min, max)
-                    .then_some((*pos, min, mesh))
+                    .then_some((*key, min, mesh))
             })
             .collect();
-        visible.sort_unstable_by_key(|(pos, _, _)| *pos);
+        visible.sort_unstable_by_key(|(key, _, _)| *key);
 
-        // The CPU-side mirror of the GPU counters: every non-empty mesh is
-        // a candidate, the frustum test culls the rest (there is no
-        // occlusion culling on this path).
+        // The CPU-side mirror of the GPU counters: every drawn non-empty
+        // mesh is a candidate, the frustum test culls the rest (there is
+        // no occlusion culling on this path).
         let candidates = self
             .book
             .meshes
             .values()
-            .filter(|m| m.face_count > 0)
+            .filter(|m| m.face_count > 0 && m.drawn && m.mask != 0xFF)
             .count() as u32;
 
         let mut stats = self.page_stats(TerrainStats {
@@ -1992,11 +2195,11 @@ impl TerrainPass {
         let mut per_page: Vec<Vec<wgpu::util::DrawIndirectArgs>> =
             self.pages.iter().map(|_| Vec::new()).collect();
         let mut faces = 0u64;
-        for (_, rel_min, mesh) in &visible {
+        for (key, rel_min, mesh) in &visible {
             let Some((page, alloc_range)) = mesh.alloc.as_ref() else {
                 continue;
             };
-            let dirs = visible_directions(*rel_min, *rel_min + Vec3::splat(CUBE_SIZE as f32));
+            let dirs = visible_directions(*rel_min, *rel_min + cube_size(key.level));
             for (dir, dir_range) in mesh.ranges.iter().enumerate() {
                 if dir_range.is_empty() || !dirs[dir] {
                     continue;
@@ -2098,6 +2301,14 @@ impl TerrainPass {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jbm_core::coords::CubePos;
+
+    fn key(x: i32, y: i32, z: i32, level: u8) -> CubeKey {
+        CubeKey {
+            level,
+            pos: CubePos { x, y, z },
+        }
+    }
 
     fn camera() -> Camera {
         Camera::new(DVec3::ZERO, 70.0_f32.to_radians(), 1.0)
@@ -2247,21 +2458,23 @@ mod tests {
     }
 
     /// The origin formula against `Camera::relative` (f64 subtraction),
-    /// within one ulp of the result, for one cube near the camera.
-    fn check_origin(camera_pos: DVec3, pos: CubePos) {
+    /// within one ulp of the result, for one cube near the camera. The
+    /// cube's level scales its world position by 2^level.
+    fn check_origin(camera_pos: DVec3, k: CubeKey) {
         let camera = Camera::new(camera_pos, 70.0_f32.to_radians(), 1.0);
         let (cube, frac) = camera_split(camera_pos);
-        let origin = cube_origin(pos, cube, frac);
+        let origin = cube_origin(k, cube, frac);
+        let scale = f64::from(CUBE_SIZE) * f64::from(1u32 << k.level);
         let world_min = DVec3::new(
-            f64::from(pos.x) * f64::from(CUBE_SIZE),
-            f64::from(pos.y) * f64::from(CUBE_SIZE),
-            f64::from(pos.z) * f64::from(CUBE_SIZE),
+            f64::from(k.pos.x) * scale,
+            f64::from(k.pos.y) * scale,
+            f64::from(k.pos.z) * scale,
         );
         let reference = camera.relative(world_min);
         for i in 0..3 {
             assert!(
                 (origin[i] - reference[i]).abs() <= ulp(reference[i]),
-                "camera {camera_pos:?} cube {pos:?}: origin {origin:?} vs reference {reference:?}"
+                "camera {camera_pos:?} cube {k:?}: origin {origin:?} vs reference {reference:?}"
             );
         }
     }
@@ -2282,14 +2495,7 @@ mod tests {
                 for dx in -1..=1i32 {
                     for dy in -1..=1i32 {
                         for dz in -1..=1i32 {
-                            check_origin(
-                                camera,
-                                CubePos {
-                                    x: cube.x + dx,
-                                    y: cube.y + dy,
-                                    z: cube.z + dz,
-                                },
-                            );
+                            check_origin(camera, key(cube.x + dx, cube.y + dy, cube.z + dz, 0));
                         }
                     }
                 }
@@ -2359,20 +2565,14 @@ mod tests {
         book.page_added();
         // Ahead, fully in the (+,+,+) octant relative to the camera: only
         // -X, -Y, +Z face it. Page 0.
-        book.commit(CubePos { x: 1, y: 1, z: -2 }, 0, 0..18, six_ranges(), None);
+        book.commit(key(1, 1, -2, 0), 0, 0..18, six_ranges(), None, 0, true, 0);
         // Far outside the 70-degree fov on +X, ahead in z: dropped. Page 0.
-        book.commit(
-            CubePos { x: 12, y: 0, z: -1 },
-            0,
-            18..36,
-            six_ranges(),
-            None,
-        );
+        book.commit(key(12, 0, -1, 0), 0, 18..36, six_ranges(), None, 0, true, 0);
         // Behind the camera (yaw 0). Page 1.
-        book.commit(CubePos { x: 0, y: 0, z: 2 }, 1, 36..54, six_ranges(), None);
+        book.commit(key(0, 0, 2, 0), 1, 36..54, six_ranges(), None, 0, true, 0);
         // The cube containing the camera: all six directions, in any
         // frustum. Page 1.
-        book.commit(CubePos { x: 0, y: 0, z: 0 }, 1, 54..72, six_ranges(), None);
+        book.commit(key(0, 0, 0, 0), 1, 54..72, six_ranges(), None, 0, true, 0);
         let bounds = book.frustum_page_bounds(cube, frac, &frustum);
         assert_eq!(bounds, vec![3, 6]);
         assert!(
@@ -2400,21 +2600,36 @@ mod tests {
         sparse[2] = 0u32..0;
         let mut book = MeshBookkeeping::default();
         book.page_added();
-        book.commit(CubePos { x: 0, y: 0, z: 0 }, 0, 0..6, sparse, None);
+        book.commit(key(0, 0, 0, 0), 0, 0..6, sparse, None, 0, true, 0);
         let bounds =
             book.frustum_page_bounds(cube, frac, &Frustum::from_view_proj(&cam.view_proj()));
         assert_eq!(bounds, vec![4], "only the four non-empty directions count");
     }
 
     #[test]
-    fn meta_for_packs_direction_pairs() {
+    fn meta_for_packs_direction_pairs_and_level_flags() {
         let mut ranges: [Range<u32>; 6] =
             std::array::from_fn(|d| (d as u32 * 3)..(d as u32 * 3 + 3));
         ranges[1] = 0..0; // -X empty
-        let pos = CubePos { x: -4, y: 5, z: -6 };
-        let meta = meta_for(pos, 2, 100, &ranges);
+        let meta = meta_for(key(-4, 5, -6, 3), 2, 100, &ranges, 7, true, 0x05);
         assert_eq!(meta.pos_page, [-4, 5, -6, 2]);
-        assert_eq!(meta.start_flags, [100, META_ACTIVE, 0, 0]);
+        assert_eq!(
+            meta.start_flags,
+            [
+                100,
+                META_ACTIVE | (3 << META_LEVEL_SHIFT) | (0x05 << META_MASK_SHIFT),
+                7,
+                0
+            ]
+        );
+        assert_eq!(
+            unpack_meta_flags(meta.start_flags[1]),
+            (true, 3, 0x05),
+            "flags round-trip"
+        );
+        // An undrawn cube reads inactive to the cull shaders.
+        let undrawn = meta_for(key(0, 0, 0, 1), 0, 0, &ranges, 0, false, 0xFF);
+        assert_eq!(unpack_meta_flags(undrawn.start_flags[1]), (false, 1, 0xFF));
         // Direction d's (offset, count) pair is dirs[d / 2][(d % 2) * 2..].
         for (d, range) in ranges.iter().enumerate() {
             let (offset, count) = (
@@ -2437,23 +2652,19 @@ mod tests {
         for _ in 0..4 {
             book.page_added();
         }
-        let mut live: Vec<CubePos> = Vec::new();
+        let mut live: Vec<CubeKey> = Vec::new();
         let mut next_pos = 0;
         for _ in 0..10_000 {
             let op = rng.next() % 4;
             if op == 0 || live.is_empty() {
                 // Upload a new cube.
-                let pos = CubePos {
-                    x: next_pos,
-                    y: 0,
-                    z: 0,
-                };
+                let pos = key(next_pos, 0, 0, 0);
                 next_pos += 1;
                 let ranges = random_ranges(&mut rng);
                 let page = (rng.next() % 4) as usize;
                 let start = (rng.next() % 1024) as u32;
                 let len: u32 = ranges.iter().map(|r| r.len() as u32).sum();
-                book.commit(pos, page, start..start + len, ranges, None);
+                book.commit(pos, page, start..start + len, ranges, None, 0, true, 0);
                 live.push(pos);
             } else if op == 1 {
                 // Remove.
@@ -2482,7 +2693,16 @@ mod tests {
                     let start = (rng.next() % 1024) as u32;
                     let len: u32 = ranges.iter().map(|r| r.len() as u32).sum();
                     let slot = book.alloc_meta_slot();
-                    book.commit(pos, page, start..start + len, ranges, Some(slot));
+                    book.commit(
+                        pos,
+                        page,
+                        start..start + len,
+                        ranges,
+                        Some(slot),
+                        0,
+                        true,
+                        0,
+                    );
                 }
             }
             if rng.next().is_multiple_of(64) {
