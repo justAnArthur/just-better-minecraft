@@ -285,7 +285,8 @@ the rings hole tests.
   `CUBE_SIZE·2^level` wide everywhere (frustum, direction skipping,
   Hi-Z).
 - The three paths stay pixel-identical with LOD scenes (proven by the
-  rings tests); the 2.6 re-measurement of gpu-cull at ring scale is in
+  rings tests); the 2.6 re-measurement of gpu-cull at ring scale
+  (cpu-cull ≈ 621 µs vs gpu-cull ≈ 948 µs, Apple M5 Pro / Metal) is in
   the game README.
 
 ### Terrain rendering

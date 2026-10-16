@@ -87,6 +87,10 @@ Setup asserts every level has resident **and** drawn cubes (the
 coverage rule accepted the rings). `examples/cube_size_metrics.rs`
 prints the same scene per path (cull counts, frame time) and per level
 (resident, drawn, masked octants, faces, skirt faces, face-page bytes).
+Measured on Apple M5 Pro (Metal), frame mean including the GPU wait:
+`rings/cpu_cull` ≈ 621 µs vs `rings/gpu_cull` ≈ 948 µs — at ring scale
+too the extra passes cost more than the occlusion saves, so cpu-cull
+stays the default.
 
 **Autopilot (task 2.6 gate).** `JBM_AUTOFLY=<blocks> cargo run -p
 jbm-game --release` turns the app into an autopilot: once spawned it
