@@ -121,16 +121,25 @@ struct App {
     last_present: Option<Instant>,
 }
 
+/// How long the autopilot waits before re-sending a fly toggle that the
+/// server has not confirmed. A frozen physics step (spawn cube still
+/// generating) consumes the toggle without applying it, so the first
+/// attempt right after join is routinely lost; at this spacing at most
+/// one toggle is ever in flight, which keeps the flip parity safe.
+const AUTOFLY_RETRY_TOGGLE: Duration = Duration::from_secs(1);
+
 /// The `JBM_AUTOFLY` autopilot state machine.
 struct Autofly {
     /// Blocks to fly after reaching cruise altitude.
     distance: f64,
-    /// Whether the fly toggle has been sent yet.
+    /// Whether the player has been seen flying (the run is underway).
     toggled: bool,
     /// The spawn position the cruise altitude is measured from.
     origin: DVec3,
     /// Blocks flown horizontally so far.
     flown: f64,
+    /// When the last fly toggle was sent.
+    last_toggle: Instant,
 }
 
 impl Autofly {
@@ -145,7 +154,15 @@ impl Autofly {
             toggled: false,
             origin: DVec3::ZERO,
             flown: 0.0,
+            last_toggle: Instant::now(),
         })
+    }
+
+    /// Whether this tick should send another fly toggle: the player has
+    /// never been seen flying, and enough time has passed that the
+    /// previous toggle can no longer be in flight.
+    fn wants_toggle(&self, since_last_attempt: Duration) -> bool {
+        !self.toggled && since_last_attempt >= AUTOFLY_RETRY_TOGGLE
     }
 }
 
@@ -353,10 +370,12 @@ impl App {
             // Climb to 40 blocks above spawn, then straight ahead at
             // sprint speed (yaw 0: toward -Z).
             let state = predictor.state();
-            if !autofly.toggled && !state.flying {
+            if state.flying {
+                autofly.toggled = true;
+            } else if autofly.wants_toggle(autofly.last_toggle.elapsed()) {
                 fly_toggle = true;
+                autofly.last_toggle = Instant::now();
             }
-            autofly.toggled = true;
             let rising = state.position.y < autofly.origin.y + 40.0;
             stepped = jbm_core::physics::MoveInput {
                 up: rising.into(),
@@ -882,5 +901,34 @@ impl ApplicationHandler for App {
             self.input
                 .accumulate_mouse(glam::Vec2::new(delta.0 as f32, delta.1 as f32));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The autopilot re-sends the fly toggle until flying is observed:
+    /// a toggle consumed by a frozen physics step (spawn cube still
+    /// generating) is otherwise lost forever and the run never leaves
+    /// the ground. It must retry only after the retry window, and never
+    /// once flying has been seen.
+    #[test]
+    fn autofly_retries_the_fly_toggle_until_flying() {
+        let mut autofly = Autofly {
+            distance: 100.0,
+            toggled: false,
+            origin: DVec3::ZERO,
+            flown: 0.0,
+            last_toggle: Instant::now(),
+        };
+        // Fresh attempt: too soon to retry.
+        assert!(!autofly.wants_toggle(Duration::ZERO));
+        // The attempt is old: retry (the toggle may have been lost).
+        assert!(autofly.wants_toggle(AUTOFLY_RETRY_TOGGLE));
+        assert!(autofly.wants_toggle(AUTOFLY_RETRY_TOGGLE * 10));
+        // Flying observed: never again.
+        autofly.toggled = true;
+        assert!(!autofly.wants_toggle(AUTOFLY_RETRY_TOGGLE * 10));
     }
 }
