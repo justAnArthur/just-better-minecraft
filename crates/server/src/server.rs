@@ -1917,6 +1917,23 @@ mod tests {
         messages
     }
 
+    /// A drain with LOD ring traffic filtered out, for asserting exact
+    /// edit sequences. These servers keep their (default) LOD rings on, so
+    /// under 2.7 `LodCubeData` legitimately interleaves with `BlockChange`
+    /// for many ticks after a join; the edit contract itself — the change
+    /// lands before `Tick` — is unchanged.
+    fn drain_edits(client: &mut ClientLink) -> Vec<ServerMsg> {
+        drain(client)
+            .into_iter()
+            .filter(|m| {
+                !matches!(
+                    m,
+                    ServerMsg::LodCubeData { .. } | ServerMsg::UnloadLodCube { .. }
+                )
+            })
+            .collect()
+    }
+
     /// Joins, settles terrain loading, and returns the spawn state.
     fn joined_and_loaded(
         server: &mut Server,
@@ -2377,7 +2394,7 @@ mod tests {
         // Both players (both have the cube loaded) learn it before Tick.
         for client in [&mut a, &mut b] {
             assert!(matches!(
-                drain(client).as_slice(),
+                drain_edits(client).as_slice(),
                 [
                     ServerMsg::BlockChange {
                         pos,
@@ -2398,7 +2415,7 @@ mod tests {
         server.tick();
         assert_eq!(server.block(ground), Some(stone));
         assert!(matches!(
-            drain(&mut a).as_slice(),
+            drain_edits(&mut a).as_slice(),
             [
                 ServerMsg::BlockChange { state, .. },
                 ServerMsg::Tick { .. }
@@ -2487,7 +2504,7 @@ mod tests {
             server.tick();
             assert!(
                 matches!(
-                    drain(&mut a).as_slice(),
+                    drain_edits(&mut a).as_slice(),
                     [
                         ServerMsg::BlockChange { state, .. },
                         ServerMsg::Tick { .. }
@@ -2496,7 +2513,7 @@ mod tests {
                 "sender must be reverted for {msg:?}"
             );
             assert_eq!(
-                drain(&mut b).as_slice(),
+                drain_edits(&mut b).as_slice(),
                 &[ServerMsg::Tick {
                     tick: server.tick_count()
                 }],
@@ -2517,7 +2534,7 @@ mod tests {
         a.send(ClientMsg::BreakBlock { pos: unloaded }).unwrap();
         server.tick();
         assert_eq!(
-            drain(&mut a).as_slice(),
+            drain_edits(&mut a).as_slice(),
             &[ServerMsg::Tick {
                 tick: server.tick_count()
             }]
@@ -2710,24 +2727,24 @@ mod tests {
             .collect()
     }
 
-    /// Joins one player and ticks until no LOD message arrives for a full
-    /// round, returning every message seen since `start_tick`.
+    /// Joins one player and ticks until the LOD rings settle: no LOD
+    /// message for `rounds` full ticks **and** no fill work left anywhere
+    /// in the pyramid's pipeline. Under 2.7 the pyramid keeps filling (and
+    /// re-sending changed cubes) long after the first rings land, so quiet
+    /// alone is not "settled". Returns every message seen.
     fn settle_lod(server: &mut Server, client: &mut ClientLink, rounds: usize) -> Vec<ServerMsg> {
         let mut seen = Vec::new();
         let mut quiet = 0;
         while quiet < rounds {
             server.tick();
             let messages = drain(client);
-            quiet = if messages.iter().any(|m| {
+            let busy = messages.iter().any(|m| {
                 matches!(
                     m,
                     ServerMsg::LodCubeData { .. } | ServerMsg::UnloadLodCube { .. }
                 )
-            }) {
-                0
-            } else {
-                quiet + 1
-            };
+            }) || server.lod_pyramid().in_flight_total() > 0;
+            quiet = if busy { 0 } else { quiet + 1 };
             seen.extend(messages);
         }
         seen
@@ -2747,9 +2764,13 @@ mod tests {
             .filter_map(|c| c.joined_player())
             .next()
             .unwrap();
-        // Nothing outside the desired disks was sent, everything the
-        // pyramid holds inside them was sent exactly once, and the sent
-        // sets agree with what the client saw.
+        // Nothing outside the desired disks was sent, and the sent sets
+        // agree with what the client saw. A cube can appear more than
+        // once in `seen`: under 2.7 a cube's content changes when real
+        // data replaces a worldgen guess, and changed cubes are re-sent
+        // by design. Exactly-once holds for the settled state, which
+        // settle_lod proves with its quiet tail: once the pyramid has no
+        // work left, nothing re-sends.
         let mut counts = std::collections::HashMap::new();
         for &(level, pos) in &sent {
             *counts.entry((level, pos)).or_insert(0usize) += 1;
@@ -2762,14 +2783,17 @@ mod tests {
         for (index, level_state) in player.lod.iter().enumerate() {
             let level = index as u8 + 1;
             for &pos in &level_state.sent {
-                assert_eq!(counts[&(level, pos)], 1, "level {level} {pos:?}");
+                assert!(counts[&(level, pos)] >= 1, "level {level} {pos:?}");
             }
             for pos in level_state.sent.iter() {
-                let ready = server.lod_cube(level, *pos).is_some();
-                assert!(ready, "a sent cube is no longer ready (level {level})");
+                assert!(
+                    server.lod_ready(level, *pos).is_some(),
+                    "a sent cube is no longer ready (level {level})"
+                );
             }
         }
-        // Every ready cube in the desired disks is in the sent set.
+        // Every cube in the desired disks whose ready is Some is in the
+        // sent set. Held-but-not-ready cubes are correctly not sent.
         for (level, pos) in server
             .lod_pyramid()
             .iter(1)
@@ -2783,7 +2807,9 @@ mod tests {
             )
         {
             let center = crate::streaming::level_center(lod0_center, level);
-            if crate::streaming::in_desired(pos, center, 3, 2) {
+            if crate::streaming::in_desired(pos, center, 3, 2)
+                && server.lod_ready(level, pos).is_some()
+            {
                 assert!(
                     player.lod[level as usize - 1].sent.contains(&pos),
                     "ready desired cube never sent: level {level} {pos:?}"
@@ -2795,9 +2821,16 @@ mod tests {
     #[test]
     fn lod_messages_respect_the_budget_and_the_merged_walk_order() {
         let (mut server, mut client) = pending_hello_on(lod_server(3));
+        // First sends only: a cube the player already holds is a re-send
+        // of a changed cube (2.7 replaces worldgen guesses with real
+        // content), and re-sends deliberately go ahead of the walk within
+        // the budget, so they are excluded from the order check — but
+        // counted for it.
+        let mut first_sent = std::collections::HashSet::new();
         let mut order: Vec<(u8, (i32, i32, i32))> = Vec::new();
         let mut per_tick_over = 0;
-        for _ in 0..200 {
+        let mut prev_lod0_center: Option<CubePos> = None;
+        for _ in 0..400 {
             server.tick();
             let messages = drain(&mut client);
             let lod_count = split_lod(&messages).len();
@@ -2806,7 +2839,17 @@ mod tests {
             }
             let state = server.players().next().unwrap().state;
             let lod0_center = cube_containing(state.position);
+            if prev_lod0_center.is_some_and(|prev| prev != lod0_center) {
+                // A center move resets the server's walk cursor, so the
+                // send order legitimately restarts from the walk's start.
+                // Level 0 marks the segment boundary (the walk is 1-based).
+                order.push((0, (0, 0, 0)));
+            }
+            prev_lod0_center = Some(lod0_center);
             for (level, pos) in split_lod(&messages) {
+                if !first_sent.insert((level, pos)) {
+                    continue;
+                }
                 let center = crate::streaming::level_center(lod0_center, level);
                 order.push((
                     level,
@@ -2820,10 +2863,16 @@ mod tests {
         assert_eq!(per_tick_over, 0, "the per-tick budget was exceeded");
         assert!(!order.is_empty());
 
-        // The send order is a subsequence of the merged walk.
+        // The first-send order is a subsequence of the merged walk. A
+        // level-0 marker segments it at center moves; each segment
+        // matches the walk from the start.
         let walk = crate::streaming::lod_walk(3, 3, 2);
         let mut walk_index = 0;
         for entry in &order {
+            if entry.0 == 0 {
+                walk_index = 0;
+                continue;
+            }
             let mut found = false;
             while walk_index < walk.len() {
                 if walk[walk_index] == *entry {
