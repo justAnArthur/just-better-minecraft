@@ -10,7 +10,7 @@
 #
 #   jobs:
 #     release:
-#       uses: justAnArthur/just-github-actions-n-workflows/.github/workflows/release-on-tag.yml@743c6d8226fa652aeec8dc842aeac1cc423f9696
+#       uses: justAnArthur/just-github-actions-n-workflows/.github/workflows/release-on-tag.yml@48a2e1180f3c62c75b450f4c85f25d3437f21a3e
 #       with:
 #         tag: ${{ github.ref_name }}
 #
@@ -18,7 +18,7 @@
 #   (none — uses the auto-provided GITHUB_TOKEN)
 # ---
 
-# toolkit-ref: @justanarthur/just-github-actions-n-workflows@1.0.3
+# toolkit-ref: @justanarthur/just-github-actions-n-workflows@1.0.4
 name: release-on-tag
 run-name: "release — ${{ inputs.tag || github.ref_name }}"
 
@@ -48,7 +48,7 @@ jobs:
     steps:
       - name: Resolve tag metadata
         id: meta
-        uses: justAnArthur/just-github-actions-n-workflows/actions/resolve-tag-meta@743c6d8226fa652aeec8dc842aeac1cc423f9696
+        uses: justAnArthur/just-github-actions-n-workflows/actions/resolve-tag-meta@48a2e1180f3c62c75b450f4c85f25d3437f21a3e
         with:
           tag: ${{ inputs.tag || github.ref_name }}
 
@@ -59,11 +59,11 @@ jobs:
           fetch-depth: 0
 
       - name: Fetch all tags
-        uses: justAnArthur/just-github-actions-n-workflows/actions/fetch-tags@743c6d8226fa652aeec8dc842aeac1cc423f9696
+        uses: justAnArthur/just-github-actions-n-workflows/actions/fetch-tags@48a2e1180f3c62c75b450f4c85f25d3437f21a3e
 
       - name: Generate release notes
         id: release_notes
-        uses: justAnArthur/just-github-actions-n-workflows/actions/generate-release-notes@743c6d8226fa652aeec8dc842aeac1cc423f9696
+        uses: justAnArthur/just-github-actions-n-workflows/actions/generate-release-notes@48a2e1180f3c62c75b450f4c85f25d3437f21a3e
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
           root_dir: ${{ github.workspace }}
