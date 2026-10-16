@@ -347,18 +347,21 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     let base = far_color(tex, in.layer, dist, in.level);
     // Cutout: glass, leaves and holes in textures discard below 0.5 —
     // only while any texture still shows (level 0, not fully faded; a LOD
-    // cell is solid by the downsampling rule).
-    if (in.level == 0u && fade(dist) < 1.0 && tex.a < 0.5) {
+    // cell is solid by the downsampling rule). The alpha test leads so
+    // opaque fragments (almost all terrain) never evaluate the fade.
+    if (tex.a < 0.5 && in.level == 0u && fade(dist) < 1.0) {
         discard;
     }
     var color = base * in.shade;
     // Distance fog (task 2.9): blend into the sky color along this
     // fragment's view ray at the horizon — the same gradient the sky pass
     // paints behind the terrain — so the far rings dissolve into it with
-    // no visible band. See the far-look block comment above.
+    // no visible band. See the far-look block comment above. The
+    // direction reuses the already-computed distance instead of a second
+    // length() (normalize).
     let f = fog_factor(dist);
     if (f > 0.0) {
-        let dir = normalize(in.rel);
+        let dir = in.rel / dist;
         let fog_color = sky_gradient(
             vec3f(dir.x, max(dir.y, FOG_DIR_MIN_Y), dir.z),
             u.horizon_color.rgb,

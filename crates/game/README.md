@@ -6,13 +6,24 @@ a channel (see docs/design.md, "Architecture overview").
 **Wiring (task 1.4):** `main` spawns the server with
 `jbm_server::run::spawn(Server::new())` (dedicated `"jbm-server"` thread),
 builds an `in_process_pair()` link, hands the server end to the thread via
-`handle.connect(server_end)`, and runs `jbm_client::app::run(client_end)`
+`handle.connect(server_end)`, and runs
+`jbm_client::app::run_with_view(client_end, view)` (task 2.9; see
+"Far-look wiring" below)
 — the window, the link polling, the mesh pool and the terrain renderer.
 When the window closes (or the server drops the link), `app::run` returns
 and `handle.stop()` joins the server thread. The server thread is never
 detached; stopping it propagates a server panic rather than swallowing it.
 
 `Server::new()` streams generated terrain around the player (task 1.5).
+
+**Far-look wiring (task 2.9):** `main` derives a
+`jbm_client::app::ViewSetup` from its `ServerConfig` before the config
+moves into the server — the LOD0 ring radius (`view_radius ·
+CUBE_SIZE`) and the furthest ring radius (`lod_view_radius · CUBE_SIZE
+· 2^lod_levels`) — and runs the client with `app::run_with_view`. The
+client cannot learn these from the link; its terrain pass scales the
+texture→flat fade and the distance-fog windows on them (see the client
+README, "The far look").
 
 **World persistence (task 2.3):** the server saves into `saves/default`
 under the current directory. `JBM_WORLD_DIR=<path>` overrides the
