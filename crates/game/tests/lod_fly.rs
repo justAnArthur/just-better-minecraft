@@ -2,11 +2,13 @@
 //! and then 90 degrees for 300 m more, 40 blocks above the terrain at
 //! pitch -15 degrees, through the real client world, mesh pool and
 //! renderer against a threaded real server. Every 100 blocks it waits
-//! (bounded) for the server's rings to be ready and sent and the client
-//! mesh queue to drain, then checks the frame below the horizon
-//! margin. It also renders one frame *without* waiting at every stop
-//! and checks the middle half of it, which at these distances covers
-//! well inside 512 blocks of the camera. Screenshots land under
+//! (bounded) for the client mesh queue — no dirty cubes, no in-flight
+//! mesh jobs — to be clear, polled about once per 50 ms server tick;
+//! server ring readiness is never checked (whatever arrived and meshed
+//! by then is what the check sees). It then checks the frame below the
+//! horizon margin. It also renders one frame *without* waiting at every
+//! stop and checks the middle half of it, which at these distances
+//! covers well inside 512 blocks of the camera. Screenshots land under
 //! `target/fly/` for the orchestrator to inspect.
 //!
 //! The hole check tolerates pinholes: the LOD0 greedy mesher leaves
@@ -50,7 +52,7 @@ const SENTINEL: [f32; 4] = [1.0, 0.0, 1.0, 1.0];
 /// The whole test must finish within this; a hang fails instead of
 /// hanging the suite.
 const TEST_TIMEOUT: Duration = Duration::from_secs(600);
-/// Per-stop wait for the rings to complete.
+/// Per-stop wait for the client mesh queue to clear.
 const STOP_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The fly course: 1500 blocks at yaw 0 (toward -Z), then 300 at yaw
@@ -437,7 +439,8 @@ fn fly_1p5km_over_real_rings_shows_no_holes() {
                 &unwaited_path,
             );
 
-            // Wait (bounded) for the rings and the mesh queue.
+            // Wait (bounded) for the client mesh queue only; the
+            // server's rings are never polled for readiness.
             let deadline = Instant::now() + STOP_TIMEOUT;
             loop {
                 fly.frames_for_one_tick(&gpu, &camera);

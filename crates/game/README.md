@@ -105,8 +105,10 @@ slow real-server flight; run with `cargo test -p jbm-game --test
 lod_fly -- --ignored`) flies a real client against a threaded real
 server: 1.5 km straight, then a 90° turn for 300 m, 40 blocks above the
 terrain at pitch −15°. Every 100 blocks it waits (20 s cap) for the
-server's rings to be ready and sent and the client mesh queue to drain,
-then checks the sentinel pixels below the horizon margin; it also
+client mesh queue to be clear for a run of ticks (server ring readiness
+is never checked — whatever arrived and meshed by then is what the
+check sees), then checks the sentinel pixels below the horizon
+margin; it also
 renders one frame *without* waiting at every stop and checks the middle
 half of it, well inside 512 blocks of the camera (farther counts are
 only reported). The check tolerates pinholes — 4-connected sentinel
