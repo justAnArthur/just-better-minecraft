@@ -2124,7 +2124,19 @@ fn a_lod_cube_changed_while_its_save_is_in_flight_is_saved_again() {
 
     // Hold the saver; v2 (group A) goes into a batch that never commits
     // until released; v3 (group B) changes the cube again while that save
-    // is in flight.
+    // is in flight. The saver must be quiet first (`unanswered_batches`
+    // 0, its documented contract): a pre-hold batch still in its hands
+    // would consume the single `release_one_save` pass below, stranding
+    // the v2 batch until its deadline.
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    while server.unanswered_batches() > 0 {
+        server.tick();
+        drain(&mut client);
+        assert!(
+            Instant::now() < deadline,
+            "the pre-hold save batches never settled"
+        );
+    }
     let held = server.storage().expect("persistence on").clone();
     held.hold_saves();
     place_group(&mut server, &mut client, &group(0));
