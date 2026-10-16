@@ -7,9 +7,13 @@
 //! 2.7 brings). The cubes go through the real client world, coverage
 //! rule, mesher and renderer; eight cameras — close, zoomed and
 //! steep-down views straight at the LOD0/LOD1 and LOD1/LOD2 borders and
-//! a corner where three levels meet — must show **zero sentinel pixels**
-//! below the horizon margin, and the three draw paths must render the
-//! scene pixel-identically. Skipped without an adapter; 32³-only.
+//! a corner where three levels meet — must show only pinholes below
+//! the horizon margin on every draw path (gpu-cull, cpu-cull and
+//! fallback): sentinel pixels may only form 4-connected components of
+//! at most 2 px each, at most 8 such px per frame (greedy-mesher
+//! T-junction pinholes; any larger component is a real hole and
+//! fails). The three draw paths must also render the scene
+//! pixel-identically. Skipped without an adapter; 32³-only.
 
 #![cfg(not(feature = "cube16"))]
 
@@ -28,6 +32,9 @@ use jbm_client::render::chunks::{TerrainPass, TerrainPath};
 use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
 use jbm_client::render::texture_array::BlockTextures;
+use jbm_client::testing::holes::{
+    assert_only_pinholes, component_details, describe_holes, sentinel_components,
+};
 use jbm_client::testing::screenshot::{assert_matches_golden, gpu_or_skip};
 use jbm_client::world::ClientWorld;
 use jbm_core::block::{BlockRegistry, BlockStateId, builtin::Blocks};
@@ -337,14 +344,14 @@ fn row_of_angle(camera: &Camera, angle: f64, height: u32) -> f64 {
     (0.5 - ndc_y * 0.5) * f64::from(height)
 }
 
-/// Counts pure-sentinel pixels below the horizon margin. The margin
-/// covers everything the sky legitimately shows below the horizon: the
-/// ~15 degree horizon-to-ground fade (pure ground color only below
-/// `asin(0.25)`) and the rings' far edge, whose drop angle is
-/// `atan(camera height above the terrain / ring extent)`; plus two rows
-/// of rasterization slop. Documented per camera in the test output.
-fn sentinel_count_below_margin(image: &RgbaImage, camera: &Camera) -> (usize, usize, f64) {
-    let height = image.height();
+/// The checked region for the hole rule: all columns from the
+/// horizon-margin row down. The margin covers everything the sky
+/// legitimately shows below the horizon: the ~15 degree
+/// horizon-to-ground fade (pure ground color only below `asin(0.25)`)
+/// and the rings' far edge, whose drop angle is `atan(camera height
+/// above the terrain / ring extent)`; plus two rows of rasterization
+/// slop. Documented per camera in the test output.
+fn below_margin_region(camera: &Camera, height: u32) -> (u32, u32, u32, u32) {
     let fade_rows = row_of_angle(camera, (0.25f64).asin(), height);
     let horizon_rows = row_of_angle(camera, 0.0, height);
     // The rings are a disk of this radius around the scene centre; a
@@ -364,18 +371,7 @@ fn sentinel_count_below_margin(image: &RgbaImage, camera: &Camera) -> (usize, us
     // the edge peek under the terrain for a few rows.
     let margin = (fade_rows - horizon_rows).max(edge_rows - horizon_rows) + 8.0;
     let start_row = (horizon_rows + margin).ceil() as u32;
-    let mut count = 0;
-    let mut counted = 0;
-    for y in start_row.min(height)..height {
-        for x in 0..image.width() {
-            let p = image.get_pixel(x, y);
-            if p[0] >= 250 && p[1] <= 5 && p[2] >= 250 {
-                count += 1;
-            }
-            counted += 1;
-        }
-    }
-    (count, counted, margin)
+    (0, start_row.min(height), SIZE, height)
 }
 
 /// The eight cameras. `name`, camera, and whether this one gets a golden.
@@ -549,24 +545,69 @@ fn rings_scene_has_no_holes_below_the_horizon_margin() {
 
     std::fs::create_dir_all(artifact_dir()).expect("create artifact dir");
     for (name, camera, golden) in cameras() {
+        // The pinhole rule holds on every draw path, not just the
+        // default one. Switch paths, let the two-phase state settle,
+        // then check — same protocol as the pixel-identity test.
+        for path in [
+            TerrainPath::GpuCull,
+            TerrainPath::CpuCull,
+            TerrainPath::Fallback,
+        ] {
+            terrain.set_prefer_gpu_cull(path == TerrainPath::GpuCull);
+            terrain.set_force_cpu_cull(path == TerrainPath::CpuCull);
+            terrain.set_force_fallback(path == TerrainPath::Fallback);
+            let available = match path {
+                TerrainPath::GpuCull => terrain.gpu_cull_available(),
+                TerrainPath::CpuCull => terrain.uses_mdi(),
+                TerrainPath::Fallback => true,
+            };
+            if available {
+                assert_eq!(terrain.path(), path, "rings {name}: {path:?} not active");
+            }
+            // Three frames so the two-phase state settles, then check.
+            for _ in 0..3 {
+                let _ =
+                    render_sentinel(&gpu, &mut renderer, &target, &depth, &mut terrain, &camera);
+            }
+            let image =
+                render_sentinel(&gpu, &mut renderer, &target, &depth, &mut terrain, &camera);
+            let region = below_margin_region(&camera, image.height());
+            let components = sentinel_components(&image, region);
+            println!(
+                "rings {name} {path:?} (active {:?}, {}): {} below margin row {}: {}",
+                terrain.path(),
+                if available {
+                    "available"
+                } else {
+                    "unavailable"
+                },
+                describe_holes(&components),
+                region.1,
+                component_details(&components),
+            );
+            // Only pinholes: components of at most 2 px, at most 8 pinhole
+            // px per frame. Anything larger — a missing skirt, a wrong
+            // border shows as a long strip — fails. The pinholes
+            // themselves are the greedy mesher's T-junction seams, where
+            // a pixel center landing within ~1/100 px of a seam is
+            // claimed by neither face.
+            assert_only_pinholes(
+                &image,
+                region,
+                &format!("rings {name} {path:?}"),
+                &artifact_dir().join(format!("{name}_{}.png", path_stem(path))),
+            );
+        }
+        // Back to the default draw path for the artifact and goldens.
+        terrain.set_prefer_gpu_cull(false);
+        terrain.set_force_cpu_cull(false);
+        terrain.set_force_fallback(false);
+        for _ in 0..3 {
+            let _ = render_sentinel(&gpu, &mut renderer, &target, &depth, &mut terrain, &camera);
+        }
         let image = render_sentinel(&gpu, &mut renderer, &target, &depth, &mut terrain, &camera);
-        let (sentinels, counted, margin) = sentinel_count_below_margin(&image, &camera);
-        println!(
-            "rings {name}: {sentinels} sentinel pixels in {counted} counted rows (margin {margin:.1} rows)"
-        );
         let path = artifact_dir().join(format!("{name}.png"));
         image.save(&path).expect("save rings image");
-        // Zero holes, minus a whisker for a pre-2.6 artifact: greedy
-        // merging leaves T-junction seams, and a pixel center landing
-        // within ~1/100 px of a seam can be claimed by neither face —
-        // a pinhole of at most a few pixels per view. Any real LOD gap
-        // (a missing skirt, a wrong border) is orders of magnitude
-        // larger; the bound stays far below it.
-        assert!(
-            sentinels <= 12,
-            "rings {name}: {sentinels} holes below the horizon margin (limit 12; image: {})",
-            path.display()
-        );
         if golden {
             assert_matches_golden(&format!("rings_{name}"), &image);
         }
@@ -842,8 +883,11 @@ fn masked_octants_hide_their_volume_and_full_masks_draw_nothing() {
     terrain.set_draw_state(&gpu, key, true, 0x01);
     let camera = looking_at(DVec3::new(96.0, 80.0, 96.0), DVec3::new(30.0, 30.0, 30.0));
     let image = render_sentinel(&gpu, &mut renderer, &target, &depth, &mut terrain, &camera);
-    let (sentinels, _, _) = sentinel_count_below_margin(&image, &camera);
-    assert!(sentinels > 0, "a masked octant must reveal the sentinel");
+    let components = sentinel_components(&image, below_margin_region(&camera, image.height()));
+    assert!(
+        !components.is_empty(),
+        "a masked octant must reveal the sentinel"
+    );
 
     // Fully masked: no commands on any path.
     for path in [
@@ -910,6 +954,15 @@ fn clone_camera(camera: &Camera) -> Camera {
     copy.set_yaw(camera.yaw);
     copy.set_pitch(camera.pitch);
     copy
+}
+
+/// File-stem token for a draw path, for per-path artifact names.
+fn path_stem(path: TerrainPath) -> &'static str {
+    match path {
+        TerrainPath::GpuCull => "gpucull",
+        TerrainPath::CpuCull => "cpucull",
+        TerrainPath::Fallback => "fallback",
+    }
 }
 
 /// A zoomed variant of a camera (narrower fov): for the "zoomed" views.
