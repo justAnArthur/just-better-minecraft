@@ -9,6 +9,12 @@ rust-version = "1.98.1"
 license = "MIT OR Apache-2.0"
 publish = false
 
+# Release automation (just-github-actions-n-workflows): the whole workspace
+# is one versioned module, tagged jbm@<version>.
+[workspace.metadata.justactions]
+name = "jbm"
+gitCommitScopeRelatedNames = ["core", "client", "server", "game", "modhost", "testkit"]
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 

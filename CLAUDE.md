@@ -41,7 +41,12 @@ Each crate has a `README.md` with purpose, public API and invariants. Read that 
 - Hot paths (meshing, collision, light) never call into mods.
 - No Mojang code or assets. Clean-room only.
 - Tests: unit tests next to code; integration tests in `crates/*/tests/`. Renderer changes need screenshot tests; perf-sensitive code needs a `criterion` bench.
-- Git: one branch per task, `task/<id>`. Commit messages are plain imperative sentences. **Never add `Co-Authored-By` trailers, "Generated with" lines or any AI/agent attribution** to commits or PRs.
+- Git: one branch per task, `task/<id>`. Commit messages follow Conventional Commits (see "Commits and releases" below). **Never add `Co-Authored-By` trailers, "Generated with" lines or any AI/agent attribution** to commits or PRs.
+
+## Commits and releases
+
+- Commits use Conventional Commits with a scope: `core`, `client`, `server`, `game`, `modhost`, `testkit`. Comma-separate several scopes, e.g. `fix(client,server): ...`. `feat` bumps the minor version, other types bump patch, a trailing `!` bumps major. Unscoped commits (or unknown scopes) do not release anything.
+- Merging to `main` bumps the workspace version, tags `jbm@<version>`, and publishes a GitHub release with Linux x86_64 and macOS arm64 binaries of the game.
 
 ## How work is done (orchestrator + GLM workers)
 

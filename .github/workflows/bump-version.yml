@@ -1,0 +1,137 @@
+# bump-version.yml
+# ---
+# auto-bumps manifest versions using conventional commits.
+#
+# copy this file into your repo's `.github/workflows/` and adjust
+# the `push.branches` trigger to match your default branch.
+#
+# can also be called as a reusable workflow from another workflow:
+#
+#   jobs:
+#     bump:
+#       uses: justAnArthur/just-github-actions-n-workflows/.github/workflows/bump-version.yml@48a2e1180f3c62c75b450f4c85f25d3437f21a3e
+#       with:
+#         bump_type: "minor:canary"
+#
+# release tags are pushed with GITHUB_TOKEN, and GitHub never starts
+# workflows from pushes made with that token. so after tagging, this
+# workflow dispatches every installed workflow whose `push.tags` filter
+# matches a new tag (publish-npm-on-tag, publish-docker-on-tag,
+# release-on-tag, deploy-vercel-on-tag, and copies of them) on the tag
+# ref, with the tag as their `tag` input. that's why it needs
+# `actions: write` — a reusable-workflow caller must grant it too.
+#
+# required secrets:
+#   (none — uses the auto-provided GITHUB_TOKEN)
+# ---
+
+# toolkit-ref: @justanarthur/just-github-actions-n-workflows@1.0.4
+name: bump-version
+run-name: >-
+  ${{
+    github.event_name == 'workflow_dispatch'
+      && format('bump-version (manual) — type={0}, stable={1}',
+           inputs.bump_type || 'auto',
+           inputs.bump_to_calculated_stable || 'false')
+      || format('bump-version (auto) — {0}',
+           github.event.head_commit.message || github.ref_name)
+  }}
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      bump_type:
+        description: >
+          version bump type.
+          append `:<channel>` for prerelease
+          (e.g. "minor:canary", "patch:stable", "minor:beta").
+        type: string
+        required: false
+        default: ""
+      bump_to_calculated_stable:
+        description: "promote current prerelease to stable based on commit history"
+        type: string
+        required: false
+        default: "false"
+      bump_manifest_names:
+        description: "comma-separated manifest names to bump (empty = all)"
+        type: string
+        required: false
+        default: ""
+      bump_prerelease_channel:
+        description: >
+          prerelease channel label (e.g. "canary", "beta", "alpha", "rc").
+          defaults to "canary" when omitted.
+        type: string
+        required: false
+        default: "canary"
+  workflow_call:
+    inputs:
+      bump_type:
+        type: string
+        required: false
+        default: ""
+      bump_to_calculated_stable:
+        type: string
+        required: false
+        default: "false"
+      bump_manifest_names:
+        type: string
+        required: false
+        default: ""
+      bump_prerelease_channel:
+        type: string
+        required: false
+        default: "canary"
+
+permissions:
+  contents: write
+  packages: write
+  actions: write
+
+jobs:
+  bump-version:
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'workflow_call' ||
+      !contains(github.event.head_commit.message, '[skip bump]')
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: "true"
+          lfs: true
+
+      - name: Fetch all tags and history
+        uses: justAnArthur/just-github-actions-n-workflows/actions/fetch-tags@48a2e1180f3c62c75b450f4c85f25d3437f21a3e
+
+      - name: Configure git user
+        id: git_user
+        uses: justAnArthur/just-github-actions-n-workflows/actions/configure-git-user@48a2e1180f3c62c75b450f4c85f25d3437f21a3e
+        with:
+          mode: ${{ github.event_name == 'push' && 'push' || 'dispatch' }}
+
+      - name: Bump version
+        id: bump
+        uses: justAnArthur/just-github-actions-n-workflows/actions/bump-version@48a2e1180f3c62c75b450f4c85f25d3437f21a3e
+        with:
+          bump_to_calculated_stable: ${{ inputs.bump_to_calculated_stable || 'false' }}
+          bump_type_and_channel: ${{ inputs.bump_type || '' }}
+          bump_manifest_names: ${{ inputs.bump_manifest_names || '' }}
+          prerelease_channel: ${{ inputs.bump_prerelease_channel || 'canary' }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          github_event: ${{ toJson(github.event) }}
+          co_author_name: ${{ steps.git_user.outputs.co_author_name }}
+          co_author_email: ${{ steps.git_user.outputs.co_author_email }}
+
+      - name: Dispatch tag-triggered workflows
+        if: ${{ !cancelled() && steps.bump.outputs.tags != '' }}
+        uses: justAnArthur/just-github-actions-n-workflows/actions/dispatch-tag-workflows@48a2e1180f3c62c75b450f4c85f25d3437f21a3e
+        with:
+          tags: ${{ steps.bump.outputs.tags }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
