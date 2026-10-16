@@ -18,8 +18,8 @@
 //! must therefore form 4-connected components of at most 2 pixels, at
 //! most 8 such pixels per frame; anything bigger — a ring-border crack
 //! is a long strip — fails. Eliminating the T-junctions in the mesher
-//! is a follow-up. The detector itself is plain code over a pixel
-//! buffer and is unit-tested without a GPU.
+//! is a follow-up. The detector lives in `jbm_client::testing::holes`
+//! (shared with the rings-scene test) and is unit-tested without a GPU.
 #![cfg(not(feature = "cube16"))]
 
 use std::sync::Arc;
@@ -37,6 +37,7 @@ use jbm_client::render::renderer::{
     DepthTarget, FrameInputs, HORIZON_COLOR, Renderer, ZENITH_COLOR,
 };
 use jbm_client::render::texture_array::BlockTextures;
+use jbm_client::testing::holes::{assert_only_pinholes, describe_holes, sentinel_components};
 use jbm_client::world::ClientWorld;
 use jbm_core::link::ClientLink;
 use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION, ServerMsg};
@@ -213,86 +214,6 @@ impl FlyClient {
     }
 }
 
-/// A 4-connected component of sentinel pixels in a checked region.
-struct HoleComponent {
-    pixels: Vec<(u32, u32)>,
-}
-
-impl HoleComponent {
-    fn size(&self) -> usize {
-        self.pixels.len()
-    }
-
-    /// The min and max corners of the bounding box, in image pixels.
-    fn bounds(&self) -> ((u32, u32), (u32, u32)) {
-        let mut min = (u32::MAX, u32::MAX);
-        let mut max = (0, 0);
-        for &(x, y) in &self.pixels {
-            min.0 = min.0.min(x);
-            min.1 = min.1.min(y);
-            max.0 = max.0.max(x);
-            max.1 = max.1.max(y);
-        }
-        (min, max)
-    }
-}
-
-/// A pinhole is at most this many pixels in one component.
-const PINHOLE_MAX_PIXELS: usize = 2;
-/// At most this many pinhole pixels per frame in the checked region.
-const PINHOLE_MAX_TOTAL: usize = 8;
-/// Highlight for offending components in debug images; must differ
-/// from the magenta sentinel and the sky gradient.
-const HOLE_HIGHLIGHT: [u8; 4] = [255, 255, 0, 255];
-
-fn is_sentinel(p: &image::Rgba<u8>) -> bool {
-    p[0] >= 250 && p[1] <= 5 && p[2] >= 250
-}
-
-/// The 4-connected components of sentinel pixels inside `region`
-/// (`x0..x1` by `y0..y1`, end-exclusive).
-fn sentinel_components(
-    image: &image::RgbaImage,
-    region: (u32, u32, u32, u32),
-) -> Vec<HoleComponent> {
-    let (x0, y0, x1, y1) = region;
-    let stride = x1 - x0;
-    let mut visited = vec![false; (stride * (y1 - y0)) as usize];
-    let in_region = |x: i64, y: i64| {
-        x >= i64::from(x0) && x < i64::from(x1) && y >= i64::from(y0) && y < i64::from(y1)
-    };
-    let mut components = Vec::new();
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let entry = ((y - y0) * stride + (x - x0)) as usize;
-            if visited[entry] || !is_sentinel(image.get_pixel(x, y)) {
-                continue;
-            }
-            // Flood fill from (x, y).
-            let mut pixels = Vec::new();
-            let mut stack = vec![(x, y)];
-            visited[entry] = true;
-            while let Some((cx, cy)) = stack.pop() {
-                pixels.push((cx, cy));
-                for (dx, dy) in [(1_i64, 0), (-1, 0), (0, 1), (0, -1)] {
-                    let (nx, ny) = (i64::from(cx) + dx, i64::from(cy) + dy);
-                    if !in_region(nx, ny) {
-                        continue;
-                    }
-                    let (nx, ny) = (nx as u32, ny as u32);
-                    let neighbor = ((ny - y0) * stride + (nx - x0)) as usize;
-                    if !visited[neighbor] && is_sentinel(image.get_pixel(nx, ny)) {
-                        visited[neighbor] = true;
-                        stack.push((nx, ny));
-                    }
-                }
-            }
-            components.push(HoleComponent { pixels });
-        }
-    }
-    components
-}
-
 /// The row margin per camera: the sky's ~15 degree below-horizon fade
 /// (pure ground color only below `asin(0.25)`) plus the rings' far-edge
 /// drop angle, plus slack for the outer cubes' missing far walls.
@@ -325,158 +246,6 @@ fn near_region() -> (u32, u32, u32, u32) {
         WIDTH - WIDTH / 4,
         HEIGHT - HEIGHT / 4,
     )
-}
-
-/// "N components, largest M px, T sentinel px" — the per-stop report.
-fn describe_holes(components: &[HoleComponent]) -> String {
-    let largest = components
-        .iter()
-        .map(HoleComponent::size)
-        .max()
-        .unwrap_or(0);
-    let total: usize = components.iter().map(HoleComponent::size).sum();
-    let count = components.len();
-    format!("{count} components, largest {largest} px, {total} sentinel px")
-}
-
-/// Pixels in components small enough to be pinholes.
-fn pinhole_total(components: &[HoleComponent]) -> usize {
-    components
-        .iter()
-        .filter(|c| c.size() <= PINHOLE_MAX_PIXELS)
-        .map(HoleComponent::size)
-        .sum()
-}
-
-/// Whether every component is a pinhole and they fit the per-frame cap.
-fn only_pinholes(components: &[HoleComponent]) -> bool {
-    components.iter().all(|c| c.size() <= PINHOLE_MAX_PIXELS)
-        && pinhole_total(components) <= PINHOLE_MAX_TOTAL
-}
-
-/// The per-stop hole check: sentinel pixels in `region` must be pinhole
-/// components only, within the per-frame cap. Prints the stats; on
-/// failure saves the frame at `image_path`, saves a debug image with
-/// the offending components highlighted next to it, and panics with
-/// their bounding boxes.
-fn assert_only_pinholes(
-    image: &image::RgbaImage,
-    region: (u32, u32, u32, u32),
-    label: &str,
-    image_path: &std::path::Path,
-) {
-    let components = sentinel_components(image, region);
-    println!("{label}: {}", describe_holes(&components));
-    if only_pinholes(&components) {
-        return;
-    }
-    let oversized = components
-        .iter()
-        .filter(|c| c.size() > PINHOLE_MAX_PIXELS)
-        .count();
-    // On a total-cap failure every component contributes; otherwise
-    // only the oversized ones offend.
-    let over_total = pinhole_total(&components) > PINHOLE_MAX_TOTAL;
-    let offending: Vec<&HoleComponent> = if over_total {
-        components.iter().collect()
-    } else {
-        components
-            .iter()
-            .filter(|c| c.size() > PINHOLE_MAX_PIXELS)
-            .collect()
-    };
-    let mut debug = image.clone();
-    for component in &offending {
-        for &(x, y) in &component.pixels {
-            debug.put_pixel(x, y, image::Rgba(HOLE_HIGHLIGHT));
-        }
-    }
-    let debug_path = image_path.with_extension("holes.png");
-    std::fs::create_dir_all(image_path.parent().unwrap()).ok();
-    image.save(image_path).ok();
-    debug.save(&debug_path).ok();
-    let boxes: Vec<String> = offending
-        .iter()
-        .map(|c| {
-            let ((min_x, min_y), (max_x, max_y)) = c.bounds();
-            format!("({min_x},{min_y})..({max_x},{max_y}) {}px", c.size())
-        })
-        .collect();
-    panic!(
-        "{label}: holes beyond pinhole tolerance ({PINHOLE_MAX_PIXELS} px per \
-         component, {PINHOLE_MAX_TOTAL} px per frame): {oversized} oversized \
-         components, pinhole total {}, offending [{}]; images {} and {}",
-        pinhole_total(&components),
-        boxes.join(", "),
-        image_path.display(),
-        debug_path.display(),
-    );
-}
-
-/// A black frame with sentinel pixels at the given coordinates, for the
-/// detector's unit test.
-fn synthetic_frame(sentinels: &[(u32, u32)]) -> image::RgbaImage {
-    let mut image = image::RgbaImage::from_pixel(WIDTH, HEIGHT, image::Rgba([0, 0, 0, 255]));
-    for &(x, y) in sentinels {
-        image.put_pixel(x, y, image::Rgba([255, 0, 255, 255]));
-    }
-    image
-}
-
-#[test]
-fn hole_detector_distinguishes_pinholes_from_holes() {
-    let region = near_region();
-
-    // Isolated single pixels (diagonals do not connect: 4-connected)
-    // and a horizontal 2-pixel pair are pinholes.
-    let pinholes = synthetic_frame(&[
-        (WIDTH / 4 + 4, HEIGHT / 4 + 4),
-        (WIDTH / 4 + 5, HEIGHT / 4 + 5),
-        (WIDTH / 4 + 40, HEIGHT / 4 + 4),
-        (WIDTH / 4 + 60, HEIGHT / 4 + 20),
-        (WIDTH / 4 + 61, HEIGHT / 4 + 20),
-    ]);
-    let components = sentinel_components(&pinholes, region);
-    assert_eq!(components.iter().map(HoleComponent::size).sum::<usize>(), 5);
-    assert_eq!(components.len(), 4, "the pair merges, diagonals do not");
-    assert!(only_pinholes(&components));
-
-    // A 3-pixel L shape is too big for a pinhole.
-    let l_shape = synthetic_frame(&[
-        (WIDTH / 4 + 10, HEIGHT / 4 + 10),
-        (WIDTH / 4 + 11, HEIGHT / 4 + 10),
-        (WIDTH / 4 + 10, HEIGHT / 4 + 11),
-    ]);
-    let components = sentinel_components(&l_shape, region);
-    assert_eq!(components.len(), 1);
-    assert_eq!(components[0].size(), 3);
-    assert!(!only_pinholes(&components));
-
-    // A 1x20 strip — the shape of a ring-border crack — fails.
-    let strip: Vec<(u32, u32)> = (0..20)
-        .map(|i| (WIDTH / 4 + 30, HEIGHT / 4 + 10 + i))
-        .collect();
-    let components = sentinel_components(&synthetic_frame(&strip), region);
-    assert_eq!(components.len(), 1);
-    assert_eq!(components[0].size(), 20);
-    assert_eq!(
-        components[0].bounds(),
-        (
-            (WIDTH / 4 + 30, HEIGHT / 4 + 10),
-            (WIDTH / 4 + 30, HEIGHT / 4 + 29)
-        )
-    );
-    assert!(!only_pinholes(&components));
-
-    // Nine scattered singles pass the component size but bust the
-    // per-frame total of 8.
-    let scattered: Vec<(u32, u32)> = (0..9)
-        .map(|i| (WIDTH / 4 + 5 * i, HEIGHT / 4 + 50))
-        .collect();
-    let components = sentinel_components(&synthetic_frame(&scattered), region);
-    assert_eq!(components.len(), 9);
-    assert_eq!(pinhole_total(&components), 9);
-    assert!(!only_pinholes(&components));
 }
 
 #[test]
