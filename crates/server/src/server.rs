@@ -2764,13 +2764,15 @@ mod tests {
             .filter_map(|c| c.joined_player())
             .next()
             .unwrap();
-        // Nothing outside the desired disks was sent, and the sent sets
-        // agree with what the client saw. A cube can appear more than
-        // once in `seen`: under 2.7 a cube's content changes when real
-        // data replaces a worldgen guess, and changed cubes are re-sent
-        // by design. Exactly-once holds for the settled state, which
-        // settle_lod proves with its quiet tail: once the pyramid has no
-        // work left, nothing re-sends.
+        // Nothing outside the desired disks was sent, and every cube the
+        // server recorded as sent was received. A cube can appear more
+        // than once in the fill history: under 2.7 a cube's content
+        // changes when real data replaces a worldgen guess (the
+        // `merge` → `touch` → `take_changed` chain in lod.rs), and
+        // changed cubes are re-sent by design via the re-send queue in
+        // stream_player_lod step 2. Exactly-once is therefore asserted on
+        // the settled window below, where those re-sends are provably
+        // done.
         let mut counts = std::collections::HashMap::new();
         for &(level, pos) in &sent {
             *counts.entry((level, pos)).or_insert(0usize) += 1;
@@ -2783,14 +2785,25 @@ mod tests {
         for (index, level_state) in player.lod.iter().enumerate() {
             let level = index as u8 + 1;
             for &pos in &level_state.sent {
-                assert!(counts[&(level, pos)] >= 1, "level {level} {pos:?}");
-            }
-            for pos in level_state.sent.iter() {
                 assert!(
-                    server.lod_ready(level, *pos).is_some(),
+                    counts.get(&(level, pos)).is_some_and(|&n| n >= 1),
+                    "a cube in the sent set was never received: level {level} {pos:?}"
+                );
+                assert!(
+                    server.lod_ready(level, pos).is_some(),
                     "a sent cube is no longer ready (level {level})"
                 );
             }
+        }
+        // The bookkeeping agrees two-sidedly: every cube received is one
+        // the server recorded as sent. With no inputs the level centers
+        // never move, so nothing was unloaded out of the sent sets — a
+        // received-but-unrecorded cube would be an untracked send.
+        for &(level, pos) in counts.keys() {
+            assert!(
+                player.lod[level as usize - 1].sent.contains(&pos),
+                "a cube was received but never recorded as sent: level {level} {pos:?}"
+            );
         }
         // Every cube in the desired disks whose ready is Some is in the
         // sent set. Held-but-not-ready cubes are correctly not sent.
@@ -2816,6 +2829,38 @@ mod tests {
                 );
             }
         }
+
+        // Exactly-once, settled window: after the pyramid is quiet, no
+        // cube may be sent again. Zero LOD traffic here is a
+        // code-guaranteed absence, not a guess: settle_lod returned only
+        // after no LOD traffic for 10 full ticks with in_flight_total()
+        // at zero, so no fill job can land to change a cube (`merge` →
+        // `touch` → `take_changed` reports nothing) — and any leftover
+        // re-send queue entry would itself have been traffic, since step 2
+        // drains the queue first within the budget. Every desired cube is
+        // already sent (asserted above), which leaves the walk cursor at
+        // the end of the walk with nothing to scan. And with no inputs the
+        // level centers never move, so step 1 unloads nothing. Any
+        // LodCubeData in this window is a re-send of an unchanged cube;
+        // any UnloadLodCube, an unload without a center move — both bugs.
+        // 20 ticks is a full walk pass either way: 435 entries at the
+        // budget of 32 need 14.
+        let mut window = Vec::new();
+        for _ in 0..20 {
+            server.tick();
+            window.extend(drain(&mut client));
+        }
+        let resent = split_lod(&window);
+        assert!(
+            resent.is_empty(),
+            "{resent:?} re-sent after the pyramid settled"
+        );
+        assert!(
+            !window
+                .iter()
+                .any(|m| matches!(m, ServerMsg::UnloadLodCube { .. })),
+            "an unload happened with a static center"
+        );
     }
 
     #[test]
