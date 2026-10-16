@@ -264,7 +264,9 @@ the `StorageError` instead, and opens storage *first* so the stored seed
 feeds the generator), `add_connection(ServerLink)`, `tick()` runs exactly
 one tick, `update(elapsed) -> u32` feeds the clock and runs every due tick. Read access for tests:
 `tick_count()`, `dropped_ticks()`, `players()`, `world_cube_count()`,
-`in_flight()`, `sent_count(PlayerId)`.
+`in_flight()`, `sent_count(PlayerId)`. Bench and test hook:
+`teleport_player(PlayerId, DVec3)` moves a player's authoritative state
+without physics; the next tick's streaming observes the new center.
 
 `ServerConfig` (all fields public):
 
@@ -606,8 +608,9 @@ Current cases:
 - `lod/stream_settled` (task 2.6, `lod_stream_bench.rs`) — one streaming
   tick of a player whose rings have settled at game scale: the idle
   floor.
-- `lod/stream_moving` — a player sprint-flying across level-1 boundaries
-  every second cube: center moves, cursor resets and keep-set unloads.
+- `lod/stream_moving` — a player teleported one level-1 cube (64 blocks)
+  every iteration, alternating between two adjacent level-1 cubes so each
+  sample takes the center move, the cursor reset and the keep-set unloads.
 - `lod/fill_poll` (task 2.7) — one inline poll that fills one requested
   surface cube (one `sample_lod` plus the merge).
 

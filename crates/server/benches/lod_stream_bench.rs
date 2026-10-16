@@ -3,14 +3,39 @@
 //! - `lod/stream_settled` — one streaming tick of a player whose rings are
 //!   complete and who stands still: the idle floor, expected near zero
 //!   work beyond the per-level center checks.
-//! - `lod/stream_moving` — a player crossing a level-1 boundary every
-//!   tick: the center moves, the walk cursor resets and the keep-set
-//!   unload scan runs.
+//! - `lod/stream_moving` — a player teleported one level-1 cube (64
+//!   blocks) every iteration, alternating between two adjacent level-1
+//!   cubes: every sample takes the level-1 center change, the walk
+//!   cursor reset and the keep-set unloads. Real sprint-fly speed
+//!   (~1.1 blocks/tick) crosses a 64-block boundary only about every 58
+//!   ticks, so driving this with inputs would measure mostly idle ticks.
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use glam::DVec3;
+use jbm_core::coords::{BlockPos, CUBE_SIZE};
 use jbm_core::link::in_process_pair;
 use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION};
 use jbm_server::server::{Server, ServerConfig};
+
+/// Side length of a level-1 cube in blocks: two LOD0 cubes.
+const LEVEL1_BLOCKS: f64 = CUBE_SIZE as f64 * 2.0;
+
+/// The level-1 cube containing `pos`, per axis (must match
+/// `streaming::level_center`: `lod0.div_euclid(2)`).
+fn level1_of(pos: DVec3) -> [i32; 3] {
+    let lod0 = BlockPos {
+        x: pos.x.floor() as i64,
+        y: pos.y.floor() as i64,
+        z: pos.z.floor() as i64,
+    }
+    .split()
+    .0;
+    [
+        lod0.x.div_euclid(2),
+        lod0.y.div_euclid(2),
+        lod0.z.div_euclid(2),
+    ]
+}
 
 fn lod_config() -> ServerConfig {
     ServerConfig {
@@ -59,21 +84,6 @@ fn settle(server: &mut Server, client: &mut jbm_core::link::ClientLink) {
     panic!("the rings never settled");
 }
 
-fn fly_input(yaw: f32, up: bool, fly_toggle: bool) -> ClientMsg {
-    ClientMsg::PlayerInput {
-        seq: 0,
-        input: jbm_core::physics::MoveInput {
-            fly_toggle,
-            up: up.into(),
-            forward: (!up).into(),
-            sprint: true,
-            yaw,
-            ..jbm_core::physics::MoveInput::IDLE
-        },
-        pitch: 0.0,
-    }
-}
-
 fn bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("lod");
 
@@ -105,25 +115,25 @@ fn bench(c: &mut Criterion) {
             })
             .unwrap();
         settle(&mut server, &mut client);
-        // Sprint-fly east, rising first so terrain never blocks: the
-        // level-1 center crosses a boundary every second cube, well
-        // within the loop.
-        let mut seq = 0u64;
-        let east = std::f32::consts::FRAC_PI_2;
+        // Alternate between the spawn and a spot one level-1 cube east.
+        // The teleport itself is O(1) bookkeeping, deliberately inside
+        // the timed closure: the measured work is the tick that reacts
+        // to it. No inputs are sent, so physics never steps and the
+        // state sits exactly where each teleport puts it.
+        let id = server.players().next().unwrap().id;
+        let home = server.players().next().unwrap().state.position;
+        let away = DVec3::new(home.x + LEVEL1_BLOCKS, home.y, home.z);
+        // The sequence is period-2 over exactly these two positions, so
+        // one comparison covers every consecutive pair.
+        assert_ne!(
+            level1_of(home),
+            level1_of(away),
+            "adjacent iterations must sit in different level-1 cubes"
+        );
+        let mut at_away = false;
         b.iter(|| {
-            let flying = server.players().next().unwrap().state.flying;
-            let rising = server.players().next().unwrap().state.position.y < 200.0;
-            let mut msg = fly_input(east, rising, !flying);
-            seq += 1;
-            if let ClientMsg::PlayerInput {
-                seq: s,
-                input: _,
-                pitch: _,
-            } = &mut msg
-            {
-                *s = seq;
-            }
-            client.send(msg).unwrap();
+            at_away = !at_away;
+            server.teleport_player(id, if at_away { away } else { home });
             server.tick();
             while let Ok(Some(_)) = client.try_recv() {}
         });

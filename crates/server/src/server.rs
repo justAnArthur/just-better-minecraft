@@ -558,6 +558,21 @@ impl Server {
         self.world.len()
     }
 
+    /// Test and bench access: teleport the player to `position`, bypassing
+    /// physics. The next tick's streaming phases observe the moved center
+    /// exactly as they would after a real teleport; no inputs are queued,
+    /// so the state sits at `position` until the next call.
+    pub fn teleport_player(&mut self, id: PlayerId, position: DVec3) {
+        for conn in &mut self.connections {
+            if let ConnectionState::Joined(player) = &mut conn.state
+                && player.id == id
+            {
+                player.state.position = position;
+                return;
+            }
+        }
+    }
+
     /// The level-`level` LOD cube at `pos`, when the pyramid holds one
     /// (levels are 1-based; `lod_levels` bounds the top).
     pub fn lod_cube(&self, level: u8, pos: CubePos) -> Option<&jbm_core::cube::Cube> {
