@@ -121,50 +121,89 @@ pub fn component_details(components: &[HoleComponent]) -> String {
     parts.join(", ")
 }
 
-/// Pixels in components small enough to be pinholes.
-pub fn pinhole_total(components: &[HoleComponent]) -> usize {
+/// A pinhole tolerance: components of at most `max_pixels` pixels, at most
+/// `max_total` such pixels per frame.
+#[derive(Debug, Clone, Copy)]
+pub struct PinholeRule {
+    pub max_pixels: usize,
+    pub max_total: usize,
+}
+
+impl PinholeRule {
+    /// The default rule ([`PINHOLE_MAX_PIXELS`], [`PINHOLE_MAX_TOTAL`]),
+    /// used by the real-server fly test.
+    pub const STRICT: PinholeRule = PinholeRule {
+        max_pixels: PINHOLE_MAX_PIXELS,
+        max_total: PINHOLE_MAX_TOTAL,
+    };
+}
+
+/// Pixels in components small enough to be pinholes under `rule`.
+pub fn pinhole_total_with(components: &[HoleComponent], rule: PinholeRule) -> usize {
     components
         .iter()
-        .filter(|c| c.size() <= PINHOLE_MAX_PIXELS)
+        .filter(|c| c.size() <= rule.max_pixels)
         .map(HoleComponent::size)
         .sum()
 }
 
-/// Whether every component is a pinhole and they fit the per-frame cap.
-pub fn only_pinholes(components: &[HoleComponent]) -> bool {
-    components.iter().all(|c| c.size() <= PINHOLE_MAX_PIXELS)
-        && pinhole_total(components) <= PINHOLE_MAX_TOTAL
+/// [`pinhole_total_with`] under [`PinholeRule::STRICT`].
+pub fn pinhole_total(components: &[HoleComponent]) -> usize {
+    pinhole_total_with(components, PinholeRule::STRICT)
 }
 
-/// The frame hole check: sentinel pixels in `region` must be pinhole
-/// components only, within the per-frame cap. Prints the stats; on
-/// failure saves the frame at `image_path`, saves a debug image with
-/// the offending components highlighted next to it, and panics with
-/// their bounding boxes.
+/// Whether every component is a pinhole under `rule` and they fit its
+/// per-frame cap.
+pub fn only_pinholes_with(components: &[HoleComponent], rule: PinholeRule) -> bool {
+    components.iter().all(|c| c.size() <= rule.max_pixels)
+        && pinhole_total_with(components, rule) <= rule.max_total
+}
+
+/// [`only_pinholes_with`] under [`PinholeRule::STRICT`].
+pub fn only_pinholes(components: &[HoleComponent]) -> bool {
+    only_pinholes_with(components, PinholeRule::STRICT)
+}
+
+/// [`assert_only_pinholes_with`] under [`PinholeRule::STRICT`].
 pub fn assert_only_pinholes(
     image: &RgbaImage,
     region: (u32, u32, u32, u32),
     label: &str,
     image_path: &std::path::Path,
 ) {
+    assert_only_pinholes_with(image, region, label, image_path, PinholeRule::STRICT);
+}
+
+/// The frame hole check: sentinel pixels in `region` must be pinhole
+/// components only, within `rule`'s per-frame cap. Prints the stats; on
+/// failure saves the frame at `image_path`, saves a debug image with
+/// the offending components highlighted next to it, and panics with
+/// their bounding boxes.
+pub fn assert_only_pinholes_with(
+    image: &RgbaImage,
+    region: (u32, u32, u32, u32),
+    label: &str,
+    image_path: &std::path::Path,
+    rule: PinholeRule,
+) {
     let components = sentinel_components(image, region);
     println!("{label}: {}", describe_holes(&components));
-    if only_pinholes(&components) {
+    if only_pinholes_with(&components, rule) {
         return;
     }
     let oversized = components
         .iter()
-        .filter(|c| c.size() > PINHOLE_MAX_PIXELS)
+        .filter(|c| c.size() > rule.max_pixels)
         .count();
     // On a total-cap failure every component contributes; otherwise
     // only the oversized ones offend.
-    let over_total = pinhole_total(&components) > PINHOLE_MAX_TOTAL;
+    let over_total = pinhole_total_with(&components, rule) > rule.max_total;
     let offending: Vec<&HoleComponent> = if over_total {
         components.iter().collect()
     } else {
         components
             .iter()
-            .filter(|c| c.size() > PINHOLE_MAX_PIXELS)
+            .filter(|c| c.size() > rule.max_pixels)
             .collect()
     };
     let mut debug = image.clone();
@@ -185,10 +224,12 @@ pub fn assert_only_pinholes(
         })
         .collect();
     panic!(
-        "{label}: holes beyond pinhole tolerance ({PINHOLE_MAX_PIXELS} px per \
-         component, {PINHOLE_MAX_TOTAL} px per frame): {oversized} oversized \
-         components, pinhole total {}, offending [{}]; images {} and {}",
-        pinhole_total(&components),
+        "{label}: holes beyond pinhole tolerance ({} px per component, {} px \
+         per frame): {oversized} oversized components, pinhole total {}, \
+         offending [{}]; images {} and {}",
+        rule.max_pixels,
+        rule.max_total,
+        pinhole_total_with(&components, rule),
         boxes.join(", "),
         image_path.display(),
         debug_path.display(),
