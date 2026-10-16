@@ -703,20 +703,26 @@ impl App {
 /// Prints the autopilot's frame-time summary: count, mean, p50, p95, p99,
 /// max, and the frames over 33 ms and 50 ms.
 fn print_frame_time_summary(times: &[f64]) {
+    println!("{}", frame_time_summary(times));
+}
+
+/// The autopilot's frame-time summary line: count, mean, p50, p95, p99,
+/// max in milliseconds, and the frames over 33 ms and 50 ms. `times` are
+/// in seconds.
+fn frame_time_summary(times: &[f64]) -> String {
     if times.is_empty() {
-        println!("autofly: no frames recorded");
-        return;
+        return "autofly: no frames recorded".to_owned();
     }
     let mut sorted = times.to_vec();
     sorted.sort_by(|a, b| a.total_cmp(b));
-    let ms = |v: f64| format!("{v:.2} ms");
+    let ms = |seconds: f64| format!("{:.2} ms", seconds * 1000.0);
     let percentile = |p: f64| {
         let index = ((sorted.len() as f64 - 1.0) * p).round() as usize;
         sorted[index.min(sorted.len() - 1)]
     };
     let mean = times.iter().sum::<f64>() / times.len() as f64;
     let over = |limit: f64| times.iter().filter(|&&t| t > limit).count();
-    println!(
+    format!(
         "autofly: {} frames, mean {}, p50 {}, p95 {}, p99 {}, max {}, over 33 ms {}, over 50 ms {}",
         times.len(),
         ms(mean),
@@ -726,7 +732,7 @@ fn print_frame_time_summary(times: &[f64]) {
         ms(sorted[sorted.len() - 1]),
         over(0.033),
         over(0.050),
-    );
+    )
 }
 
 /// Tries to grab the cursor (Locked, falling back to Confined) and hide
@@ -930,5 +936,20 @@ mod tests {
         // Flying observed: never again.
         autofly.toggled = true;
         assert!(!autofly.wants_toggle(AUTOFLY_RETRY_TOGGLE * 10));
+    }
+
+    /// Frame times are recorded in seconds but reported in milliseconds:
+    /// 0.010, 0.012 and 0.040 s must print 10/12/40 ms, not 0.01 ms.
+    /// The percentile index is `(len - 1) * p` rounded, so p50 picks the
+    /// middle sample and p95/p99 round up to the 40 ms one; the over-33
+    /// and over-50 counts compare seconds.
+    #[test]
+    fn frame_time_summary_reports_milliseconds() {
+        assert_eq!(
+            frame_time_summary(&[0.010, 0.012, 0.040]),
+            "autofly: 3 frames, mean 20.67 ms, p50 12.00 ms, p95 40.00 ms, \
+             p99 40.00 ms, max 40.00 ms, over 33 ms 1, over 50 ms 0"
+        );
+        assert_eq!(frame_time_summary(&[]), "autofly: no frames recorded");
     }
 }
