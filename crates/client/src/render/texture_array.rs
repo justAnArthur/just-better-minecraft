@@ -584,11 +584,10 @@ mod tests {
         // srgb(255) == 1.0.
         let half = f64::from(srgb_to_linear(255)) / 2.0;
         let avg = layer_average(&layer);
-        for c in 0..3 {
+        for (c, channel) in avg.iter().enumerate().take(3) {
             assert!(
-                (f64::from(avg[c]) - half).abs() < 1e-6,
-                "channel {c}: {} vs {half}",
-                avg[c]
+                (f64::from(*channel) - half).abs() < 1e-6,
+                "channel {c}: {channel} vs {half}"
             );
         }
         assert!((avg[3] - 1.0).abs() < 1e-6, "mean alpha of opaque layer");
@@ -629,11 +628,10 @@ mod tests {
         // Each channel is full-scale in exactly one of the four pixels,
         // so every unweighted mean is a quarter of the decoded scale.
         let quarter = f64::from(srgb_to_linear(255)) / 4.0;
-        for c in 0..3 {
+        for (c, channel) in avg.iter().enumerate().take(3) {
             assert!(
-                (f64::from(avg[c]) - quarter).abs() < 1e-6,
-                "channel {c}: {} vs {quarter}",
-                avg[c]
+                (f64::from(*channel) - quarter).abs() < 1e-6,
+                "channel {c}: {channel} vs {quarter}"
             );
         }
         assert!(avg[3] < 1e-6);

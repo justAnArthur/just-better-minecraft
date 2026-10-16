@@ -223,12 +223,10 @@ fn lod1_cube_top_face_is_the_flat_average_color() {
     for y in y0..y1 {
         for x in x0..x1 {
             let pixel = image.get_pixel(x as u32, y as u32);
-            for c in 0..3 {
+            for (c, (&got, &want)) in pixel.0.iter().zip(expected.iter()).enumerate() {
                 assert!(
-                    (i16::from(pixel.0[c]) - i16::from(expected[c])).abs() <= 1,
-                    "pixel ({x}, {y}) channel {c}: {} vs flat average {}",
-                    pixel.0[c],
-                    expected[c]
+                    (i16::from(got) - i16::from(want)).abs() <= 1,
+                    "pixel ({x}, {y}) channel {c}: {got} vs flat average {want}"
                 );
             }
             checked += 1;
