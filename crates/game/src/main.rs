@@ -4,9 +4,24 @@
 
 use std::path::PathBuf;
 
+use jbm_client::app::ViewSetup;
+use jbm_core::coords::CUBE_SIZE;
 use jbm_core::link::in_process_pair;
 use jbm_server::run;
 use jbm_server::server::{Server, ServerConfig};
+
+/// The far-look view distances (task 2.9) derived from the server config:
+/// the LOD0 streaming disk radius and the outermost LOD ring's radius, in
+/// blocks. The client cannot learn these from the link, so the game —
+/// which built the config — passes them along.
+fn view_setup(config: &ServerConfig) -> ViewSetup {
+    ViewSetup {
+        lod0_ring_radius: config.view_radius as f32 * CUBE_SIZE as f32,
+        furthest_ring_radius: config.lod_view_radius as f32
+            * CUBE_SIZE as f32
+            * (1u32 << config.lod_levels) as f32,
+    }
+}
 
 /// The world directory the game saves to, unless `JBM_WORLD_DIR` overrides
 /// it. `saves/default` under the current directory.
@@ -25,6 +40,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         world_dir: world_dir(),
         ..ServerConfig::default()
     };
+    // The far-look view distances, read off the config before it moves
+    // into the server (task 2.9).
+    let view = view_setup(&config);
     // A storage error (locked world, newer format, …) is a one-line exit,
     // not a panic.
     let server = match Server::try_with_config(config) {
@@ -37,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handle = run::spawn(server);
     let (client_end, server_end) = in_process_pair();
     handle.connect(server_end);
-    let result = jbm_client::app::run(client_end);
+    let result = jbm_client::app::run_with_view(client_end, view);
     // The window closed (or the link died); stop and join the server. That
     // flushes every accepted edit to disk before the process exits.
     handle.stop();

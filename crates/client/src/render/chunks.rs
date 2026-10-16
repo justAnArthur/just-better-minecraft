@@ -143,6 +143,41 @@ pub struct TerrainUniforms {
     /// xyz = `camera − camera_cube · CUBE_SIZE` (f64 on the CPU, rounded
     /// to f32); w = CUBE_SIZE, so the shaders are cube-size agnostic.
     pub camera_frac: [f32; 4],
+    /// Task 2.9 far look. x = the LOD0 ring radius in blocks (the
+    /// texture→flat fade window is a fraction of it); y = the furthest
+    /// ring radius in blocks (the fog window is a fraction of it);
+    /// z = fog on (1.0) / off (0.0 — `Renderer::set_fog` / `JBM_NO_FOG`);
+    /// w spare.
+    pub far: [f32; 4],
+}
+
+/// Fractions of the ring radii the far look (task 2.9) keys on, mirrored
+/// as WGSL consts in `shaders/terrain.wgsl` — keep the two in sync. The
+/// fade covers 40%..85% of the LOD0 ring radius (flat on both sides of
+/// the LOD0/LOD1 border); the fog starts at 35% of the furthest ring
+/// radius and saturates at 98%, just inside the outermost ring.
+pub const FADE_START_FRACTION: f32 = 0.40;
+pub const FADE_END_FRACTION: f32 = 0.85;
+pub const FOG_START_FRACTION: f32 = 0.35;
+pub const FOG_END_FRACTION: f32 = 0.98;
+
+/// AO softening per LOD level (task 2.9), mirrored by `ao_soften` in
+/// `shaders/terrain.wgsl` — keep the two in sync. Level 0 keeps the exact
+/// AO factor (pre-2.9 goldens stay bit-stable); coarser levels pull the
+/// factor toward fully open, because AO contrast scales with cell size and
+/// reads blotchy far away. Levels beyond the table clamp to the last entry.
+pub const AO_SOFTEN: [f32; 4] = [1.0, 0.6, 0.45, 0.3];
+
+/// Default view distances for the far look (task 2.9), matching the
+/// `ServerConfig` defaults (`view_radius` 8, `lod_levels` 4,
+/// `lod_view_radius` 8): the LOD0 ring radius and the furthest (level-4)
+/// ring radius, in blocks.
+pub const DEFAULT_LOD0_RING_RADIUS: f32 = 8.0 * CUBE_SIZE as f32;
+pub const DEFAULT_FURTHEST_RING_RADIUS: f32 = 8.0 * CUBE_SIZE as f32 * 16.0;
+
+/// The `far` words of [`TerrainUniforms`] from the radii and fog flag.
+fn far_uniform_words(far_radii: [f32; 2], fog: bool) -> [f32; 4] {
+    [far_radii[0], far_radii[1], if fog { 1.0 } else { 0.0 }, 0.0]
 }
 
 /// The cull shader's per-frame uniform (group 1, binding 0 of cull.wgsl).
@@ -857,6 +892,15 @@ pub struct TerrainPass {
     /// ref-counted clones.
     texture_view: wgpu::TextureView,
     sampler: wgpu::Sampler,
+    /// The per-layer average colors (task 2.9), kept for the shared bind
+    /// group rebuilds.
+    averages_buffer: wgpu::Buffer,
+    /// Far-look view distances (task 2.9): LOD0 ring radius and furthest
+    /// ring radius, in blocks. See `set_view_distance`.
+    far_radii: [f32; 2],
+    /// Whether distance fog is on (task 2.9); propagated from
+    /// `Renderer::set_fog` every frame.
+    fog: bool,
     pages: Vec<FacePage>,
     /// Faces per page (every page is the same size).
     page_faces: u32,
@@ -985,8 +1029,10 @@ impl TerrainPass {
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
+                    // VERTEX: the origin formula; FRAGMENT: the far-look
+                    // fade and fog windows (task 2.9).
                     binding: 1,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -1008,6 +1054,17 @@ impl TerrainPass {
                     binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    // Per-layer average colors (task 2.9's flat far look).
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
                     count: None,
                 },
             ],
@@ -1050,12 +1107,25 @@ impl TerrainPass {
                     binding: 3,
                     resource: wgpu::BindingResource::Sampler(textures.sampler()),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: textures.averages_buffer().as_entire_binding(),
+                },
             ],
         });
 
+        // The sky gradient snippet is concatenated ahead of the terrain
+        // text so the fog evaluates the identical function the sky pass
+        // shows (WGSL has no includes; task 2.9). It has no dependencies,
+        // so leading with it is valid.
+        let terrain_source = format!(
+            "{}{}",
+            include_str!("shaders/sky_gradient.wgsl"),
+            include_str!("shaders/terrain.wgsl")
+        );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("jbm terrain"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/terrain.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(terrain_source.into()),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("jbm terrain layout"),
@@ -1305,6 +1375,9 @@ impl TerrainPass {
             shared_bind_group,
             texture_view,
             sampler,
+            averages_buffer: textures.averages_buffer().clone(),
+            far_radii: [DEFAULT_LOD0_RING_RADIUS, DEFAULT_FURTHEST_RING_RADIUS],
+            fog: true,
             pages: Vec::new(),
             page_faces,
             book: MeshBookkeeping::default(),
@@ -1678,8 +1751,36 @@ impl TerrainPass {
                     binding: 3,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.averages_buffer.as_entire_binding(),
+                },
             ],
         });
+    }
+
+    /// Sets the far-look view distances (task 2.9): the LOD0 ring radius
+    /// and the furthest ring radius, both in blocks. The LOD0 radius sets
+    /// where LOD0's textures fade into the flat average colors
+    /// ([`FADE_START_FRACTION`]..[`FADE_END_FRACTION`] of it, so both
+    /// sides of the LOD0/LOD1 border are flat); the furthest radius sets
+    /// the distance-fog window ([`FOG_START_FRACTION`]..[`FOG_END_FRACTION`]
+    /// of it, so the outermost ring's edge is never visible). Defaults
+    /// match the `ServerConfig` defaults; the game passes its own values.
+    pub fn set_view_distance(&mut self, lod0_ring_radius: f32, furthest_ring_radius: f32) {
+        self.far_radii = [lod0_ring_radius, furthest_ring_radius];
+    }
+
+    /// Enables or disables distance fog (task 2.9). The
+    /// `Renderer::set_fog` / `JBM_NO_FOG=1` hook propagates here every
+    /// frame; the fade from textures to flat average colors always stays.
+    pub fn set_fog(&mut self, enabled: bool) {
+        self.fog = enabled;
+    }
+
+    /// The far-look fields of the per-frame terrain uniform (task 2.9).
+    fn far_uniform_words(&self) -> [f32; 4] {
+        far_uniform_words(self.far_radii, self.fog)
     }
 
     pub fn stats(&self) -> TerrainStats {
@@ -1902,6 +2003,7 @@ impl TerrainPass {
                 camera_frac.z,
                 CUBE_SIZE as f32,
             ],
+            far: self.far_uniform_words(),
         };
         gpu.queue.write_buffer(
             &self.terrain_uniforms,
@@ -2147,6 +2249,7 @@ impl TerrainPass {
                     camera_frac.z,
                     CUBE_SIZE as f32,
                 ],
+                far: self.far_uniform_words(),
             }),
         );
 
@@ -2534,9 +2637,42 @@ mod tests {
 
     #[test]
     fn terrain_uniforms_layout_matches_wgsl() {
-        assert_eq!(std::mem::size_of::<TerrainUniforms>(), 32);
+        // The WGSL mirror (terrain.wgsl) is vec4i + vec4f + vec4f =
+        // 48 bytes, every field 16-byte aligned (task 2.9 added `far`).
+        assert_eq!(std::mem::size_of::<TerrainUniforms>(), 48);
         assert_eq!(std::mem::offset_of!(TerrainUniforms, camera_cube), 0);
         assert_eq!(std::mem::offset_of!(TerrainUniforms, camera_frac), 16);
+        assert_eq!(std::mem::offset_of!(TerrainUniforms, far), 32);
+        assert!(
+            std::mem::size_of::<TerrainUniforms>().is_multiple_of(16),
+            "no tail padding"
+        );
+    }
+
+    /// The far-look uniform words follow the radii and fog flag exactly
+    /// (task 2.9).
+    #[test]
+    fn far_uniform_words_follow_the_fog_flag() {
+        assert_eq!(
+            far_uniform_words([256.0, 4096.0], true),
+            [256.0, 4096.0, 1.0, 0.0]
+        );
+        assert_eq!(
+            far_uniform_words([256.0, 4096.0], false),
+            [256.0, 4096.0, 0.0, 0.0]
+        );
+        assert_eq!(
+            far_uniform_words([64.0, 1280.0], false),
+            [64.0, 1280.0, 0.0, 0.0]
+        );
+        // The defaults follow the ServerConfig defaults' shape at any cube
+        // size: 8 cubes for the LOD0 ring, and the level-4 disk (16x
+        // coarser) for the furthest.
+        assert_eq!(DEFAULT_LOD0_RING_RADIUS, 8.0 * CUBE_SIZE as f32);
+        assert_eq!(
+            DEFAULT_FURTHEST_RING_RADIUS,
+            DEFAULT_LOD0_RING_RADIUS * 16.0
+        );
     }
 
     #[test]
