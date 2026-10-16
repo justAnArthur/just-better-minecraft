@@ -57,6 +57,10 @@ struct FlyClient {
     in_flight: usize,
     /// The authoritative player position, from the last `PlayerState`.
     server_pos: Option<DVec3>,
+    /// The authoritative flying flag, and the last acknowledged input
+    /// seq (`PlayerState::ack_seq`).
+    server_flying: bool,
+    server_ack: u64,
     renderer: Renderer,
     terrain: TerrainPass,
     target: OffscreenTarget,
@@ -80,11 +84,24 @@ impl FlyClient {
             coverage: Coverage::default(),
             in_flight: 0,
             server_pos: None,
+            server_flying: false,
+            server_ack: 0,
             renderer,
             terrain,
             target,
             depth,
         }
+    }
+
+    /// Whether to send a fly toggle with the next input. The physics
+    /// step freezes the player — returning the pre-toggle state — while
+    /// the spawn cube is still generating, so a one-shot toggle sent at
+    /// join time is consumed and silently lost. Retrying is safe with
+    /// at most one unacked toggle in flight: a new one goes out only
+    /// after the previous was consumed (`ack_seq` caught up) and the
+    /// authoritative state still reports walking.
+    fn needs_fly_toggle(&self, toggle_seq: u64) -> bool {
+        !self.server_flying && self.server_ack >= toggle_seq
     }
 
     /// Drains the link into the world, dropping GPU state for unloads
@@ -105,8 +122,10 @@ impl FlyClient {
                     ServerMsg::Welcome { spawn: s, .. } => {
                         *spawn = Some(*s);
                     }
-                    ServerMsg::PlayerState { state, .. } => {
+                    ServerMsg::PlayerState { ack_seq, state } => {
                         self.server_pos = Some(state.position);
+                        self.server_flying = state.flying;
+                        self.server_ack = *ack_seq;
                     }
                     ServerMsg::CubeData { .. }
                     | ServerMsg::UnloadCube { .. }
@@ -258,18 +277,27 @@ fn fly_1p5km_over_real_rings_shows_no_holes() {
     let mut fly = FlyClient::new(&gpu);
 
     // Join: send a climbing fly-toggle tick until the Welcome arrives,
-    // then keep climbing to cruise altitude.
+    // then keep climbing to cruise altitude. The toggle is re-sent
+    // until a PlayerState confirms flying: physics discards a whole
+    // step (toggle included) while the player's own column is not
+    // loaded yet, and worldgen races the first steps after spawn.
+    // `toggle_seq` is the seq of the last toggle sent (0 = none yet);
+    // `needs_fly_toggle` keeps at most one unacked toggle in flight so
+    // retries can never flip flying back off.
     let mut seq = 0u64;
-    let mut flying_sent = false;
+    let mut toggle_seq = 0u64;
     let mut spawn: Option<[f64; 3]> = None;
     while spawn.is_none() {
         seq += 1;
+        let fly_toggle = fly.needs_fly_toggle(toggle_seq);
+        if fly_toggle {
+            toggle_seq = seq;
+        }
         let input = jbm_core::physics::MoveInput {
-            fly_toggle: !flying_sent,
+            fly_toggle,
             up: 1,
             ..jbm_core::physics::MoveInput::IDLE
         };
-        flying_sent = true;
         client
             .send(ClientMsg::PlayerInput {
                 seq,
@@ -296,13 +324,20 @@ fn fly_1p5km_over_real_rings_shows_no_holes() {
     );
     camera.set_pitch(-15.0_f32.to_radians());
 
-    // Climb to cruise altitude, 40 blocks over spawn.
+    // Climb to cruise altitude, 40 blocks over spawn. The toggle keeps
+    // being re-sent (one unacked in flight) until the server confirms
+    // flying, for the same lost-step race as above.
     while fly.server_pos.is_none_or(|p| p.y < spawn_at.y + 40.0) {
         seq += 1;
+        let fly_toggle = fly.needs_fly_toggle(toggle_seq);
+        if fly_toggle {
+            toggle_seq = seq;
+        }
         client
             .send(ClientMsg::PlayerInput {
                 seq,
                 input: jbm_core::physics::MoveInput {
+                    fly_toggle,
                     up: 1,
                     ..jbm_core::physics::MoveInput::IDLE
                 },
