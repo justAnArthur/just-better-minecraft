@@ -7,7 +7,7 @@
 This repo's release machinery is wired by workflows from `justAnArthur/just-github-actions-n-workflows`. As an AI agent you need three things to be useful here:
 
 1. **Use Conventional Commits with a scope** — missing scope = silent no-bump.
-2. **The scope maps to a package** via `properties.gitCommitScopeRelatedNames` in that package's `package.json`. Read it BEFORE editing.
+2. **The scope maps to a package** via `gitCommitScopeRelatedNames` in that package's manifest (`package.json` `properties`, `pom.xml` `<properties>`, or `Cargo.toml` `metadata.justactions`). Read it BEFORE editing.
 3. **Tags carry JSON annotations** that control which publish/deploy workflows fire. Inspect with `git tag -l --format='%(contents)' <tag>` if anything looks skipped.
 
 ## 1. Repo layout after install
@@ -54,9 +54,23 @@ The mapping lives in each package's manifest, not in any single file. Example:
 }
 ```
 
+In a Rust repo the settings live in `[package.metadata.justactions]` of a crate, or in `[workspace.metadata.justactions]` of the root `Cargo.toml` when the whole workspace shares one version (`[workspace.package] version`, members use `version.workspace = true`):
+
+```toml
+# Cargo.toml (workspace root)
+[workspace.package]
+version = "0.1.0"
+
+[workspace.metadata.justactions]
+name = "my-game"
+gitCommitScopeRelatedNames = ["core", "client", "server"]
+```
+
+Then `feat(client): ...` bumps the whole workspace, tagged `my-game@0.2.0`. Member crates that inherit the workspace version are not modules of their own — use one of the workspace's scopes for them.
+
 Then `feat(api): ...` AND `feat(backend): ...` both bump `@myorg/api`. Match logic is in the toolkit: a scope matches if it equals the manifest `name` or any value in `gitCommitScopeRelatedNames` (see `lib/src/manifests/discovery.ts` and `lib/src/modules/index.ts`).
 
-**Before editing code in this repo:** read every `package.json` (or `pom.xml`) under the path you'll touch. Check its `properties.gitCommitScopeRelatedNames`. Use one of those values as your commit scope.
+**Before editing code in this repo:** read every `package.json`, `pom.xml` or `Cargo.toml` under the path you'll touch, plus the root `Cargo.toml` in a Rust workspace. Check its `gitCommitScopeRelatedNames`. Use one of those values as your commit scope.
 
 If you use a scope that isn't in any manifest, your commit is **silently dropped** — no version bump occurs and no error surfaces.
 
@@ -65,9 +79,9 @@ If you use a scope that isn't in any manifest, your commit is **silently dropped
 When the `bump-version.yml` workflow runs (push to `main`, or via `workflow_dispatch`), it:
 
 1. Parses commits since the last tag, finds the highest-bump-type per scope.
-2. Updates `package.json` / `pom.xml` versions.
+2. Updates `package.json` / `pom.xml` / `Cargo.toml` versions (for Cargo, also the matching local entries in `Cargo.lock`).
 3. Commits and pushes the version bump as a `chore[skip bump]: bumping ...` commit.
-4. Creates **annotated git tags** in the form `@scope/name@version` (e.g. `@myorg/api@0.2.0`).
+4. Creates **annotated git tags** in the form `<name>@<version>` (e.g. `@myorg/api@0.2.0`, or `my-game@0.2.0` for an unscoped name).
 5. The tag's annotation message is **JSON**:
 
    ```json
@@ -187,6 +201,8 @@ For repo-specific agent instructions, write a separate `CONTRIBUTING.md` or root
 - `feat: add endpoint` — missing scope, silent no-bump.
 - `feat(API): ...` — uppercase scope; manifests use lowercase by convention.
 - Adding a new package without setting `properties.gitCommitScopeRelatedNames` — bumps for it will never fire.
+- Adding a crate to a Rust workspace without adding its scope to `[workspace.metadata.justactions] gitCommitScopeRelatedNames` — commits scoped to it bump nothing.
+- Editing `version` in `Cargo.toml` or `Cargo.lock` by hand — the bump does both; a hand edit desyncs them and breaks `cargo --locked`.
 - Pushing a tag like `v1.2.3` instead of `@scope/name@1.2.3` — none of the `**@*` triggers will match.
 - Running `npm version patch` directly — bypasses the conventional-commit-driven bump and produces a tag without the JSON annotation, which downstream workflows then fall back to legacy detection for.
 - Hand-editing `bump-version.yml` to change the bump logic — overwritten by `update`.
