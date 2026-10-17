@@ -18,16 +18,10 @@ use std::time::{Duration, Instant};
 use glam::DVec3;
 use jbm_client::camera::Camera;
 use jbm_client::gpu::Gpu;
-use jbm_client::lod::Coverage;
-use jbm_client::mesh::appearance::{BlockAppearance, builtin_textures};
-use jbm_client::mesh::pool::MeshPool;
-use jbm_client::render::offscreen::OffscreenTarget;
-use jbm_client::render::renderer::{
-    DepthTarget, FrameInputs, HORIZON_COLOR, Renderer, ZENITH_COLOR,
-};
-use jbm_client::render::terrain::TerrainPass;
-use jbm_client::render::texture_array::BlockTextures;
-use jbm_client::world::ClientWorld;
+use jbm_client::mesh::appearance::BlockAppearance;
+use jbm_client::render::renderer::{HORIZON_COLOR, ZENITH_COLOR};
+use jbm_client::terrain_sync::TerrainSync;
+use jbm_client::testing::OffscreenRig;
 use jbm_core::coords::{CUBE_SIZE, CubePos};
 use jbm_core::link::ClientLink;
 use jbm_core::protocol::PlayerId;
@@ -168,18 +162,12 @@ fn find_nth_coast(generator: &Generator, n: usize) -> DVec3 {
     panic!("no coast found within the search limit for this seed");
 }
 
-/// The client half, as in the fly test: world, mesh pool, coverage,
-/// renderer, plus every LOD0 cube position currently held.
+/// The client half, as in the fly test: the terrain pipeline and the
+/// offscreen rig, plus every LOD0 cube position currently held.
 struct WindowClient {
-    world: ClientWorld,
-    pool: MeshPool,
-    coverage: Coverage,
-    in_flight: usize,
+    sync: TerrainSync,
     received_lod0: std::collections::HashSet<CubePos>,
-    renderer: Renderer,
-    terrain: TerrainPass,
-    target: OffscreenTarget,
-    depth: DepthTarget,
+    rig: OffscreenRig,
 }
 
 impl WindowClient {
@@ -187,22 +175,10 @@ impl WindowClient {
         let mut registry = jbm_core::block::BlockRegistry::new();
         jbm_core::block::builtin::register(&mut registry);
         let appearance = Arc::new(BlockAppearance::new(&registry));
-        let target = OffscreenTarget::new(&gpu.device, WIDTH, HEIGHT);
-        let depth = DepthTarget::new(&gpu.device, WIDTH, HEIGHT);
-        let renderer = Renderer::new(gpu, target.format());
-        let (layers, _) = builtin_textures();
-        let textures = BlockTextures::new(gpu, &layers).expect("texture array");
-        let terrain = TerrainPass::new(gpu, target.format(), renderer.uniform_layout(), &textures);
         WindowClient {
-            world: ClientWorld::new(),
-            pool: MeshPool::new(appearance, 0),
-            coverage: Coverage::default(),
-            in_flight: 0,
+            sync: TerrainSync::new(appearance, 0),
             received_lod0: std::collections::HashSet::new(),
-            renderer,
-            terrain,
-            target,
-            depth,
+            rig: OffscreenRig::new(gpu, WIDTH, HEIGHT),
         }
     }
 
@@ -215,26 +191,16 @@ impl WindowClient {
                     }
                     ServerMsg::CubeData { pos, .. } => {
                         self.received_lod0.insert(*pos);
-                        self.world.apply(&msg);
+                        self.sync.apply(gpu, &mut self.rig.terrain, &msg);
                     }
                     ServerMsg::UnloadCube { pos } => {
                         self.received_lod0.remove(pos);
-                        if let jbm_client::world::WorldChange::Unloaded(key) =
-                            self.world.apply(&msg)
-                        {
-                            self.terrain.remove(gpu, key);
-                            self.coverage.set_ready(key, false);
-                        }
+                        self.sync.apply(gpu, &mut self.rig.terrain, &msg);
                     }
                     ServerMsg::LodCubeData { .. }
                     | ServerMsg::UnloadLodCube { .. }
                     | ServerMsg::BlockChange { .. } => {
-                        if let jbm_client::world::WorldChange::Unloaded(key) =
-                            self.world.apply(&msg)
-                        {
-                            self.terrain.remove(gpu, key);
-                            self.coverage.set_ready(key, false);
-                        }
+                        self.sync.apply(gpu, &mut self.rig.terrain, &msg);
                     }
                     _ => {}
                 },
@@ -244,51 +210,19 @@ impl WindowClient {
         }
     }
 
+    /// Submits and uploads meshes within the app budgets (16 submits,
+    /// 32 uploads per frame).
     fn pump_meshing(&mut self, gpu: &Gpu, camera: &Camera) {
-        let inputs = self.world.take_dirty(16, camera.position);
-        self.in_flight += inputs.len();
-        for (key, version, input) in inputs {
-            self.pool.submit(key, version, input);
-        }
-        let mut uploads = 0;
-        while uploads < 32 {
-            let Some(result) = self.pool.try_recv() else {
-                break;
-            };
-            self.in_flight -= 1;
-            if self.world.version(result.key) != Some(result.version) {
-                continue;
-            }
-            self.terrain.upload(gpu, result.key, &result.output);
-            self.coverage.set_ready(result.key, true);
-            uploads += 1;
-        }
-        for (key, drawn, mask) in self.coverage.take_changed() {
-            self.terrain.set_draw_state(gpu, key, drawn, mask);
-        }
+        self.sync.pump(gpu, &mut self.rig.terrain, camera, 16, 32);
     }
 
     fn queue_clear(&self) -> bool {
-        self.world.dirty_count() == 0 && self.in_flight == 0
+        self.sync.queue_clear()
     }
 
     fn render(&mut self, gpu: &Gpu, camera: &Camera) -> image::RgbaImage {
-        self.renderer
-            .set_sky_colors(Some((HORIZON_COLOR, ZENITH_COLOR, SENTINEL)));
-        self.renderer.render(
-            gpu,
-            FrameInputs {
-                target: &self.target.create_view(),
-                depth: &self.depth,
-                camera,
-                terrain: Some(&mut self.terrain),
-                outline: None,
-                overlay: None,
-            },
-        );
-        let image = self.target.read_rgba(gpu);
-        self.renderer.set_sky_colors(None);
-        image
+        self.rig
+            .render_with_sky(gpu, camera, Some((HORIZON_COLOR, ZENITH_COLOR, SENTINEL)))
     }
 }
 
@@ -488,12 +422,12 @@ fn valley_cliff_is_full_lod0_near_the_camera() {
     //    comes from the depth buffer (reverse-Z: distance = NEAR / d).
     //    Farther tinted pixels are legitimate ring terrain and are only
     //    counted for the report.
-    win.renderer.set_fog(false);
-    win.renderer.set_lod_tint(false);
+    win.rig.renderer.set_fog(false);
+    win.rig.renderer.set_lod_tint(false);
     let plain = win.render(&gpu, &camera);
-    win.renderer.set_lod_tint(true);
+    win.rig.renderer.set_lod_tint(true);
     let tinted = win.render(&gpu, &camera);
-    let depths = win.depth.read_depth(&gpu);
+    let depths = win.rig.read_depth(&gpu);
     std::fs::create_dir_all("target/surface").ok();
     let _ = plain.save("target/surface/valley_plain.png");
     let _ = tinted.save("target/surface/valley_tinted.png");
@@ -588,12 +522,12 @@ fn coast_defect_pixels(
         },
     );
 
-    win.renderer.set_fog(false);
-    win.renderer.set_lod_tint(false);
+    win.rig.renderer.set_fog(false);
+    win.rig.renderer.set_lod_tint(false);
     let plain = win.render(gpu, &camera);
-    win.renderer.set_lod_tint(true);
+    win.rig.renderer.set_lod_tint(true);
     let tinted = win.render(gpu, &camera);
-    let depths = win.depth.read_depth(gpu);
+    let depths = win.rig.read_depth(gpu);
     std::fs::create_dir_all("target/surface").ok();
     let _ = plain.save(format!("target/surface/coast_{tag}_plain.png"));
     let _ = tinted.save(format!("target/surface/coast_{tag}_tinted.png"));
