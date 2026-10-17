@@ -27,8 +27,8 @@ use image::RgbaImage;
 use jbm_client::camera::Camera;
 use jbm_client::lod::Coverage;
 use jbm_client::lod::CubeKey;
+use jbm_client::mesh;
 use jbm_client::mesh::appearance::{BlockAppearance, builtin_textures};
-use jbm_client::mesh::greedy;
 use jbm_client::render::chunks::{TerrainPass, TerrainPath};
 use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
@@ -327,7 +327,7 @@ fn settle(
             break;
         }
         for (key, _version, input) in dirty {
-            let output = greedy::mesh(&input, appearance);
+            let output = mesh::mesh(&input, appearance);
             terrain.upload(gpu, key, &output);
             // An empty mesh counts as ready.
             coverage.set_ready(key, true);
@@ -958,8 +958,8 @@ fn a_lod1_cube_renders_like_its_pattern_scaled() {
             level,
             pos: CubePos { x: 0, y: 0, z: 0 },
         };
-        let input = greedy::MeshInput::isolated_at_level(Arc::new(cube.clone()), level);
-        let output = greedy::mesh(&input, &appearance);
+        let input = mesh::MeshInput::isolated_at_level(Arc::new(cube.clone()), level);
+        let output = mesh::mesh(&input, &appearance);
         terrain.upload(&gpu, key, &output);
         coverage.set_ready(key, true);
         for (key, drawn, mask) in coverage.take_changed() {
@@ -1022,8 +1022,8 @@ fn a_lod1_cube_renders_like_its_pattern_scaled() {
         level: 1,
         pos: CubePos { x: 0, y: 0, z: 0 },
     };
-    let input = greedy::MeshInput::isolated_at_level(Arc::new(lod1.clone()), 1);
-    let output = greedy::mesh(&input, &appearance);
+    let input = mesh::MeshInput::isolated_at_level(Arc::new(lod1.clone()), 1);
+    let output = mesh::mesh(&input, &appearance);
     terrain.upload(&gpu, key, &output);
     coverage.set_ready(key, true);
     for (key, drawn, mask) in coverage.take_changed() {
@@ -1098,8 +1098,8 @@ fn masked_octants_hide_their_volume_and_full_masks_draw_nothing() {
         level: 1,
         pos: CubePos { x: 0, y: 0, z: 0 },
     };
-    let input = greedy::MeshInput::isolated_at_level(Arc::new(cube), 1);
-    let output = greedy::mesh(&input, &appearance);
+    let input = mesh::MeshInput::isolated_at_level(Arc::new(cube), 1);
+    let output = mesh::mesh(&input, &appearance);
     terrain.upload(&gpu, key, &output);
     coverage.set_ready(key, true);
     for (key, drawn, mask) in coverage.take_changed() {

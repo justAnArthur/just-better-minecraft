@@ -27,9 +27,7 @@ use crate::mesh::input::{
 };
 use crate::mesh::seams::{LID_KEY_BIT, SKIRT_KEY_BIT, lid, skirt};
 
-// Re-exported so callers keep the historical `mesh::greedy` path for the
-// entry point and its types (tests, benches and the game crate use it).
-pub use crate::mesh::input::{MeshInput, MeshOutput, build_padded, mesh, neighbor_index};
+use crate::mesh::input::MeshOutput;
 
 /// Padded-index stride of an axis vector like (0, 0, -1).
 #[inline]
@@ -235,6 +233,7 @@ mod tests {
 
     use crate::mesh::face::{Direction, unpack};
     use crate::mesh::oracle::{legacy_mesh_padded, naive_unit_faces};
+    use crate::mesh::{MeshInput, build_padded, mesh, neighbor_index};
     use jbm_core::block::builtin;
     use jbm_core::coords::CUBE_VOLUME;
     use jbm_core::cube::Cube;

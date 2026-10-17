@@ -20,7 +20,7 @@ use std::sync::Arc;
 use glam::DVec3;
 use jbm_client::camera::Camera;
 use jbm_client::lod::CubeKey;
-use jbm_client::mesh::greedy::{self, MeshInput, neighbor_index};
+use jbm_client::mesh::{self, MeshInput, neighbor_index};
 use jbm_core::block::BlockStateId;
 use jbm_core::block::builtin::Blocks;
 use jbm_core::coords::{CUBE_SIZE, CubePos, LocalPos};
@@ -107,7 +107,7 @@ fn scene_state(blocks: &Blocks, y: i64, surface: i64) -> BlockStateId {
 /// The rings scene: every cube pre-meshed, keyed for upload, plus a
 /// camera looking down across the stack from game height.
 pub struct RingsScene {
-    pub meshes: Vec<(CubeKey, greedy::MeshOutput)>,
+    pub meshes: Vec<(CubeKey, mesh::MeshOutput)>,
     pub camera: Camera,
     /// Per-level streamed cube count (levels 0..=5).
     pub resident: [usize; 6],
@@ -277,7 +277,7 @@ impl RingsScene {
                     level,
                 };
                 let key = CubeKey { level, pos: *pos };
-                meshes.push((key, greedy::mesh(&input, appearance)));
+                meshes.push((key, mesh::mesh(&input, appearance)));
                 resident[level as usize] += 1;
             }
         }

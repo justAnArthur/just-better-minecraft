@@ -17,7 +17,7 @@ use jbm_core::physics::{BlockShapes, SolidTable};
 use jbm_core::protocol::ServerMsg;
 
 use crate::lod::CubeKey;
-use crate::mesh::greedy::{MeshInput, neighbor_index};
+use crate::mesh::{MeshInput, neighbor_index};
 
 /// What `apply` did with a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

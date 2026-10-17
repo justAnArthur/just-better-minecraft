@@ -13,7 +13,6 @@ use jbm_core::cube::Cube;
 
 use crate::mesh::appearance::BlockAppearance;
 use crate::mesh::face::PackedFace;
-use crate::mesh::greedy::mesh_padded;
 
 /// Side length of the padded array: the cube plus a one-block shell.
 pub const PAD: usize = CUBE_SIZE as usize + 2;
@@ -112,42 +111,6 @@ impl MeshOutput {
     pub fn is_empty(&self) -> bool {
         self.faces.is_empty()
     }
-}
-
-/// Meshes one cube. See the README for the face rule and AO rule.
-pub fn mesh(input: &MeshInput, appearance: &BlockAppearance) -> MeshOutput {
-    if let Some(state) = input.center.uniform() {
-        let app = appearance.get(state);
-        if app.air {
-            // Uniform air owns no faces, whatever the neighbors are.
-            return MeshOutput::default();
-        }
-        if app.opaque && enclosed_by_opaque(input, appearance) {
-            // Fully surrounded by uniform opaque face neighbors: nothing
-            // of this cube is visible.
-            return MeshOutput::default();
-        }
-    }
-    let padded = build_padded(input, appearance);
-    mesh_padded(&padded, appearance, input.level)
-}
-
-/// Whether all six face neighbors are present, uniform and opaque.
-fn enclosed_by_opaque(input: &MeshInput, appearance: &BlockAppearance) -> bool {
-    const FACE_OFFSETS: [(i32, i32, i32); 6] = [
-        (1, 0, 0),
-        (-1, 0, 0),
-        (0, 1, 0),
-        (0, -1, 0),
-        (0, 0, 1),
-        (0, 0, -1),
-    ];
-    FACE_OFFSETS.iter().all(|&(dx, dy, dz)| {
-        input
-            .neighbor(dx, dy, dz)
-            .and_then(|cube| cube.uniform())
-            .is_some_and(|state| appearance.get(state).opaque)
-    })
 }
 
 /// Builds the padded 34^3 cell array from the center cube and its

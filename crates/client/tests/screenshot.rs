@@ -81,7 +81,7 @@ fn debug_overlay_matches_golden() {
 #[cfg(not(feature = "cube16"))]
 use jbm_client::mesh::appearance::BlockAppearance;
 #[cfg(not(feature = "cube16"))]
-use jbm_client::mesh::greedy::{self, MeshInput};
+use jbm_client::mesh::{self, MeshInput};
 #[cfg(not(feature = "cube16"))]
 use jbm_client::render::chunks::TerrainPass;
 #[cfg(not(feature = "cube16"))]
@@ -138,13 +138,12 @@ fn render_scene(golden_name: &str, scene: &[(CubePos, Cube)], camera: &Camera) {
                         z: pos.z + dz,
                     };
                     if let Some(cube) = by_pos.get(&neighbor) {
-                        input.neighbors[greedy::neighbor_index(dx, dy, dz)] =
-                            Some(Arc::clone(cube));
+                        input.neighbors[mesh::neighbor_index(dx, dy, dz)] = Some(Arc::clone(cube));
                     }
                 }
             }
         }
-        let output = greedy::mesh(&input, &appearance);
+        let output = mesh::mesh(&input, &appearance);
         terrain.upload(&gpu, jbm_client::lod::CubeKey::lod0(*pos), &output);
     }
 

@@ -6,8 +6,8 @@
 
 use glam::DVec3;
 use jbm_client::camera::Camera;
+use jbm_client::mesh;
 use jbm_client::mesh::appearance::{BlockAppearance, builtin_textures};
-use jbm_client::mesh::greedy;
 use jbm_client::render::chunks::TerrainPass;
 use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::overlay::OverlayText;
@@ -182,7 +182,7 @@ fn edited_spawn_scene_matches_golden() {
     let textures = BlockTextures::new(&gpu, &layers).expect("texture array");
     let mut terrain = TerrainPass::new(&gpu, target.format(), renderer.uniform_layout(), &textures);
     for (pos, _, input) in dirty {
-        terrain.upload(&gpu, pos, &greedy::mesh(&input, &appearance));
+        terrain.upload(&gpu, pos, &mesh::mesh(&input, &appearance));
     }
 
     // A camera about 6 blocks east of the pit, looking steeply down into it

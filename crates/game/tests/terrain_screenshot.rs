@@ -5,8 +5,8 @@
 
 use glam::DVec3;
 use jbm_client::camera::Camera;
+use jbm_client::mesh;
 use jbm_client::mesh::appearance::{BlockAppearance, builtin_textures};
-use jbm_client::mesh::greedy;
 use jbm_client::render::chunks::TerrainPass;
 use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
@@ -97,7 +97,7 @@ fn streamed_terrain_matches_golden() {
     let dirty = world.take_dirty(usize::MAX, spawn);
     assert_eq!(dirty.len(), DESIRED_CUBES);
     for (pos, _, input) in dirty {
-        terrain.upload(&gpu, pos, &greedy::mesh(&input, &appearance));
+        terrain.upload(&gpu, pos, &mesh::mesh(&input, &appearance));
     }
 
     // Above and behind spawn, looking down across it.

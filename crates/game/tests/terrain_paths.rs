@@ -14,8 +14,8 @@ use std::ops::Range;
 use glam::DVec3;
 use image::RgbaImage;
 use jbm_client::camera::Camera;
+use jbm_client::mesh;
 use jbm_client::mesh::appearance::{BlockAppearance, builtin_textures};
-use jbm_client::mesh::greedy;
 use jbm_client::render::chunks::{Frustum, TerrainPass, TerrainPath};
 use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
@@ -67,7 +67,7 @@ fn streamed_scene(
     edits: &[ClientMsg],
 ) -> (
     ClientWorld,
-    Vec<(jbm_client::lod::CubeKey, greedy::MeshOutput)>,
+    Vec<(jbm_client::lod::CubeKey, mesh::MeshOutput)>,
     DVec3,
 ) {
     let mut registry = BlockRegistry::new();
@@ -107,9 +107,9 @@ fn streamed_scene(
     }
 
     let dirty = world.take_dirty(usize::MAX, spawn);
-    let meshes: Vec<(jbm_client::lod::CubeKey, greedy::MeshOutput)> = dirty
+    let meshes: Vec<(jbm_client::lod::CubeKey, mesh::MeshOutput)> = dirty
         .into_iter()
-        .map(|(key, _, input)| (key, greedy::mesh(&input, &appearance)))
+        .map(|(key, _, input)| (key, mesh::mesh(&input, &appearance)))
         .collect();
     (world, meshes, spawn)
 }
@@ -180,7 +180,7 @@ fn upload_dirty(gpu: &jbm_client::gpu::Gpu, world: &mut ClientWorld, terrain: &m
     let appearance = BlockAppearance::new(&registry);
     let dirty = world.take_dirty(usize::MAX, DVec3::ZERO);
     for (pos, _, input) in dirty {
-        terrain.upload(gpu, pos, &greedy::mesh(&input, &appearance));
+        terrain.upload(gpu, pos, &mesh::mesh(&input, &appearance));
     }
 }
 
@@ -224,7 +224,7 @@ fn render_frame(
 /// equality test). Prints which paths ran.
 fn render_all_paths(
     gpu: &jbm_client::gpu::Gpu,
-    meshes: &[(jbm_client::lod::CubeKey, greedy::MeshOutput)],
+    meshes: &[(jbm_client::lod::CubeKey, mesh::MeshOutput)],
     camera: &Camera,
     golden: &str,
 ) {

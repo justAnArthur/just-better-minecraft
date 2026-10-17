@@ -8,7 +8,7 @@
 use glam::DVec3;
 use jbm_client::camera::Camera;
 use jbm_client::mesh::appearance::{BlockAppearance, builtin_textures};
-use jbm_client::mesh::greedy::{self, MeshInput};
+use jbm_client::mesh::{self, MeshInput};
 use jbm_client::render::chunks::TerrainPass;
 use jbm_client::render::chunks::TerrainPath;
 use jbm_client::render::chunks::worst_case_faces;
@@ -53,14 +53,14 @@ fn center_block(blocks: &builtin::Blocks) -> Cube {
     })
 }
 
-fn mesh_of(appearance: &BlockAppearance, cube: Cube) -> greedy::MeshOutput {
-    greedy::mesh(&MeshInput::isolated(Arc::new(cube)), appearance)
+fn mesh_of(appearance: &BlockAppearance, cube: Cube) -> mesh::MeshOutput {
+    mesh::mesh(&MeshInput::isolated(Arc::new(cube)), appearance)
 }
 
 fn render_passes_identically(
     gpu: &jbm_client::gpu::Gpu,
     churned: &mut TerrainPass,
-    fresh_meshes: &[(CubePos, greedy::MeshOutput)],
+    fresh_meshes: &[(CubePos, mesh::MeshOutput)],
     camera: &Camera,
     path: jbm_client::render::chunks::TerrainPath,
 ) {
@@ -172,7 +172,7 @@ fn slot_reuse_after_churn_renders_like_a_fresh_pass() {
         .collect();
     let checker = mesh_of(&appearance, checkerboard(&blocks));
     let center = mesh_of(&appearance, center_block(&blocks));
-    let mut meshes: HashMap<CubePos, greedy::MeshOutput> = HashMap::new();
+    let mut meshes: HashMap<CubePos, mesh::MeshOutput> = HashMap::new();
     for (i, &pos) in positions.iter().enumerate() {
         let mesh = if i < 4 {
             checker.clone()
@@ -224,7 +224,7 @@ fn slot_reuse_after_churn_renders_like_a_fresh_pass() {
     camera.set_yaw(yaw);
     camera.set_pitch(pitch);
 
-    let mut fresh_meshes: Vec<(CubePos, greedy::MeshOutput)> = meshes.into_iter().collect();
+    let mut fresh_meshes: Vec<(CubePos, mesh::MeshOutput)> = meshes.into_iter().collect();
     fresh_meshes.sort_unstable_by_key(|(pos, _)| *pos);
     // The churned pass renders identically to a fresh pass on cpu-cull and,
     // when the adapter allows it, on gpu-cull too (task 2.5: meta slots and
