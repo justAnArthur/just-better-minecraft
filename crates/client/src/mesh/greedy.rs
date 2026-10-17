@@ -414,7 +414,11 @@ fn mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u8) -> MeshOutp
                         width: w as u32,
                         height: h as u32,
                         direction,
-                        layer: (key >> 15) & 0xFFFF,
+                        // 15 bits: bit 30 of the key is SKIRT_KEY_BIT, not
+                        // part of the layer (reading 16 bits gave skirt faces
+                        // layer + 32768: the texture array clamped it, the
+                        // 2.9 per-layer color buffer read out of bounds).
+                        layer: (key >> 15) & LAYER_KEY_MASK,
                         ao: [ao8 & 3, (ao8 >> 2) & 3, (ao8 >> 4) & 3, (ao8 >> 6) & 3],
                         light: key & 0xF,
                     }));
@@ -431,6 +435,10 @@ fn mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u8) -> MeshOutp
 /// Marks a face key emitted under the skirt rule (bit 30; bit 31 is the
 /// non-zero flag).
 const SKIRT_KEY_BIT: u32 = 1 << 30;
+
+/// The texture layer field of a face key: bits 15..30, below
+/// [`SKIRT_KEY_BIT`].
+const LAYER_KEY_MASK: u32 = 0x7FFF;
 
 /// The skirt rule (task 2.6), applied at level >= 1 in the side directions
 /// +-X/+-Z. A skirt stands in for a coarse cell's side wall at a level
@@ -1177,6 +1185,13 @@ mod tests {
         assert!(faces_covering(&output, Direction::PosX, half - 1, 8, 5).is_empty());
         assert!(faces_covering(&output, Direction::PosX, half - 1, 3, 5).is_empty());
         assert!(output.skirts > 0);
+        // Skirt faces carry the block's real texture layer: the skirt key
+        // bit must not leak into the layer field (it once read as layer +
+        // 32768, out of bounds for the per-layer color buffer).
+        let stone_layer = appearance.get(blocks.stone).layers[0] as u32;
+        for f in faces_covering(&output, Direction::PosX, half - 1, 10, 5) {
+            assert_eq!(f.layer, stone_layer, "skirt face layer");
+        }
         // Interior columns (away from the plane) never skirt toward +X.
         assert!(faces_covering(&output, Direction::PosX, half - 3, 10, 5).is_empty());
     }
