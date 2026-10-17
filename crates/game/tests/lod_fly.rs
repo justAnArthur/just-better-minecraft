@@ -258,7 +258,8 @@ fn margin_rows(camera: &Camera) -> u32 {
     };
     let horizon = row_of(0.0);
     let fade = row_of((0.25f64).asin());
-    let ring_extent = 8.0 * 256.0 + 512.0;
+    // Task 2.10: lod_levels 6 puts the outermost ring ~16 km out.
+    let ring_extent = 8.0 * 256.0 * 8.0 + 512.0;
     let edge = row_of(((camera.position.y - 76.0) / ring_extent).atan());
     ((fade - horizon).max(edge - horizon) + 8.0).ceil().max(0.0) as u32
 }

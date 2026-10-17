@@ -1,12 +1,13 @@
-//! The LOD rings scene for task 2.6 benches and metrics (game scale):
-//! level 0 and level 1 from the real generator (level 1 by the core
-//! downsampling rule over level-0 data), levels 2 and 3 sampled from
-//! the generator's surface at each level's resolution with a
-//! solid-leaning max over the child-level corner grid (the worldgen
-//! path 2.7 brings). Heights are precomputed onto cached grids — one
-//! per-block grid over the level-0/1 footprint and one half-step grid
-//! over the coarse rings — so building the scene costs millions of
-//! array reads, not hundreds of millions of generator calls.
+//! The LOD rings scene for task 2.6 benches and metrics (game scale;
+//! task 2.10 widened it from four levels to the default six): level 0
+//! and level 1 from the real generator (level 1 by the core downsampling
+//! rule over level-0 data), levels 2..=5 sampled from the generator's
+//! surface at each level's resolution with a solid-leaning max over the
+//! child-level corner grid (the worldgen path 2.7 brings). Heights are
+//! precomputed onto cached grids — one per-block grid over the level-0/1
+//! footprint and coarser grids over the outer rings — so building the
+//! scene costs millions of array reads, not hundreds of millions of
+//! generator calls.
 //! Everything is keyed by the client's `CubeKey` and pre-meshed with
 //! same-level neighbors, ready to upload into a `TerrainPass`.
 #![allow(dead_code)]
@@ -108,8 +109,8 @@ fn scene_state(blocks: &Blocks, y: i64, surface: i64) -> BlockStateId {
 pub struct RingsScene {
     pub meshes: Vec<(CubeKey, greedy::MeshOutput)>,
     pub camera: Camera,
-    /// Per-level streamed cube count.
-    pub resident: [usize; 4],
+    /// Per-level streamed cube count (levels 0..=5).
+    pub resident: [usize; 6],
 }
 
 impl RingsScene {
@@ -151,10 +152,14 @@ impl RingsScene {
         let block_span = (RING_RADIUS * 2 + 4) * i64::from(CUBE_SIZE) * 2;
         let fine = HeightGrid::build(generator, -block_span, block_span, 1);
 
-        // Grid 2: half-step heights over the coarse rings (level 2 and 3
-        // sample at multiples of 2 blocks).
-        let coarse_span = (RING_RADIUS + 2) * i64::from(CUBE_SIZE) * 8;
-        let coarse = HeightGrid::build(generator, -coarse_span, coarse_span, 2);
+        // Grid 2: heights over the middle rings (levels 2 and 3 sample at
+        // multiples of 2 blocks), and grid 3 over the far rings (levels 4
+        // and 5 sample at multiples of 8 — level 5's disk reaches
+        // ±(8+2)·32·32 blocks, where a stride-2 grid would be ~200 MB).
+        let mid_span = (RING_RADIUS + 2) * i64::from(CUBE_SIZE) * 8;
+        let coarse = HeightGrid::build(generator, -mid_span, mid_span, 2);
+        let far_span = (RING_RADIUS + 2) * i64::from(CUBE_SIZE) * 32;
+        let far = HeightGrid::build(generator, -far_span, far_span, 8);
 
         // Level 0 cubes: exact cubes wherever the LOD0 ring and the
         // level-1 downsampling need them.
@@ -192,8 +197,7 @@ impl RingsScene {
         // All cubes by level for meshing. Level 0 streams only its own
         // ring (default view_radius); the footprint cubes beyond it are
         // downsampling sources, not streamed cubes.
-        let mut by_level: [Vec<(CubePos, Arc<Cube>)>; 4] =
-            [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        let mut by_level: [Vec<(CubePos, Arc<Cube>)>; 6] = std::array::from_fn(|_| Vec::new());
         for pos in disk(0) {
             by_level[0].push((pos, Arc::clone(&lod0[&pos])));
         }
@@ -210,8 +214,9 @@ impl RingsScene {
             }
             by_level[1].push((pos, Arc::new(parent_cube)));
         }
-        for level in [2u8, 3] {
+        for level in 2u8..=5 {
             let cell_blocks = 1i64 << level;
+            let grid = if level <= 3 { &coarse } else { &far };
             for pos in disk(level) {
                 let base = (
                     i64::from(pos.x) * i64::from(CUBE_SIZE) * cell_blocks,
@@ -222,7 +227,7 @@ impl RingsScene {
                     let x = base.0 + i64::from(local.x) * cell_blocks;
                     let y = base.1 + i64::from(local.y) * cell_blocks;
                     let z = base.2 + i64::from(local.z) * cell_blocks;
-                    let max_surface = coarse.max_over_cell(x, z, level);
+                    let max_surface = grid.max_over_cell(x, z, level);
                     if y >= max_surface {
                         return BlockStateId::AIR;
                     }
@@ -238,20 +243,15 @@ impl RingsScene {
         }
 
         // Mesh everything with same-level neighbors.
-        let mut index: [HashMap<CubePos, Arc<Cube>>; 4] = [
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
-        ];
-        for level in 0..4usize {
+        let mut index: [HashMap<CubePos, Arc<Cube>>; 6] = std::array::from_fn(|_| HashMap::new());
+        for level in 0..6usize {
             for (pos, cube) in &by_level[level] {
                 index[level].insert(*pos, Arc::clone(cube));
             }
         }
         let mut meshes = Vec::new();
-        let mut resident = [0usize; 4];
-        for level in 0..4u8 {
+        let mut resident = [0usize; 6];
+        for level in 0..6u8 {
             for (pos, cube) in &by_level[level as usize] {
                 let mut neighbors = std::array::from_fn(|_| None);
                 for dy in -1..=1i32 {

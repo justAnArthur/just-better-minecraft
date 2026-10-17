@@ -96,9 +96,10 @@ play on gpu-cull, run `JBM_GPU_CULL=1 cargo run -p jbm-game --release`
 
 **LOD rings (task 2.6).** `terrain_draw` adds `rings/cpu_cull` and
 `rings/gpu_cull`: the rings scene at game scale (default
-`lod_view_radius`, 4 levels) built in `benches/common/rings.rs` —
+`lod_view_radius`, 6 levels since task 2.10) built in
+`benches/common/rings.rs` —
 levels 0–1 from the real generator (level 1 by the core downsampling
-rule over level-0 data), levels 2–3 sampled from the generator's
+rule over level-0 data), levels 2–5 sampled from the generator's
 surface at each level's resolution, every cube pre-meshed with
 same-level neighbors and uploaded through the real coverage rule.
 Setup asserts every level has resident **and** drawn cubes (the

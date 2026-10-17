@@ -135,8 +135,10 @@ pub struct ServerConfig {
     pub world_dir: Option<PathBuf>,
     /// How often dirty cubes are snapshotted to the save thread.
     pub save_interval: Duration,
-    /// Top LOD level the server keeps (4 keeps LOD1–LOD4). `0` disables
-    /// the pyramid entirely: no allocation, no work per cube or edit.
+    /// Top LOD level the server keeps (6 keeps LOD1–LOD6; task 2.10
+    /// raised it from 4 — L5 cells are 32 blocks, L6 64, and the outer
+    /// ring reaches ~16 km). `0` disables the pyramid entirely: no
+    /// allocation, no work per cube or edit.
     pub lod_levels: u8,
     /// Horizontal radius of every LOD ring, in cubes of that ring's level
     /// (task 2.6). Each level streams a full disk; the client draws the
@@ -173,7 +175,7 @@ impl Default for ServerConfig {
             max_in_flight: 512,
             world_dir: None,
             save_interval: Duration::from_secs(5),
-            lod_levels: 4,
+            lod_levels: 6,
             lod_view_radius: 8,
             lod_vertical_radius: 3,
             lod_send_budget_per_tick: 32,
