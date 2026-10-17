@@ -338,7 +338,11 @@ fn mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u8) -> MeshOutp
                     let b = pad[b_index];
                     let a_air = a & (F_AIR << FLAGS_SHIFT) != 0;
                     let b_cull = b & (F_OPAQUE_CULL << FLAGS_SHIFT) != 0;
-                    let culled = a_air || b_cull || (a == b && a & (F_CUTOUT << FLAGS_SHIFT) != 0);
+                    // Same state on both sides culls: opaque blocks via
+                    // b_cull, and non-opaque ones too — water, glass and
+                    // cutout leaves draw no faces between equal neighbors
+                    // (an ocean once emitted every internal water face).
+                    let culled = a_air || b_cull || a == b;
                     let key = if culled {
                         if level > 0 && side && !a_air && b_cull && skirt(pad, a_index, direction) {
                             (1 << 31)
@@ -1039,9 +1043,12 @@ mod tests {
                     for ui in 0..CUBE_SIZE as isize {
                         let a = pad[(a_row + ui * u + vi * v) as usize];
                         let b = pad[(b_row + ui * u + vi * v) as usize];
+                        // Same-state culling for non-opaque blocks (wave D)
+                        // updated here too: the reference pins everything
+                        // else about the pre-2.6 sweep.
                         let culled = a & (F_AIR << FLAGS_SHIFT) != 0
                             || b & (F_OPAQUE_CULL << FLAGS_SHIFT) != 0
-                            || (a == b && a & (F_CUTOUT << FLAGS_SHIFT) != 0);
+                            || a == b;
                         let key = if culled {
                             0
                         } else {
@@ -1252,6 +1259,25 @@ mod tests {
         let input = MeshInput::isolated_at_level(Arc::new(make()), 0);
         let output = mesh(&input, &appearance);
         assert!(faces_covering(&output, Direction::PosX, last, 10, 5).is_empty());
+    }
+
+    #[test]
+    fn a_body_of_water_meshes_only_its_outer_faces() {
+        let (_, appearance, blocks) = setup();
+        // An 8x8x8 block of water in air: equal non-opaque neighbors cull,
+        // so the mesh is its six outer sides, one merged quad each — not
+        // the 3 x 7 x 64 internal faces it once also emitted. Glass too.
+        for state in [blocks.water, blocks.glass] {
+            let cube = Cube::from_fn(|p| {
+                if p.x < 8 && p.y < 8 && p.z < 8 {
+                    state
+                } else {
+                    BlockStateId::AIR
+                }
+            });
+            let output = mesh_air_surrounded(cube, &appearance);
+            assert_eq!(output.faces.len(), 6, "{state:?}: outer faces only");
+        }
     }
 
     #[test]
