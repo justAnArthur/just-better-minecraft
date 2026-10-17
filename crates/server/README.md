@@ -15,14 +15,16 @@ graph (`Overworld`, the default, or `Classic`), and
 are the overworld's documented bounds, derived from its interval bounds (the
 classic graph's narrower `[36, 92]` sits inside them).
 
-- **Water and sea level (task 2.8).** `SEA_LEVEL = 64`: air cells at or
+- **Water and sea level (task 2.8).** `SEA_LEVEL = 63`: air cells at or
   below it become `base:water` — in `generate` and `sample_lod` alike.
+  The water's top face is at 64, a multiple of 16, so every LOD level up
+  to 4 downsamples the sea to the same height (no steps at ring borders).
   Water is non-solid, so physics passes through it; no swimming or flow.
   Sea-less worlds (`Classic`, custom graphs) never gain water.
 - **Surface materials (overworld):** per column, from that column's own
   surface height `h` and its steepest neighbour step `slope` — stone when
   `h ≥ SEA_LEVEL + 180` (bare-rock peaks; snow is a follow-up) or
-  `slope ≥ 4` (cliffs), sand when `h ≤ SEA_LEVEL − 3` (beaches, seabed),
+  `slope ≥ 4` (cliffs), sand when `h ≤ SEA_LEVEL + 1` (a beach rim one block above the water, and the seabed),
   otherwise grass over a 3-deep dirt belt, stone below. Local per column,
   so it is cheap and LOD-consistent. `sample_lod` scales the slope bar by
   the sample stride, so a level-*n* cube classifies the terrain

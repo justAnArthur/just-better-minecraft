@@ -181,7 +181,7 @@ fn overworld_shape_statistics_at_8km() {
 }
 
 #[test]
-fn ocean_columns_fill_with_water_to_sea_level_at_lod0_and_lod1() {
+fn ocean_columns_fill_with_water_to_sea_level_at_every_level() {
     let terrain = overworld(DEFAULT_SEED);
     let water = blocks().water;
     // Find a genuine ocean column near the origin.
@@ -211,33 +211,42 @@ fn ocean_columns_fill_with_water_to_sea_level_at_lod0_and_lod1() {
         );
     }
 
-    // LOD1: the 2-block cell containing SEA_LEVEL is filled (water), the
-    // one above is air — `sample_lod` applies the same rule.
-    let lod = terrain.sample_lod(
-        1,
-        CubePos {
-            x: (x >> 6) as i32,
-            y: (SEA_LEVEL >> 6) as i32,
-            z: (z >> 6) as i32,
-        },
-    );
-    let local = |y: i64| {
-        LocalPos::new(
-            (x & 63) as u8 >> 1,
-            (y & 63) as u8 >> 1,
-            (z & 63) as u8 >> 1,
-        )
-    };
-    assert_ne!(
-        lod.get(local(SEA_LEVEL).unwrap()),
-        BlockStateId::AIR,
-        "LOD1 cell at sea level is filled"
-    );
-    assert_eq!(
-        lod.get(local(SEA_LEVEL + 4).unwrap()),
-        BlockStateId::AIR,
-        "LOD1 cell above the sea is air"
-    );
+    // LOD1..=4: the cell containing SEA_LEVEL is filled (water) and the
+    // cell containing SEA_LEVEL + 1 is air at EVERY level — the water's
+    // top face (SEA_LEVEL + 1 = 64) is a multiple of 16, a cell boundary
+    // at all four levels, so the sea is equally high on both sides of
+    // every ring border. `sample_lod` applies the same rule as generate.
+    assert_eq!((SEA_LEVEL + 1) % 16, 0, "sea surface off the level-4 grid");
+    for level in 1u8..=4 {
+        let cell = 1i64 << level;
+        let side = 32 * cell;
+        let at = |y: i64| {
+            let lod = terrain.sample_lod(
+                level,
+                CubePos {
+                    x: x.div_euclid(side) as i32,
+                    y: y.div_euclid(side) as i32,
+                    z: z.div_euclid(side) as i32,
+                },
+            );
+            let local = LocalPos::new(
+                (x.rem_euclid(side) / cell) as u8,
+                (y.rem_euclid(side) / cell) as u8,
+                (z.rem_euclid(side) / cell) as u8,
+            );
+            lod.get(local.unwrap())
+        };
+        assert_ne!(
+            at(SEA_LEVEL),
+            BlockStateId::AIR,
+            "LOD{level} cell at sea level is filled"
+        );
+        assert_eq!(
+            at(SEA_LEVEL + 1),
+            BlockStateId::AIR,
+            "LOD{level} cell above the sea is air"
+        );
+    }
 }
 
 #[test]

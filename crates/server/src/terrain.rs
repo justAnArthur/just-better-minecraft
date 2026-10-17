@@ -27,13 +27,23 @@ use crate::worldgen::{self, CompiledGraph, Preset};
 /// non-solid, so physics passes through it; there is no swimming or flow.
 /// Only the `Overworld` preset has a sea (see [`Preset::sea_level`]) —
 /// `Classic` is frozen bit-for-bit and never gains water.
-pub const SEA_LEVEL: i64 = 64;
+///
+/// The water's top face sits at `SEA_LEVEL + 1 = 64`, a multiple of 16:
+/// every LOD cell boundary up to level 4 falls on it, so the downsampled
+/// sea is exactly as high at every level. (At 64 the top face sat at 65,
+/// and each level's lean-solid rounding lifted it, 66, 68, 72, 80 — a
+/// visible step on the ocean at every ring border.)
+pub const SEA_LEVEL: i64 = 63;
 
-/// Sea-adjacent level: a solid cell whose surface sits at or below it gets
-/// sand instead of grass and dirt. Tied to [`SEA_LEVEL`] so beaches sit
-/// just under the waterline; `SEA_LEVEL - 3 = 61` keeps the classic
-/// terrain's rule exactly.
-const SAND_LEVEL: i64 = SEA_LEVEL - 3;
+/// The classic terrain's sand line: a solid cell whose surface sits at or
+/// below it gets sand instead of grass and dirt. Frozen at 61 with the
+/// classic preset.
+const SAND_LEVEL: i64 = 61;
+
+/// The overworld's beach line: columns whose surface is at most one block
+/// above the water (`SEA_LEVEL + 1`), and the seabed, are sand, so coasts
+/// show a sand rim above the waterline.
+const BEACH_LEVEL: i64 = SEA_LEVEL + 1;
 
 /// Above this height the surface is bare stone: no soil survives the
 /// altitude (snow needs a block and a texture and is a follow-up).
@@ -97,8 +107,8 @@ fn surface_block(solid: bool, d: u8, y: i64, blocks: &Blocks) -> BlockStateId {
 ///
 /// - **stone** when `h >= STONE_LEVEL` (bare-rock peaks) or
 ///   `slope >= STEEP_SLOPE` (cliffs: soil cannot hold);
-/// - **sand** when `h <= SAND_LEVEL` (beaches and the seabed, the same
-///   belt the classic rule gives);
+/// - **sand** when `h <= BEACH_LEVEL` (a beach rim one block above the
+///   water, and the seabed);
 /// - **grass** over dirt otherwise.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TopMaterial {
@@ -110,7 +120,7 @@ enum TopMaterial {
 fn column_material(h: i64, slope: i64) -> TopMaterial {
     if h >= STONE_LEVEL || slope >= STEEP_SLOPE {
         TopMaterial::Stone
-    } else if h <= SAND_LEVEL {
+    } else if h <= BEACH_LEVEL {
         TopMaterial::Sand
     } else {
         TopMaterial::Grass
@@ -816,7 +826,7 @@ impl Generator {
                 .max((h - surfaces[(gz + 1) * extended + gx]).abs());
             if h >= STONE_LEVEL || slope >= bar {
                 TopMaterial::Stone
-            } else if h <= SAND_LEVEL {
+            } else if h <= BEACH_LEVEL {
                 TopMaterial::Sand
             } else {
                 TopMaterial::Grass
