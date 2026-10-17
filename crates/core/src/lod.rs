@@ -56,6 +56,18 @@ use crate::cube::Cube;
 /// Children per parent cell.
 pub const CHILDREN: usize = 8;
 
+/// The far-look view distances in blocks, `(LOD0 disk radius, outermost
+/// LOD ring radius)`: `view_radius · CUBE_SIZE` and `lod_view_radius ·
+/// CUBE_SIZE · 2^lod_levels`. The one rule shared by the server config,
+/// the game's view setup and the client's debug panel (task 2.12).
+pub fn ring_radii(view_radius: u32, lod_view_radius: u32, lod_levels: u8) -> (f32, f32) {
+    let cube = CUBE_SIZE as f32;
+    (
+        view_radius as f32 * cube,
+        lod_view_radius as f32 * cube * (1u32 << lod_levels) as f32,
+    )
+}
+
 /// A cube at a LOD level. Level 0 is the streamed world itself ("LOD0");
 /// a level-*n* cube at `pos` covers blocks `pos * CUBE_SIZE * 2^n` onwards
 /// and each of its cells is `2^n` blocks per side. One key type names
@@ -437,6 +449,17 @@ mod tests {
     const DIRT: BlockStateId = BlockStateId(2);
     const GRASS: BlockStateId = BlockStateId(3);
     const PLANKS: BlockStateId = BlockStateId(4);
+
+    /// The one far-look radius rule (task 2.12): the LOD0 disk in blocks,
+    /// and the outermost ring scaled by `2^lod_levels`. The shipped
+    /// defaults (8, 8, 6) give 8 cubes and 512 cubes.
+    #[test]
+    fn ring_radii_follow_the_level_count() {
+        let cube = CUBE_SIZE as f32;
+        assert_eq!(ring_radii(8, 8, 6), (8.0 * cube, 8.0 * cube * 64.0));
+        assert_eq!(ring_radii(4, 2, 0), (4.0 * cube, 2.0 * cube));
+        assert_eq!(ring_radii(32, 16, 3).1, 16.0 * cube * 8.0);
+    }
 
     /// `children[dx + 2·dz + 4·dy]` from a per-cell closure taking
     /// `(dx, dy, dz)`.

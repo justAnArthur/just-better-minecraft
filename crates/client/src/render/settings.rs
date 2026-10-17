@@ -1,22 +1,31 @@
 //! Renderer-owned frame settings: one struct for the toggles and view
 //! distances the renderer and the terrain pass must agree on — fog, the
-//! level tint, the far-look radii and the terrain draw-path flags. The
-//! renderer owns the one live copy and hands `&RenderSettings` to
-//! `TerrainPass::draw` each frame; the app reads the environment once at
-//! startup through [`RenderSettings::from_env`] (the only place the
-//! JBM_* rendering variables are read). The debug panel adds its toggles
-//! as fields here.
+//! level tint, the far-look radii, the terrain draw-path flags and the
+//! task 2.12 debug views. The renderer owns the one live copy and hands
+//! `&RenderSettings` to `TerrainPass::draw` each frame; the app reads the
+//! environment once at startup through [`RenderSettings::from_env`] (the
+//! only place the JBM_* rendering variables are read). The debug panel
+//! edits the same fields live.
 
 use crate::render::terrain::{DEFAULT_FURTHEST_RING_RADIUS, DEFAULT_LOD0_RING_RADIUS};
+
+/// How many LOD levels exist (levels 0..=6): the width of `level_mask`.
+pub const LOD_LEVELS: u32 = 7;
+
+/// Every level shown (the default level mask).
+pub const ALL_LEVELS: u8 = 0x7F;
 
 /// The frame-level rendering settings.
 ///
 /// - `fog` / `lod_tint` / `far_radii` are per-frame visual state: the
 ///   renderer passes them to the terrain pass with every draw.
 /// - `prefer_gpu_cull` / `force_cpu_cull` / `force_fallback` seed the
-///   terrain pass's path choice at construction (`TerrainPass::with_settings`);
-///   the pass's own `set_force_*` setters remain the test and bench
+///   terrain pass's path choice; the pass re-reads them from the settings
+///   every draw (task 2.12), so the panel's checkboxes switch the path
+///   live. The pass's own `set_force_*` setters remain the test and bench
 ///   override.
+/// - The debug-view fields (task 2.12) ride the same path: the terrain
+///   pass bakes them into its per-frame uniforms and cull params.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RenderSettings {
     /// Whether terrain distance fog applies; off via `JBM_NO_FOG=1`.
@@ -34,10 +43,38 @@ pub struct RenderSettings {
     /// Prefer the gpu-cull path over the cpu-cull default; on via
     /// `JBM_GPU_CULL=1`. Ignored when the adapter is not gpu-capable.
     pub prefer_gpu_cull: bool,
-    /// Force the cpu-cull path (no environment variable; tests, benches).
+    /// Force the cpu-cull path (no environment variable; tests, benches,
+    /// the panel's checkbox).
     pub force_cpu_cull: bool,
     /// Force the direct-draw fallback; on via `JBM_NO_MDI=1`.
     pub force_fallback: bool,
+    /// The wireframe debug view (task 2.12): the terrain fragment shader
+    /// brightens the outer edge of every greedy quad; on via
+    /// `JBM_WIREFRAME=1`.
+    pub wireframe: bool,
+    /// Wireframe only (task 2.12): the edges over a flat background, no
+    /// textures, shade, fog or tint; on via `JBM_WIREFRAME_ONLY=1`
+    /// (implies `wireframe`).
+    pub wireframe_only: bool,
+    /// The chunk-border debug view (task 2.12): the renderer's line pass
+    /// draws resident cube boundaries, colored by the tint palette; on via
+    /// `JBM_CHUNK_BORDERS=1`.
+    pub chunk_borders: bool,
+    /// The exploded-cube debug view's gap in blocks (task 2.12): the
+    /// vertex shader shifts every cube by `gap × its cube-grid offset`,
+    /// spreading the world apart. 0 = off; `JBM_EXPLODE=<gap>` seeds it.
+    /// While nonzero, both cull paths skip frustum culling (the moved
+    /// cubes sit outside every conservative bound).
+    pub explode: u32,
+    /// Which LOD levels draw, one bit per level 0..=6 (task 2.12): a
+    /// hidden level leaves a hole. `JBM_LEVELS=0,1,3` shows exactly those
+    /// levels; the panel's per-level checkboxes edit the bits.
+    pub level_mask: u8,
+    /// The freeze-culling debug view (task 2.12): the cull keeps using the
+    /// frustum and position captured when it was switched on while the
+    /// camera moves freely, so what draws no longer follows the view; on
+    /// via `JBM_FREEZE_CULL=1`.
+    pub freeze_cull: bool,
 }
 
 impl Default for RenderSettings {
@@ -49,46 +86,116 @@ impl Default for RenderSettings {
             prefer_gpu_cull: false,
             force_cpu_cull: false,
             force_fallback: false,
+            wireframe: false,
+            wireframe_only: false,
+            chunk_borders: false,
+            explode: 0,
+            level_mask: ALL_LEVELS,
+            freeze_cull: false,
         }
     }
 }
 
 impl RenderSettings {
-    /// Reads the rendering environment variables, each checked as
-    /// `NAME=1`: `JBM_NO_FOG` (fog off), `JBM_LOD_TINT` (tint on),
-    /// `JBM_GPU_CULL` (prefer gpu-cull) and `JBM_NO_MDI` (force the
-    /// direct-draw fallback). The app calls this once at startup and
+    /// Reads the rendering environment variables: `JBM_NO_FOG`,
+    /// `JBM_LOD_TINT`, `JBM_GPU_CULL` and `JBM_NO_MDI` as `NAME=1`;
+    /// `JBM_WIREFRAME`, `JBM_WIREFRAME_ONLY`, `JBM_CHUNK_BORDERS` and
+    /// `JBM_FREEZE_CULL` as `NAME=1`; `JBM_EXPLODE=<gap>` (any value,
+    /// clamped to 0..=8) and `JBM_LEVELS=<comma-separated level list>` as
+    /// the shown-levels mask. The app calls this once at startup and
     /// never reads them again.
     pub fn from_env() -> RenderSettings {
         let flag = |name: &str| std::env::var_os(name).is_some_and(|v| v == "1");
+        let explode = std::env::var("JBM_EXPLODE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(8);
+        let level_mask = level_mask_from_list(&std::env::var("JBM_LEVELS").unwrap_or_default());
         RenderSettings::from_flags(
-            flag("JBM_NO_FOG"),
-            flag("JBM_LOD_TINT"),
-            flag("JBM_GPU_CULL"),
-            flag("JBM_NO_MDI"),
+            DebugFlags {
+                no_fog: flag("JBM_NO_FOG"),
+                lod_tint: flag("JBM_LOD_TINT"),
+                prefer_gpu_cull: flag("JBM_GPU_CULL"),
+                no_mdi: flag("JBM_NO_MDI"),
+                wireframe: flag("JBM_WIREFRAME"),
+                wireframe_only: flag("JBM_WIREFRAME_ONLY"),
+                chunk_borders: flag("JBM_CHUNK_BORDERS"),
+                freeze_cull: flag("JBM_FREEZE_CULL"),
+            },
+            explode,
+            level_mask,
         )
     }
 
     /// The environment mapping, pure so it can be unit-tested.
-    fn from_flags(
-        no_fog: bool,
-        lod_tint: bool,
-        prefer_gpu_cull: bool,
-        no_mdi: bool,
-    ) -> RenderSettings {
+    fn from_flags(flags: DebugFlags, explode: u32, level_mask: u8) -> RenderSettings {
         RenderSettings {
-            fog: !no_fog,
-            lod_tint,
-            prefer_gpu_cull,
-            force_fallback: no_mdi,
+            fog: !flags.no_fog,
+            lod_tint: flags.lod_tint,
+            prefer_gpu_cull: flags.prefer_gpu_cull,
+            force_fallback: flags.no_mdi,
+            wireframe: flags.wireframe || flags.wireframe_only,
+            wireframe_only: flags.wireframe_only,
+            chunk_borders: flags.chunk_borders,
+            explode,
+            level_mask,
+            freeze_cull: flags.freeze_cull,
             ..RenderSettings::default()
         }
     }
 }
 
+/// The boolean half of the environment mapping.
+#[derive(Debug, Clone, Copy)]
+struct DebugFlags {
+    no_fog: bool,
+    lod_tint: bool,
+    prefer_gpu_cull: bool,
+    no_mdi: bool,
+    wireframe: bool,
+    wireframe_only: bool,
+    chunk_borders: bool,
+    freeze_cull: bool,
+}
+
+/// Parses `JBM_LEVELS`'s comma-separated level list ("0,1,3") into the
+/// bit mask. Empty or unparsable input keeps every level; entries outside
+/// 0..=6 are ignored.
+fn level_mask_from_list(list: &str) -> u8 {
+    let trimmed = list.trim();
+    if trimmed.is_empty() {
+        return ALL_LEVELS;
+    }
+    let mut mask = 0u8;
+    let mut any = false;
+    for part in trimmed.split(',') {
+        if let Ok(level) = part.trim().parse::<u32>()
+            && level < LOD_LEVELS
+        {
+            mask |= 1 << level;
+            any = true;
+        }
+    }
+    if any { mask } else { ALL_LEVELS }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn flags() -> DebugFlags {
+        DebugFlags {
+            no_fog: false,
+            lod_tint: false,
+            prefer_gpu_cull: false,
+            no_mdi: false,
+            wireframe: false,
+            wireframe_only: false,
+            chunk_borders: false,
+            freeze_cull: false,
+        }
+    }
 
     #[test]
     fn defaults_match_the_documented_choices() {
@@ -98,6 +205,12 @@ mod tests {
         assert!(!settings.prefer_gpu_cull, "cpu-cull is the default path");
         assert!(!settings.force_cpu_cull);
         assert!(!settings.force_fallback);
+        assert_eq!(settings.level_mask, ALL_LEVELS, "every level shows");
+        assert!(!settings.wireframe);
+        assert!(!settings.wireframe_only);
+        assert!(!settings.chunk_borders);
+        assert_eq!(settings.explode, 0);
+        assert!(!settings.freeze_cull);
         assert_eq!(
             settings.far_radii,
             [DEFAULT_LOD0_RING_RADIUS, DEFAULT_FURTHEST_RING_RADIUS]
@@ -107,24 +220,68 @@ mod tests {
     #[test]
     fn env_flags_map_to_settings() {
         // Nothing set: the defaults.
-        let settings = RenderSettings::from_flags(false, false, false, false);
+        let settings = RenderSettings::from_flags(flags(), 0, ALL_LEVELS);
         assert_eq!(settings, RenderSettings::default());
         // Each variable flips exactly its own field.
-        let settings = RenderSettings::from_flags(true, false, false, false);
+        let mut f = flags();
+        f.no_fog = true;
+        let settings = RenderSettings::from_flags(f, 0, ALL_LEVELS);
         assert!(!settings.fog);
         assert!(!settings.lod_tint);
         assert!(!settings.prefer_gpu_cull);
         assert!(!settings.force_fallback);
-        let settings = RenderSettings::from_flags(false, true, false, false);
-        assert!(settings.fog);
-        assert!(settings.lod_tint);
-        let settings = RenderSettings::from_flags(false, false, true, false);
+        let mut f = flags();
+        f.lod_tint = true;
+        assert!(RenderSettings::from_flags(f, 0, ALL_LEVELS).lod_tint);
+        let mut f = flags();
+        f.prefer_gpu_cull = true;
+        let settings = RenderSettings::from_flags(f, 0, ALL_LEVELS);
         assert!(settings.prefer_gpu_cull);
         assert!(!settings.force_fallback);
         // JBM_NO_MDI forces the fallback (the same path a missing-MDI
         // adapter selects).
-        let settings = RenderSettings::from_flags(false, false, true, true);
+        let mut f = flags();
+        f.no_mdi = true;
+        f.prefer_gpu_cull = true;
+        let settings = RenderSettings::from_flags(f, 0, ALL_LEVELS);
         assert!(settings.force_fallback);
         assert!(settings.prefer_gpu_cull, "the flags are independent");
+    }
+
+    /// The task 2.12 debug-view variables: each flips its own field, and
+    /// `JBM_WIREFRAME_ONLY=1` implies the wireframe.
+    #[test]
+    fn debug_env_flags_map_to_settings() {
+        let mut f = flags();
+        f.wireframe = true;
+        let settings = RenderSettings::from_flags(f, 0, ALL_LEVELS);
+        assert!(settings.wireframe);
+        assert!(!settings.wireframe_only);
+        let mut f = flags();
+        f.wireframe_only = true;
+        let settings = RenderSettings::from_flags(f, 0, ALL_LEVELS);
+        assert!(settings.wireframe, "wireframe-only implies wireframe");
+        assert!(settings.wireframe_only);
+        let mut f = flags();
+        f.chunk_borders = true;
+        assert!(RenderSettings::from_flags(f, 0, ALL_LEVELS).chunk_borders);
+        let mut f = flags();
+        f.freeze_cull = true;
+        assert!(RenderSettings::from_flags(f, 0, ALL_LEVELS).freeze_cull);
+        let settings = RenderSettings::from_flags(flags(), 4, ALL_LEVELS);
+        assert_eq!(settings.explode, 4);
+    }
+
+    /// `JBM_LEVELS` parses a comma-separated list into the mask; junk
+    /// keeps every level rather than hiding the world.
+    #[test]
+    fn levels_list_parses_into_the_mask() {
+        assert_eq!(level_mask_from_list("0,1,3"), 0b000_1011);
+        assert_eq!(level_mask_from_list("6"), 0b100_0000);
+        assert_eq!(level_mask_from_list(" 2 , 4 "), 0b01_0100);
+        assert_eq!(level_mask_from_list(""), ALL_LEVELS);
+        assert_eq!(level_mask_from_list("junk"), ALL_LEVELS);
+        assert_eq!(level_mask_from_list("9,17"), ALL_LEVELS, "out of range");
+        assert_eq!(level_mask_from_list("0,x,2"), 0b101, "junk entries skip");
     }
 }

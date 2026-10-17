@@ -14,6 +14,7 @@
 //! comparison bench.
 
 mod lod_sample;
+mod playground;
 mod surface;
 
 use std::collections::HashMap;
@@ -121,6 +122,11 @@ pub struct Generator {
     /// `None` (the classic preset, custom graphs) keeps the sea-less
     /// surface rules bit-for-bit.
     sea_level: Option<i64>,
+    /// Task 2.12's fixed-layout debug world: `generate`, `sample_lod`,
+    /// `surface_height`, `column_surface_bounds` and `spawn` run the
+    /// [`playground`] model instead of the graph (which stays as the
+    /// preset's unused placeholder).
+    playground: bool,
     column_cache: Mutex<HashMap<(i32, i32), ColumnData>>,
     /// Test hooks: how many `generate` and how many `sample_lod`
     /// mixed-path calls ran. Fast paths count nowhere — the LOD tests use
@@ -138,13 +144,15 @@ impl Generator {
         Self::with_preset(seed, blocks, Preset::Overworld)
     }
 
-    /// A generator running one of the shipped graph presets.
+    /// A generator running one of the shipped presets. `Preset::Playground`
+    /// runs the fixed debug layout instead of a graph (task 2.12).
     pub fn with_preset(seed: u64, blocks: Blocks, preset: Preset) -> Self {
         Self {
             seed,
             blocks,
             graph: preset.compiled(),
             sea_level: preset.sea_level(),
+            playground: preset == Preset::Playground,
             column_cache: Mutex::new(HashMap::new()),
             generate_calls: AtomicU64::new(0),
             lod_sample_calls: AtomicU64::new(0),
@@ -160,6 +168,7 @@ impl Generator {
             blocks,
             graph: Arc::new(graph.clone()),
             sea_level: None,
+            playground: false,
             column_cache: Mutex::new(HashMap::new()),
             generate_calls: AtomicU64::new(0),
             lod_sample_calls: AtomicU64::new(0),
@@ -186,6 +195,9 @@ impl Generator {
     /// `[MIN_HEIGHT, MAX_HEIGHT]` only, and yield `MIN_HEIGHT - 1` when
     /// nothing in that range is solid.
     pub fn surface_height(&self, x: i64, z: i64) -> i64 {
+        if self.playground {
+            return playground::column(x, z, &self.blocks).height;
+        }
         let graph = self.graph.as_ref();
         match graph.band() {
             Some(band) => {
@@ -215,6 +227,9 @@ impl Generator {
     /// without a sea (classic, custom graphs) keep spawning over
     /// `(0, 0)` exactly as before.
     pub fn spawn(&self) -> [f64; 3] {
+        if self.playground {
+            return playground::spawn();
+        }
         let Some(sea) = self.sea_level else {
             return [0.5, (self.surface_height(0, 0) + 2) as f64, 0.5];
         };
@@ -385,6 +400,20 @@ impl Generator {
     /// a fresh one costs about one mixed cube's evaluation; unbanded
     /// graphs evaluate their (typically tiny, test-made) columns directly.
     pub fn column_surface_bounds(&self, cx: i32, cz: i32) -> (i64, i64) {
+        if self.playground {
+            let base_x = i64::from(cx) * i64::from(CUBE_SIZE);
+            let base_z = i64::from(cz) * i64::from(CUBE_SIZE);
+            let mut min = i64::MAX;
+            let mut max = i64::MIN;
+            for z in 0..i64::from(CUBE_SIZE) {
+                for x in 0..i64::from(CUBE_SIZE) {
+                    let h = playground::column(base_x + x, base_z + z, &self.blocks).height;
+                    min = min.min(h);
+                    max = max.max(h);
+                }
+            }
+            return (min, max);
+        }
         match self.column_data(cx, cz) {
             ColumnData::Bits { heights, .. } => {
                 let mut min = i64::MAX;
@@ -422,6 +451,20 @@ impl Generator {
     /// per-block `set` palette churn.
     pub fn generate(&self, pos: CubePos) -> Cube {
         self.generate_calls.fetch_add(1, Ordering::Relaxed);
+        if self.playground {
+            let bottom = i64::from(pos.y) * i64::from(CUBE_SIZE);
+            let base_x = i64::from(pos.x) * i64::from(CUBE_SIZE);
+            let base_z = i64::from(pos.z) * i64::from(CUBE_SIZE);
+            let blocks = self.blocks;
+            return Cube::from_fn(|p| {
+                playground::state(
+                    base_x + i64::from(p.x),
+                    bottom + i64::from(p.y),
+                    base_z + i64::from(p.z),
+                    &blocks,
+                )
+            });
+        }
         let graph = self.graph.as_ref();
         let bottom = i64::from(pos.y) * i64::from(CUBE_SIZE);
         let top = bottom + i64::from(CUBE_SIZE) - 1;

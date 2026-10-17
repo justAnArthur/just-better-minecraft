@@ -3,9 +3,11 @@
 //! readback ring that brings the GPU counters home one or two frames
 //! late.
 
-/// u32 words in the GPU stats buffer: 7 counters plus the region-overflow
-/// counter (word 7, asserted zero by tests).
-pub(super) const STATS_WORDS: usize = 8;
+/// u32 words in the GPU stats buffer: 8 frame counters (7 plus the
+/// region-overflow word, asserted zero by tests), then 7 per-level drawn
+/// counts and 7 per-level face counts (task 2.12; levels 0..=6, the last
+/// entry collecting anything beyond).
+pub(super) const STATS_WORDS: usize = 22;
 pub(super) const STATS_BYTES: u64 = STATS_WORDS as u64 * 4;
 
 /// GPU culling counters, filled by cull.wgsl and read back one or two
@@ -32,10 +34,19 @@ pub struct CullStats {
     /// frustum bound must be >= what the GPU emits). Always zero; the
     /// tests assert it.
     pub region_overflow: u32,
+    /// Cubes drawn this frame per level (task 2.12): index L = level L,
+    /// the last entry collecting anything beyond 6.
+    pub level_drawn: [u32; 7],
+    /// Faces issued this frame per level, the same indexing.
+    pub level_faces: [u32; 7],
 }
 
 impl CullStats {
     fn from_words(words: &[u32]) -> CullStats {
+        let mut level_drawn = [0u32; 7];
+        let mut level_faces = [0u32; 7];
+        level_drawn.copy_from_slice(&words[8..15]);
+        level_faces.copy_from_slice(&words[15..22]);
         CullStats {
             candidates: words[0],
             frustum_culled: words[1],
@@ -45,6 +56,8 @@ impl CullStats {
             commands: words[5],
             faces: words[6],
             region_overflow: words[7],
+            level_drawn,
+            level_faces,
         }
     }
 
@@ -69,6 +82,12 @@ pub struct LevelStats {
     pub faces: u64,
     /// Faces emitted under the skirt rule.
     pub skirts: u32,
+    /// Cubes the cull actually drew this frame at this level (task 2.12;
+    /// on the gpu-cull path, one or two frames late like the rest of
+    /// [`CullStats`]).
+    pub frame_drawn: u32,
+    /// Faces the cull issued this frame at this level.
+    pub frame_faces: u64,
 }
 
 /// Per-frame terrain draw statistics, for the overlay and the metrics

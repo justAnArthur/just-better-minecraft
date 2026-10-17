@@ -42,6 +42,7 @@ pub use stats::{CullStats, LevelStats, TerrainStats};
 
 use std::ops::Range;
 
+use glam::{DVec3, Mat4};
 use jbm_core::coords::CUBE_SIZE;
 
 use crate::camera::Camera;
@@ -53,7 +54,7 @@ use crate::render::renderer::DepthTarget;
 use crate::render::settings::RenderSettings;
 use crate::render::texture_array::BlockTextures;
 
-use layout::{far_uniform_words, meta_flags, meta_for, tint_uniform_words};
+use layout::{debug_uniform_words, far_uniform_words, meta_flags, meta_for, tint_uniform_words};
 use pages::{FacePage, MeshBookkeeping};
 use pipelines::FACE_BYTES;
 use stats::StatsRing;
@@ -62,6 +63,17 @@ use stats::StatsRing;
 /// half the cube's blocks facing all six ways.
 pub fn worst_case_faces() -> u32 {
     ((CUBE_SIZE as u64).pow(3) * 6 / 2) as u32
+}
+
+/// The freeze-cull view's captured state (task 2.12): the camera position
+/// and rotation-only view-projection from the moment the debug view
+/// switched on. The cull keeps testing against these while the real
+/// camera moves; `frozen_view` hands them to the app so it can draw the
+/// frozen frustum as lines.
+#[derive(Debug, Clone, Copy)]
+struct Frozen {
+    position: DVec3,
+    view_proj: Mat4,
 }
 
 /// Which of the three terrain paths a frame uses.
@@ -142,6 +154,11 @@ pub struct TerrainPass {
     region_counter_buffer: wgpu::Buffer,
     stats_buffer: wgpu::Buffer,
     stats_ring: StatsRing,
+    /// The freeze-cull view's uniform (group 1, binding 7 of cull.wgsl).
+    freeze_buffer: wgpu::Buffer,
+    /// The frozen camera the cull keeps using while `freeze_cull` is on;
+    /// captured on the setting's rising edge, released when it goes off.
+    frozen: Option<Frozen>,
     hiz: Option<HizPyramid>,
     /// The 1x1 view the cull bind group binds before the first gpu-cull
     /// frame creates the real pyramid (uploads grow the region buffers,
@@ -162,6 +179,11 @@ pub struct TerrainPass {
     force_cpu_cull: bool,
     /// Forced fallback for tests and benches (`set_force_fallback`).
     force_fallback: bool,
+    /// The path flags the last draw applied from `RenderSettings`, so a
+    /// settings change (the panel) is detected and applied while the
+    /// `set_*` setters' overrides survive until the settings actually
+    /// change (they hold between draws by design).
+    applied_paths: [bool; 3],
     stats: TerrainStats,
 }
 
@@ -475,8 +497,8 @@ impl TerrainPass {
     }
 
     /// The per-frame terrain uniform for `camera` (the one object both
-    /// draw paths write); the view distances, fog and tint come from the
-    /// renderer-owned `RenderSettings`.
+    /// draw paths write); the view distances, fog, tint and the task 2.12
+    /// debug views come from the renderer-owned `RenderSettings`.
     fn terrain_uniforms_for(&self, camera: &Camera, settings: &RenderSettings) -> TerrainUniforms {
         let (camera_cube, camera_frac) = camera_split(camera.position);
         TerrainUniforms {
@@ -489,14 +511,69 @@ impl TerrainPass {
             ],
             far: far_uniform_words(settings.far_radii, settings.fog),
             tint: tint_uniform_words(settings.lod_tint),
+            debug: debug_uniform_words(settings),
         }
+    }
+
+    /// Captures or releases the freeze-cull view on the setting's edges
+    /// (task 2.12), and writes the frozen uniform the cull shader reads.
+    fn update_frozen(&mut self, gpu: &Gpu, camera: &Camera, settings: &RenderSettings) {
+        if settings.freeze_cull && self.frozen.is_none() {
+            self.frozen = Some(Frozen {
+                position: camera.position,
+                view_proj: camera.view_proj(),
+            });
+        }
+        if !settings.freeze_cull {
+            self.frozen = None;
+        }
+        if let Some(frozen) = &self.frozen {
+            let (camera_cube, camera_frac) = camera_split(frozen.position);
+            let freeze = layout::FreezeParams {
+                view_proj: frozen.view_proj.to_cols_array_2d(),
+                camera_cube: [camera_cube.x, camera_cube.y, camera_cube.z, 0],
+                camera_frac: [
+                    camera_frac.x,
+                    camera_frac.y,
+                    camera_frac.z,
+                    CUBE_SIZE as f32,
+                ],
+            };
+            gpu.queue
+                .write_buffer(&self.freeze_buffer, 0, bytemuck::bytes_of(&freeze));
+        }
+    }
+
+    /// The frozen camera the cull keeps testing against while the
+    /// freeze-cull view is on (task 2.12): its world position and
+    /// rotation-only view-projection, for drawing the frozen frustum.
+    pub fn frozen_view(&self) -> Option<(DVec3, Mat4)> {
+        self.frozen
+            .map(|frozen| (frozen.position, frozen.view_proj))
+    }
+
+    /// The resident cubes the coverage rule draws (task 2.12's chunk
+    /// borders iterate them): one key per non-empty, drawn, not fully
+    /// masked mesh.
+    pub fn resident_keys(&self) -> Vec<CubeKey> {
+        self.book
+            .meshes
+            .iter()
+            .filter(|(_, mesh)| {
+                mesh.face_count > 0 && mesh.drawn && mesh.mask != 0xFF && mesh.alloc.is_some()
+            })
+            .map(|(key, _)| *key)
+            .collect()
     }
 
     pub fn stats(&self) -> TerrainStats {
         self.stats
     }
 
-    /// Per-level residency, coverage and face counts, level-ascending.
+    /// Per-level residency, coverage and face counts, level-ascending,
+    /// with the cull's per-level drawn and face counters merged in (task
+    /// 2.12; on the gpu-cull path those lag one or two frames like the
+    /// rest of `CullStats`).
     pub fn level_stats(&self) -> Vec<LevelStats> {
         let mut levels: Vec<LevelStats> = Vec::new();
         for (key, mesh) in &self.book.meshes {
@@ -513,6 +590,11 @@ impl TerrainPass {
             }
             entry.faces += u64::from(mesh.face_count);
             entry.skirts += mesh.skirts;
+        }
+        for (level, entry) in levels.iter_mut().enumerate() {
+            let index = level.min(self.last_cull.level_drawn.len() - 1);
+            entry.frame_drawn = self.last_cull.level_drawn[index];
+            entry.frame_faces = u64::from(self.last_cull.level_faces[index]);
         }
         levels
     }
@@ -650,7 +732,8 @@ impl TerrainPass {
     /// Records the terrain draw on the chosen path. See the path table in
     /// the README; `draw_gpu_cull` and `draw_cpu_cull` in the path
     /// modules. `settings` is the renderer-owned frame state (fog, level
-    /// tint).
+    /// tint, the task 2.12 debug views) — its path flags are re-applied
+    /// every draw, so the panel's force checkboxes switch the path live.
     // The seven parameters are one frame's draw context; a bundling
     // struct would only be unpacked again in each path.
     #[allow(clippy::too_many_arguments)]
@@ -664,6 +747,22 @@ impl TerrainPass {
         uniforms: &wgpu::BindGroup,
         settings: &RenderSettings,
     ) {
+        // Live path switching (task 2.12): a settings change (the panel)
+        // is applied on the next draw. The set_force_* setters hold
+        // between draws by design, so unchanged settings never clobber
+        // them.
+        let paths = [
+            settings.prefer_gpu_cull,
+            settings.force_cpu_cull,
+            settings.force_fallback,
+        ];
+        if paths != self.applied_paths {
+            self.applied_paths = paths;
+            self.prefer_gpu_cull = settings.prefer_gpu_cull;
+            self.force_cpu_cull = settings.force_cpu_cull;
+            self.force_fallback = settings.force_fallback;
+        }
+        self.update_frozen(gpu, camera, settings);
         match self.active_path() {
             TerrainPath::GpuCull => {
                 self.draw_gpu_cull(gpu, encoder, target, depth, camera, uniforms, settings)

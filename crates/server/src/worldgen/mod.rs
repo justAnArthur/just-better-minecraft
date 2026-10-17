@@ -53,38 +53,47 @@ pub const CLASSIC_JSON: &str = include_str!("../../assets/worldgen/classic.json"
 /// Which shipped worldgen a server generates with ([`crate::server::
 /// ServerConfig::worldgen`]). `Overworld` is the default; `Classic` is the
 /// pre-2.8 terrain, kept so tests and goldens that depend on it keep their
-/// meaning.
+/// meaning; `Playground` is task 2.12's fixed-layout debug world — no
+/// graph at all, see [`crate::terrain::playground`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Preset {
     Overworld,
     Classic,
+    Playground,
 }
 
 impl Preset {
-    /// The preset's JSON text.
+    /// The preset's JSON text. `Playground` has none — it is a Rust
+    /// generator, not a density graph (its features — checkerboards,
+    /// per-feature materials — are not expressible as density); the
+    /// callers that would print it get a descriptive line instead.
     pub fn json(self) -> &'static str {
         match self {
             Preset::Overworld => OVERWORLD_JSON,
             Preset::Classic => CLASSIC_JSON,
+            Preset::Playground => "(the playground debug world: a fixed Rust layout, no graph)",
         }
     }
 
     /// The preset's compiled graph, compiled once per process. A broken
     /// shipped graph is a bug caught by the worldgen tests, so loading
-    /// panics.
+    /// panics. `Playground` never runs a graph — the placeholder keeps
+    /// this method total; the generator ignores it.
     pub fn compiled(self) -> Arc<CompiledGraph> {
         match self {
             Preset::Overworld => overworld(),
             Preset::Classic => classic(),
+            Preset::Playground => overworld(),
         }
     }
 
     /// The preset's sea level: air at or below it becomes water (task 2.8).
     /// `None` for `Classic` — it never had water, and its tests and goldens
-    /// stay meaningful only if it never gains any.
+    /// stay meaningful only if it never gains any. `Playground`'s pool
+    /// surfaces at the same sea level as the overworld's ocean.
     pub fn sea_level(self) -> Option<i64> {
         match self {
-            Preset::Overworld => Some(crate::terrain::SEA_LEVEL),
+            Preset::Overworld | Preset::Playground => Some(crate::terrain::SEA_LEVEL),
             Preset::Classic => None,
         }
     }

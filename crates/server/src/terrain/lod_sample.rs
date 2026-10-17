@@ -47,6 +47,9 @@ impl Generator {
     /// column and take the band's provable solid/air rows for free.
     pub fn sample_lod(&self, level: u8, pos: CubePos) -> Cube {
         assert!(level >= 1, "sample_lod is for levels >= 1");
+        if self.playground {
+            return self.sample_lod_playground(level, pos);
+        }
         let graph = self.graph.as_ref();
         let step = 1i64 << (level as u32 - 1); // 2^(n-1) blocks between samples
         let side = i64::from(CUBE_SIZE) << level as u32; // blocks per axis
@@ -101,6 +104,37 @@ impl Generator {
         // reduce each 2×2×2 sample group to one cell.
         let sampled = sample_columns(&mut sampler, sea.is_some(), per_axis);
         let states = style_columns(&sampler, &sampled, sea, &self.blocks, per_axis);
+        reduce_to_cube(&states, per_axis)
+    }
+
+    /// The playground's LOD sample (task 2.12): the same three phases as
+    /// the graph path, but "sampling" reads the fixed layout's block at
+    /// each sample point — the very function `generate` fills LOD0 with —
+    /// so level 1 is exact by construction and coarser levels follow the
+    /// same min-corner sampling rule.
+    fn sample_lod_playground(&self, level: u8, pos: CubePos) -> Cube {
+        self.lod_sample_calls.fetch_add(1, Ordering::Relaxed);
+        let step = 1i64 << (level as u32 - 1);
+        let side = i64::from(CUBE_SIZE) << level as u32;
+        let base = [
+            i64::from(pos.x) * side,
+            i64::from(pos.y) * side,
+            i64::from(pos.z) * side,
+        ];
+        let per_axis = 2 * CUBE_SIZE as usize;
+        let blocks = self.blocks;
+        let mut states = vec![BlockStateId::AIR; per_axis * per_axis * per_axis];
+        for j in 0..per_axis {
+            let y = base[1] + step * j as i64;
+            for z in 0..per_axis {
+                let wz = base[2] + step * z as i64;
+                for x in 0..per_axis {
+                    let wx = base[0] + step * x as i64;
+                    states[(j * per_axis + z) * per_axis + x] =
+                        super::playground::state(wx, y, wz, &blocks);
+                }
+            }
+        }
         reduce_to_cube(&states, per_axis)
     }
 }
@@ -303,8 +337,8 @@ fn style_columns(
 
 /// **Phase 3 — reduce.** Each cell's eight children are the samples at
 /// `2·cell + (dx, dy, dz)` — the same gather `downsample_octant` does, on
-/// the doubled grid.
-fn reduce_to_cube(states: &[BlockStateId], per_axis: usize) -> Cube {
+/// the doubled grid. Shared with the playground's sampling path.
+pub(super) fn reduce_to_cube(states: &[BlockStateId], per_axis: usize) -> Cube {
     Cube::from_fn(|p| {
         let (px, py, pz) = (p.x as usize, p.y as usize, p.z as usize);
         let mut children = [BlockStateId::AIR; 8];

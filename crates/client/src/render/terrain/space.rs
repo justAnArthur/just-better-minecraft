@@ -136,7 +136,7 @@ fn scaled_cube(pos: i32, scale: i64, camera_cube: i32) -> f32 {
 }
 
 /// The camera-relative side length of a level-`level` cube.
-pub(super) fn cube_size(level: u8) -> Vec3 {
+pub fn cube_size(level: u8) -> Vec3 {
     Vec3::splat(CUBE_SIZE as f32 * (1u32 << level) as f32)
 }
 

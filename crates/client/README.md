@@ -70,10 +70,13 @@ coordinates and cfg-gated off under the crate's own `cube16` passthrough;
   (construction and bind groups), `cpu_cull.rs` / `gpu_cull.rs` (the draw
   paths).
 - `render::settings::RenderSettings` — the frame-level settings (fog,
-  level tint, far-look radii, draw-path flags) the renderer owns and
-  passes to `TerrainPass::draw`; `from_env()` is the one read of the
-  `JBM_NO_FOG` / `JBM_LOD_TINT` / `JBM_GPU_CULL` / `JBM_NO_MDI`
-  variables, done by the app at startup.
+  level tint, far-look radii, draw-path flags, the task 2.12 debug
+  views) the renderer owns and passes to `TerrainPass::draw`;
+  `from_env()` is the one read of the `JBM_NO_FOG` / `JBM_LOD_TINT` /
+  `JBM_GPU_CULL` / `JBM_NO_MDI` / `JBM_WIREFRAME` / `JBM_WIREFRAME_ONLY`
+  / `JBM_CHUNK_BORDERS` / `JBM_EXPLODE` / `JBM_LEVELS` /
+  `JBM_FREEZE_CULL` variables, done by the app at startup (the F3 panel
+  edits the same fields live).
 - `render::hiz::HizPyramid` — the hierarchical-Z depth pyramid the GPU
   cull tests occlusion against.
 - `render::suballoc::Suballocator` — the CPU-side free-list suballocator
@@ -100,8 +103,9 @@ coordinates and cfg-gated off under the crate's own `cube16` passthrough;
   struct.
 - `app::run(link)` — opens the window and runs the frame loop against a
   server link, with the default view distances; `app::run_with_view`
-  takes a `ViewSetup` (the ring radii the far look keys on — the game
-  derives it from its `ServerConfig`). `JBM_AUTOFLY=<blocks>` (task 2.6
+  takes a `ViewSetup` (the server's `view_radius`, `lod_view_radius` and
+  `lod_levels`, which the far look and the debug panel's radius sliders
+  key on — the game copies them from its `ServerConfig`). `JBM_AUTOFLY=<blocks>` (task 2.6
   gate) turns the app into an autopilot: once spawned it toggles flying,
   climbs 40 blocks above spawn, flies straight at sprint speed for
   `<blocks>` blocks through the normal `PlayerInput` path (prediction
@@ -396,9 +400,11 @@ invisible:
   concatenates that snippet ahead of both `sky.wgsl` and `terrain.wgsl`
   — the two can never drift.
 - **Where the radii come from:** the client cannot learn them from the
-  link, so the game derives a `ViewSetup` from its `ServerConfig`
-  (`view_radius · CUBE_SIZE` and `lod_view_radius · CUBE_SIZE ·
-  2^lod_levels`) and `app::run_with_view` feeds it into its one
+  link, so the game copies the radii into a `ViewSetup` from its
+  `ServerConfig`; `ViewSetup::ring_radii()` turns them into blocks by the
+  one shared rule, `jbm_core::lod::ring_radii` (`view_radius · CUBE_SIZE`
+  and `lod_view_radius · CUBE_SIZE · 2^lod_levels`, also used by the
+  server config and the panel's World sliders), and `app::run_with_view` feeds it into its one
   `RenderSettings::from_env()` read; the renderer-owned settings hand
   them to the terrain pass every frame (`Renderer::set_view_distance`
   changes them). Defaults match the `ServerConfig` defaults
@@ -775,6 +781,41 @@ targeted block, expanded by 0.002, depth-tested, 60% black. Lines get no
 depth bias, so the shader pulls each vertex 0.2% of its distance toward
 the camera; without that the edges z-fought into dashes against
 coplanar neighbor faces.
+
+## The F3 debug panel (task 2.12)
+
+**F3** toggles an egui window (`debug_ui/`) drawn last, over sky,
+terrain, crosshair and hotbar, into the same surface view — one
+`EguiPass` per window (winit state + wgpu renderer + shared context),
+never constructed offscreen. While it is open the cursor is released and
+egui owns mouse and keyboard (`game_keys_enabled` decides when a game
+key still applies: not while the panel is open and a widget wants the
+keyboard); **Escape closes the panel**, it never quits. The bitmap
+overlay stands down and its `hud::lines` move into the panel's Stats
+section, with the frame-time spread (avg / p99 / worst over the last 120
+frames), triangles (`faces × 2`), page bytes, used faces and a per-level
+table (resident / drawn this frame / faces issued — on the gpu-cull path
+those arrive through the readback ring, one or two frames late).
+
+The **Views** section edits `RenderSettings` live; each view also has
+its startup environment variable:
+
+| View | Env var | Effect |
+|---|---|---|
+| wireframe | `JBM_WIREFRAME=1` | dark lines along every greedy quad's border (fragment shader, from the quad-local coordinate — no `POLYGON_MODE_LINE`) |
+| wireframe only | `JBM_WIREFRAME_ONLY=1` | the edges over a flat near-black background; no textures, shade, tint or fog |
+| chunk borders | `JBM_CHUNK_BORDERS=1` | line boxes around resident cubes within 3 cubes per level (`render/lines.rs`, depth-tested), colored by the level-tint palette |
+| exploded | `JBM_EXPLODE=<gap 0..8>` | the vertex shader shifts every cube by `gap ×` its cube-grid offset; while nonzero **frustum culling is skipped on every path** (the moved cubes sit outside every conservative bound — the CPU region bound falls back to the static per-page totals) |
+| level tint | `JBM_LOD_TINT=1` / F4 | per-level color multiply (task 2.10) |
+| levels | `JBM_LEVELS=0,1,3` | the shown-level mask; a hidden level leaves a hole (enforced in the cull, both CPU and GPU) |
+| freeze culling | `JBM_FREEZE_CULL=1` | the cull keeps the frustum and position captured at switch-on (a `FreezeParams` uniform, binding 7, on the gpu path too — which also skips Hi-Z occlusion there, the pyramid holding the real view's depth); the frozen frustum draws as lines |
+| fog | `JBM_NO_FOG=1` | distance fog off |
+| prefer gpu cull / force cpu cull / force fallback | `JBM_GPU_CULL=1` / `JBM_NO_MDI=1` | the path flags are re-read from the settings every draw, so the panel switches paths live |
+
+The **World** section's sliders steer the server's view radii through
+the game's `DebugHooks` (plain closures — the client never depends on
+`jbm-server`) and move the renderer's far-look radii so the fade and fog
+windows follow.
 
 ## Screenshot tests
 

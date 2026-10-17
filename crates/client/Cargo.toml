@@ -25,6 +25,9 @@ winit.workspace = true
 glam.workspace = true
 bytemuck.workspace = true
 font8x8.workspace = true
+egui.workspace = true
+egui-winit.workspace = true
+egui-wgpu.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

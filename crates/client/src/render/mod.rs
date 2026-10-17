@@ -4,6 +4,7 @@
 //! multi-draw indirect), the Hi-Z pyramid, and the block texture array.
 
 pub mod hiz;
+pub mod lines;
 pub mod offscreen;
 pub mod outline;
 pub mod overlay;

@@ -19,6 +19,10 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
 use crate::camera::Camera;
+use crate::debug_ui::DebugHooks;
+use crate::debug_ui::EguiPass;
+use crate::debug_ui::game_keys_enabled;
+use crate::debug_ui::panel::WorldSetup;
 use crate::edit::{Hotbar, Repeat, place_target};
 use crate::gpu::Gpu;
 use crate::hud::{HudPlayer, HudSnapshot, lines as hud_lines};
@@ -63,23 +67,44 @@ pub fn run(link: ClientLink) -> Result<(), Box<dyn Error>> {
 /// values the client cannot learn from the link itself. The LOD0 ring
 /// radius sets where LOD0's textures fade into the flat average colors;
 /// the furthest ring radius sets the distance-fog window (see
-/// `Renderer::set_view_distance`).
-#[derive(Debug, Clone, Copy)]
+/// `Renderer::set_view_distance`). `debug` (task 2.12) is the optional
+/// server bridge the debug panel's World section uses; the client stays
+/// free of server types — the game fills the closures.
 pub struct ViewSetup {
-    /// The LOD0 streaming disk radius, in blocks (`view_radius ·
-    /// CUBE_SIZE`).
-    pub lod0_ring_radius: f32,
-    /// The furthest (outermost LOD level's) ring radius, in blocks
-    /// (`lod_view_radius · CUBE_SIZE · 2^lod_levels`).
-    pub furthest_ring_radius: f32,
+    /// The server's LOD0 streaming radius, in cubes (`view_radius`).
+    pub view_radius: u32,
+    /// The server's ring radius per LOD level, in cubes
+    /// (`lod_view_radius`).
+    pub lod_view_radius: u32,
+    /// The server's LOD level count (`lod_levels`).
+    pub lod_levels: u8,
+    /// The debug panel's server hooks, when the caller has a server to
+    /// talk to (the game's in-process one).
+    pub debug: Option<DebugHooks>,
+}
+
+impl ViewSetup {
+    /// The documented defaults, matching `ServerConfig`: `view_radius` 8,
+    /// `lod_view_radius` 8, 6 LOD levels.
+    pub fn default_radii() -> ViewSetup {
+        ViewSetup {
+            view_radius: 8,
+            lod_view_radius: 8,
+            lod_levels: 6,
+            debug: None,
+        }
+    }
+
+    /// The far-look radii in blocks, `(LOD0 disk, outermost ring)`, by
+    /// [`jbm_core::lod::ring_radii`].
+    pub fn ring_radii(&self) -> (f32, f32) {
+        jbm_core::lod::ring_radii(self.view_radius, self.lod_view_radius, self.lod_levels)
+    }
 }
 
 impl Default for ViewSetup {
     fn default() -> ViewSetup {
-        ViewSetup {
-            lod0_ring_radius: crate::render::terrain::DEFAULT_LOD0_RING_RADIUS,
-            furthest_ring_radius: crate::render::terrain::DEFAULT_FURTHEST_RING_RADIUS,
-        }
+        ViewSetup::default_radii()
     }
 }
 
@@ -102,6 +127,9 @@ struct Windowed {
     renderer: Renderer,
     depth: DepthTarget,
     terrain: TerrainPass,
+    /// The egui debug panel's plumbing; created with the window, so
+    /// offscreen tests never touch it.
+    egui: EguiPass,
 }
 
 struct App {
@@ -148,6 +176,20 @@ struct App {
     frame_times: Vec<f64>,
     /// When the last presented frame rendered; spans skipped loops.
     last_present: Option<Instant>,
+    /// Whether the egui debug panel is open (task 2.12, F3). While it is,
+    /// the cursor is released, egui owns the mouse and keyboard (game
+    /// keys apply only while it does not want the keyboard), and the
+    /// bitmap overlay stands down for the panel's Stats section.
+    panel_open: bool,
+    /// The World section's editable view distances (cube units).
+    panel_world: Option<WorldSetup>,
+    /// The debug panel's server bridge, when the caller passed one.
+    debug_hooks: Option<DebugHooks>,
+    /// Server label/value rows for the panel, refreshed a few times per
+    /// second (the hooks' `server_lines` clone is not free).
+    server_lines: Vec<(String, String)>,
+    /// When the panel's server rows were last refreshed.
+    server_lines_at: Option<Instant>,
 }
 
 /// How long the autopilot waits before re-sending a fly toggle that the
@@ -234,10 +276,16 @@ impl App {
             view: ViewSetup::default(),
             frame_times: Vec::new(),
             last_present: None,
+            panel_open: false,
+            panel_world: None,
+            debug_hooks: None,
+            server_lines: Vec::new(),
+            server_lines_at: None,
         }
     }
 
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<(), Box<dyn Error>> {
+        let debug = self.view.debug.take();
         let window = Arc::new(
             event_loop.create_window(
                 WindowAttributes::default()
@@ -281,8 +329,9 @@ impl App {
         // the gpu-cull preference and the fallback force all come from
         // here, and the view's ring radii ride along (the caller knows
         // them; the client cannot learn them from the link).
+        let (lod0_ring_radius, furthest_ring_radius) = self.view.ring_radii();
         let settings = RenderSettings {
-            far_radii: [self.view.lod0_ring_radius, self.view.furthest_ring_radius],
+            far_radii: [lod0_ring_radius, furthest_ring_radius],
             ..RenderSettings::from_env()
         };
         let mut renderer = Renderer::new(&gpu, format);
@@ -300,6 +349,15 @@ impl App {
             &textures,
             &settings,
         );
+        let egui = EguiPass::new(&gpu, &window, format)?;
+        // The panel's World sliders start at the view distances the caller
+        // passed.
+        self.panel_world = Some(WorldSetup {
+            view_radius: self.view.view_radius,
+            lod_view_radius: self.view.lod_view_radius,
+            lod_levels: self.view.lod_levels,
+        });
+        self.debug_hooks = debug;
 
         window.request_redraw();
         self.windowed = Some(Windowed {
@@ -310,6 +368,7 @@ impl App {
             renderer,
             depth,
             terrain,
+            egui,
         });
         Ok(())
     }
@@ -586,8 +645,34 @@ impl App {
             lod_tint: w.renderer.lod_tint(),
         };
         let mut overlay = OverlayText::new();
-        for line in hud_lines(&snapshot) {
-            overlay.push(line);
+        if self.panel_open {
+            // The panel's Stats section prints these lines instead of the
+            // bitmap overlay (task 2.12): the two can never disagree.
+            let refresh = self
+                .server_lines_at
+                .is_none_or(|at| at.elapsed() >= Duration::from_millis(500));
+            if refresh && let Some(hooks) = &self.debug_hooks {
+                self.server_lines = (hooks.server_lines)();
+                self.server_lines_at = Some(Instant::now());
+            }
+            w.egui.begin_frame(&w.window);
+            let world = self
+                .panel_world
+                .as_mut()
+                .expect("panel world set at window init");
+            crate::debug_ui::panel::show(
+                &w.egui.context,
+                &snapshot,
+                &self.stats,
+                w.renderer.settings_mut(),
+                world,
+                self.debug_hooks.as_ref(),
+                &self.server_lines,
+            );
+        } else {
+            for line in hud_lines(&snapshot) {
+                overlay.push(line);
+            }
         }
 
         // The autopilot finishes once its distance is flown: print the
@@ -628,6 +713,10 @@ impl App {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+        // The task 2.12 debug lines (chunk borders, the frozen frustum),
+        // rebuilt each frame from the settings and the resident set.
+        let debug_lines = self.build_debug_lines(&w.terrain, &self.camera, w.renderer.settings());
+        w.renderer.set_debug_lines(&w.gpu, &debug_lines);
         w.renderer.render(
             &w.gpu,
             FrameInputs {
@@ -636,9 +725,15 @@ impl App {
                 camera: &self.camera,
                 terrain: Some(&mut w.terrain),
                 outline: target.map(|hit| hit.block),
-                overlay: Some(&overlay),
+                overlay: (!self.panel_open).then_some(&overlay),
             },
         );
+        // The egui panel is drawn last, over sky, terrain, the crosshair
+        // and the hotbar, into the same surface view (its own encoder and
+        // submit, still before the present).
+        if self.panel_open {
+            w.egui.draw(&w.gpu, &w.window, &view);
+        }
         w.gpu.queue.present(frame);
         // Only presented frames count for the autopilot summary —
         // Occluded-surface skips return before this point.
@@ -647,6 +742,157 @@ impl App {
             w.window.request_redraw();
         }
     }
+
+    /// The frame's debug lines (task 2.12), camera-relative like the
+    /// terrain: the chunk-border boxes while that view is on, and the
+    /// frozen cull frustum while freeze-cull is on. Empty (and the line
+    /// pass stands down) when neither view is active.
+    fn build_debug_lines(
+        &self,
+        terrain: &TerrainPass,
+        camera: &Camera,
+        settings: &crate::render::settings::RenderSettings,
+    ) -> Vec<crate::render::lines::LineVertex> {
+        let mut vertices = Vec::new();
+        if settings.chunk_borders {
+            self.push_chunk_borders(&mut vertices, terrain, camera);
+        }
+        if settings.freeze_cull {
+            self.push_frozen_frustum(&mut vertices, terrain, camera);
+        }
+        vertices
+    }
+
+    /// Chunk-border boxes: resident drawn cubes within a small radius per
+    /// level, each level's boxes at that level's cube size and tinted
+    /// with the level's palette color, so LOD0 shows white 16-block boxes
+    /// and coarse levels their own larger boxes in their own color.
+    fn push_chunk_borders(
+        &self,
+        vertices: &mut Vec<crate::render::lines::LineVertex>,
+        terrain: &TerrainPass,
+        camera: &Camera,
+    ) {
+        /// How many cubes of each level around the camera draw borders.
+        const BORDER_RADIUS: i64 = 3;
+        let (camera_cube, camera_frac) = crate::render::terrain::camera_split(camera.position);
+        for key in terrain.resident_keys() {
+            // The cube's own level units: its position is already in them.
+            let stride = (jbm_core::coords::CUBE_SIZE as i64) << key.level;
+            let center = [
+                (camera.position.x / stride as f64).floor() as i64,
+                (camera.position.y / stride as f64).floor() as i64,
+                (camera.position.z / stride as f64).floor() as i64,
+            ];
+            let distance = [
+                i64::from(key.pos.x) - center[0],
+                i64::from(key.pos.y) - center[1],
+                i64::from(key.pos.z) - center[2],
+            ]
+            .iter()
+            .map(|&d| d.abs())
+            .max()
+            .unwrap_or(i64::MAX);
+            if distance > BORDER_RADIUS {
+                continue;
+            }
+            let min = crate::render::terrain::cube_origin(key, camera_cube, camera_frac);
+            let size = crate::render::terrain::space::cube_size(key.level);
+            let max = min + size;
+            let [r, g, b] = crate::render::terrain::lod_tint_color(key.level);
+            let color = [r, g, b, 0.8];
+            push_box_edges(vertices, min, max, color);
+        }
+    }
+
+    /// The frozen cull frustum as its corner box: near plane to a far
+    /// cutoff (the projection's far plane is at infinity, so the lines
+    /// stop at a fixed distance), re-based from the frozen camera's space
+    /// into the real camera's, where the renderer draws.
+    fn push_frozen_frustum(
+        &self,
+        vertices: &mut Vec<crate::render::lines::LineVertex>,
+        terrain: &TerrainPass,
+        camera: &Camera,
+    ) {
+        /// The far cutoff of the drawn frustum, in blocks (the real far
+        /// plane is at infinity).
+        const FAR_CUTOFF_DEPTH: f32 = 1.0 / 2048.0;
+        let Some((frozen_pos, view_proj)) = terrain.frozen_view() else {
+            return;
+        };
+        let inverse = view_proj.inverse();
+        // NDC depth 1 = the near plane; reverse-Z depth d sits at
+        // NEAR / d blocks (the camera constant rides in the projection).
+        let rebased = |ndc: glam::Vec4| -> glam::Vec3 {
+            let unprojected = inverse * ndc;
+            let rel_frozen = unprojected.truncate() / unprojected.w;
+            let shift = (frozen_pos - camera.position).as_vec3();
+            rel_frozen + shift
+        };
+        let near: [glam::Vec3; 4] = [
+            rebased(glam::Vec4::new(-1.0, -1.0, 1.0, 1.0)),
+            rebased(glam::Vec4::new(1.0, -1.0, 1.0, 1.0)),
+            rebased(glam::Vec4::new(1.0, 1.0, 1.0, 1.0)),
+            rebased(glam::Vec4::new(-1.0, 1.0, 1.0, 1.0)),
+        ];
+        let far: [glam::Vec3; 4] = [
+            rebased(glam::Vec4::new(-1.0, -1.0, FAR_CUTOFF_DEPTH, 1.0)),
+            rebased(glam::Vec4::new(1.0, -1.0, FAR_CUTOFF_DEPTH, 1.0)),
+            rebased(glam::Vec4::new(1.0, 1.0, FAR_CUTOFF_DEPTH, 1.0)),
+            rebased(glam::Vec4::new(-1.0, 1.0, FAR_CUTOFF_DEPTH, 1.0)),
+        ];
+        let color = [1.0, 0.25, 0.2, 0.9];
+        for ring in [near, far] {
+            for i in 0..4 {
+                push_segment(vertices, ring[i], ring[(i + 1) % 4], color);
+            }
+        }
+        for i in 0..4 {
+            push_segment(vertices, near[i], far[i], color);
+        }
+    }
+}
+
+/// One box's twelve edges, axis-aligned `[min, max]`.
+fn push_box_edges(
+    vertices: &mut Vec<crate::render::lines::LineVertex>,
+    min: glam::Vec3,
+    max: glam::Vec3,
+    color: [f32; 4],
+) {
+    let (a, b) = (min, max);
+    let corners = [
+        glam::Vec3::new(a.x, a.y, a.z),
+        glam::Vec3::new(b.x, a.y, a.z),
+        glam::Vec3::new(b.x, b.y, a.z),
+        glam::Vec3::new(a.x, b.y, a.z),
+        glam::Vec3::new(a.x, a.y, b.z),
+        glam::Vec3::new(b.x, a.y, b.z),
+        glam::Vec3::new(b.x, b.y, b.z),
+        glam::Vec3::new(a.x, b.y, b.z),
+    ];
+    // Bottom rect, top rect, then the four pillars.
+    for i in 0..4 {
+        push_segment(vertices, corners[i], corners[(i + 1) % 4], color);
+        push_segment(vertices, corners[i + 4], corners[(i + 1) % 4 + 4], color);
+        push_segment(vertices, corners[i], corners[i + 4], color);
+    }
+}
+
+/// One line segment, two vertices.
+fn push_segment(
+    vertices: &mut Vec<crate::render::lines::LineVertex>,
+    from: glam::Vec3,
+    to: glam::Vec3,
+    color: [f32; 4],
+) {
+    let vertex = |p: glam::Vec3| crate::render::lines::LineVertex {
+        pos: [p.x, p.y, p.z, 0.0],
+        color,
+    };
+    vertices.push(vertex(from));
+    vertices.push(vertex(to));
 }
 
 /// Prints the autopilot's frame-time summary: count, mean, p50, p95, p99,
@@ -746,6 +992,23 @@ impl ApplicationHandler for App {
         if w.window.id() != window_id {
             return;
         }
+        // While the debug panel is open, egui sees the input events first
+        // (task 2.12); the game's own arms below then stand down for the
+        // events egui owns. F3 and Escape are pre-empted before egui so
+        // the panel can always be toggled and closed.
+        if self.panel_open {
+            match &event {
+                WindowEvent::KeyboardInput { .. }
+                | WindowEvent::CursorMoved { .. }
+                | WindowEvent::MouseInput { .. }
+                | WindowEvent::MouseWheel { .. }
+                | WindowEvent::Resized { .. }
+                | WindowEvent::Focused(..) => {
+                    w.egui.on_event(&w.window, &event);
+                }
+                _ => {}
+            }
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -772,7 +1035,12 @@ impl ApplicationHandler for App {
                 let pressed = event.state == ElementState::Pressed;
                 match &event.logical_key {
                     Key::Named(NamedKey::Escape) if pressed => {
-                        if self.cursor_grabbed {
+                        if self.panel_open {
+                            // The panel is open and the cursor already
+                            // free: Escape closes the panel, never the
+                            // game.
+                            self.panel_open = false;
+                        } else if self.cursor_grabbed {
                             release_cursor(&w.window);
                             self.cursor_grabbed = false;
                             self.edit_break.set_held(false);
@@ -781,7 +1049,33 @@ impl ApplicationHandler for App {
                             event_loop.exit();
                         }
                     }
+                    // F3 toggles the debug panel (task 2.12). Opening it
+                    // releases the cursor and stands the game input down;
+                    // closing it leaves the cursor free for the usual
+                    // click-to-grab.
+                    key if pressed && matches!(key, Key::Named(NamedKey::F3)) => {
+                        self.panel_open = !self.panel_open;
+                        if self.panel_open {
+                            if self.cursor_grabbed {
+                                release_cursor(&w.window);
+                                self.cursor_grabbed = false;
+                            }
+                            self.input.clear_keys();
+                            self.edit_break.set_held(false);
+                            self.edit_place.set_held(false);
+                        }
+                    }
                     key => {
+                        // Game keys apply unless the open panel's egui
+                        // wants the keyboard (a text box has focus).
+                        // Releases always apply, so a key held when egui
+                        // took the keyboard does not stay stuck down.
+                        if !game_keys_enabled(self.panel_open, w.egui.wants_keyboard_input()) {
+                            if !pressed && let Some(mk) = map_key(key) {
+                                self.input.set_key(mk, false);
+                            }
+                            return;
+                        }
                         // F toggles flying: one edge per press, consumed by
                         // the next sim tick.
                         if pressed && matches!(key, Key::Character(c) if c.to_lowercase() == "f") {
@@ -811,6 +1105,11 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                // The open panel owns the mouse: no grabbing, no breaking
+                // or placing (egui already saw the event above).
+                if self.panel_open {
+                    return;
+                }
                 let pressed = state == ElementState::Pressed;
                 match button {
                     // While the cursor is free, the first left click grabs

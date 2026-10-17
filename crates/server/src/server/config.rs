@@ -107,16 +107,10 @@ impl ServerConfig {
     }
 
     /// The far-look view distances in blocks: `(lod0 disk radius,
-    /// outermost LOD ring radius)` — `view_radius · CUBE_SIZE` and
-    /// `lod_view_radius · CUBE_SIZE · 2^lod_levels`. The client cannot
-    /// learn these from the link, so the game, which built the config,
-    /// passes them along at startup.
+    /// outermost LOD ring radius)`, by [`jbm_core::lod::ring_radii`]. The
+    /// client cannot learn these from the link, so the game, which built
+    /// the config, passes the radii along at startup.
     pub fn ring_radii(&self) -> (f32, f32) {
-        (
-            self.view_radius as f32 * jbm_core::coords::CUBE_SIZE as f32,
-            self.lod_view_radius as f32
-                * jbm_core::coords::CUBE_SIZE as f32
-                * (1u32 << self.lod_levels) as f32,
-        )
+        jbm_core::lod::ring_radii(self.view_radius, self.lod_view_radius, self.lod_levels)
     }
 }
