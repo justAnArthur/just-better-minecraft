@@ -5,11 +5,16 @@ server side of the protocol.
 
 ## Terrain (`terrain`)
 
-`Generator::new(seed, Blocks)` produces cubes by evaluating the compiled
-shipped overworld graph (below); `generate(CubePos) -> Cube` is a pure
-function of `(seed, pos)`, and `surface_height(x, z) -> i64` is public
-(plus `column_surface_bounds(cx, cz)` — task 2.10's min/max surface over
-a cube column, reusing the per-column cache).
+The module is `terrain/`: `mod.rs` holds the [`Generator`] with its
+bounded per-column cache, `surface.rs` the surface stage (which block a
+solid cell becomes — one shared rule set for block-per-block generation
+and LOD sampling), and `lod_sample.rs` the phased straight-from-the-graph
+LOD sampler (`sample_lod`, below). `Generator::new(seed, Blocks)` produces
+cubes by evaluating the compiled shipped overworld graph (below);
+`generate(CubePos) -> Cube` is a pure function of `(seed, pos)`, and
+`surface_height(x, z) -> i64` is public (plus `column_surface_bounds(cx,
+cz)` — the min/max surface over a cube column, reusing the per-column
+cache).
 `Generator::with_preset(seed, Blocks, worldgen::Preset)` picks the shipped
 graph (`Overworld`, the default, or `Classic`), and
 `Generator::from_graph(seed, Blocks, &CompiledGraph)` runs any graph instead
@@ -47,8 +52,13 @@ classic graph's narrower `[36, 92]` sits inside them).
   never per-block `set`. A bounded per-column cache (64 cube columns) keeps
   the evaluated surface band so vertically adjacent cubes cost almost
   nothing; it is a pure-function cache and cannot change answers.
-- The task 1.5 noise terrain lives on as `worldgen::reference`, kept only
-  for the equivalence tests and the comparison bench.
+- The original hand-written noise terrain lives on as
+  `worldgen::reference`, kept only for the equivalence tests and the
+  comparison bench. It compiles under the crate's `reference` cargo
+  feature, enabled for the crate's own tests and benches through a self
+  dev-dependency (the pattern `jbm-client` uses for `testing`); the noise
+  primitives the graphs evaluate at runtime (`noise2`, `fbm`, `ridged2`)
+  are production code in `worldgen/noise.rs`.
 - **Preview:** `cargo run -p jbm-server --example worldgen_preview --
   [seed_hex [km]]` writes a hillshaded top-down PNG of the overworld to
   `target/worldgen_preview/overworld_<seed>_<km>km.png` — the tuning loop's
@@ -86,8 +96,8 @@ missing output. Loading never panics on bad input.
 | `add`, `sub`, `mul`, `min`, `max` | `a`, `b` | |
 | `neg`, `abs`, `floor` | `a` | |
 | `clamp` | `input`, `min`, `max` | `f64::clamp` semantics; `min > max` is a compile error when constant |
-| `noise2` | `salt`, `x_scale`, `z_scale`, `x_offset?`, `z_offset?` | the reference 2D gradient noise at `((x + x_offset)·x_scale, (z + z_offset)·z_scale)`, seeded `world_seed ^ salt`; range ±√2/2 |
-| `fbm2` | `salt`, `scale`, `octaves`, `x_offset?`, `z_offset?` | the reference fractal sum at `((x + x_offset)·scale, (z + z_offset)·scale)`, normalized; range ±√2/2 |
+| `noise2` | `salt`, `x_scale`, `z_scale`, `x_offset?`, `z_offset?` | the 2D gradient noise (`worldgen::noise`) at `((x + x_offset)·x_scale, (z + z_offset)·z_scale)`, seeded `world_seed ^ salt`; range ±√2/2 |
+| `fbm2` | `salt`, `scale`, `octaves`, `x_offset?`, `z_offset?` | the fractal sum (`worldgen::noise`) at `((x + x_offset)·scale, (z + z_offset)·scale)`, normalized; range ±√2/2 |
 | `ridged2` | `salt`, `scale`, `octaves`, `gain`, `x_offset?`, `z_offset?` | the ridged multifractal (below); range exactly `[0, 1]` |
 | `spline` | `input`, `points` | piecewise linear over `[[x, y], …]`, clamped at both ends; points strictly increasing in `x`, at least two |
 
@@ -172,7 +182,7 @@ uses the per-column material rules above (see Terrain). Computing `d` for
 the top rows evaluates up to 4 cells above the cube — never a neighbour
 cube. For a pure heightmap density the sea-less rules are exactly the old
 `column_block`; the equivalence argument is a comment on
-`terrain::surface_block`.
+`terrain::surface`'s `surface_block`.
 
 **Per-column cache.** Rows the interval bounds cannot decide form a band
 (the classic graph's is `y ∈ (36, 93)`, the overworld's spans its full

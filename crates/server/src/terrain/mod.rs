@@ -4,10 +4,17 @@
 //! rule are documented in the crate README's "Worldgen graph" section; the
 //! module docs of [`crate::worldgen`] restate the rule.
 //!
-//! Terrain shape is data now: `final_density >= 0` means solid, and the
-//! surface stage below decides which solid block a cell becomes. The task
-//! 1.5 code this replaces lives on as [`crate::worldgen::reference`] for
-//! the equivalence tests and the comparison bench.
+//! Terrain shape is data: `final_density >= 0` means solid, and the
+//! surface stage ([`surface`]) decides which solid block a cell becomes —
+//! one shared rule set for block-per-block generation and for LOD
+//! sampling. Sampling a whole LOD cube straight from the graph, without
+//! generating any LOD0 terrain, lives in [`lod_sample`]. The hand-written
+//! heightmap terrain this graph path replaced lives on (feature-gated) as
+//! [`crate::worldgen::reference`] for the equivalence tests and the
+//! comparison bench.
+
+mod lod_sample;
+mod surface;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,15 +25,15 @@ use jbm_core::block::BlockStateId;
 use jbm_core::block::builtin::Blocks;
 use jbm_core::coords::{CUBE_SIZE, CubePos};
 use jbm_core::cube::Cube;
-use jbm_core::lod::downsample_cell;
 
 use crate::worldgen::{self, CompiledGraph, Preset};
+use surface::{SURFACE_LOOKAHEAD, TopMaterial, column_material, max_neighbor_step, style_column};
 
-/// Sea level (task 2.8): air cells at or below it become `base:water` in
-/// the surface stage, in both `generate` and `sample_lod`. Water is
-/// non-solid, so physics passes through it; there is no swimming or flow.
-/// Only the `Overworld` preset has a sea (see [`Preset::sea_level`]) —
-/// `Classic` is frozen bit-for-bit and never gains water.
+/// Sea level: air cells at or below it become `base:water` in the surface
+/// stage, in both `generate` and `sample_lod`. Water is non-solid, so
+/// physics passes through it; there is no swimming or flow. Only the
+/// `Overworld` preset has a sea (see [`Preset::sea_level`]) — `Classic` is
+/// frozen bit-for-bit and never gains water.
 ///
 /// The water's top face sits at `SEA_LEVEL + 1 = 64`, a multiple of 16:
 /// every LOD cell boundary up to level 4 falls on it, so the downsampled
@@ -34,24 +41,6 @@ use crate::worldgen::{self, CompiledGraph, Preset};
 /// and each level's lean-solid rounding lifted it, 66, 68, 72, 80 — a
 /// visible step on the ocean at every ring border.)
 pub const SEA_LEVEL: i64 = 63;
-
-/// The classic terrain's sand line: a solid cell whose surface sits at or
-/// below it gets sand instead of grass and dirt. Frozen at 61 with the
-/// classic preset.
-const SAND_LEVEL: i64 = 61;
-
-/// The overworld's beach line: columns whose surface is at most one block
-/// above the water (`SEA_LEVEL + 1`), and the seabed, are sand, so coasts
-/// show a sand rim above the waterline.
-const BEACH_LEVEL: i64 = SEA_LEVEL + 1;
-
-/// Above this height the surface is bare stone: no soil survives the
-/// altitude (snow needs a block and a texture and is a follow-up).
-const STONE_LEVEL: i64 = SEA_LEVEL + 180;
-
-/// A column whose surface steps this many blocks (or more) to any of its
-/// four immediate neighbours counts as a cliff and surfaces as stone.
-const STEEP_SLOPE: i64 = 4;
 
 /// The gentle-slope bar the spawn search requires: no neighbour step
 /// larger than this.
@@ -63,100 +52,6 @@ const GENTLE_SLOPE: i64 = 2;
 /// classic graph's own, much narrower range `[36, 92]` sits inside it.
 pub const MIN_HEIGHT: i64 = 23;
 pub const MAX_HEIGHT: i64 = 408;
-
-/// How many cells above a cube the surface stage may need to look at: `d`
-/// is capped at 4, so cells up to `y + 4` decide the top rows' blocks.
-const SURFACE_LOOKAHEAD: usize = 4;
-
-/// The block a solid cell becomes, given `d`, the number of consecutive
-/// solid cells directly above it (capped at [`SURFACE_LOOKAHEAD`]).
-///
-/// Equivalence with the heightmap layering of
-/// `worldgen::reference::column_block(y, h)`: for a pure heightmap
-/// density, solid means `y <= h`, so the run above a solid cell is
-/// `h - y` (when at most 4) and the surface of the run is `y + d = h`.
-/// Then:
-///
-/// - `d <= 3 && y + d <= 61` is `h <= 61 && y >= h - 3`: sand, exactly the
-///   beach/seabed branch;
-/// - else `d == 0` is `y == h` with `h > 61`: grass;
-/// - else `d <= 3` is `h - 3 <= y < h` with `h > 61`: dirt;
-/// - else (`d == 4`, i.e. `y <= h - 4`): stone.
-///
-/// Air cells (`y > h`) are not solid, so they stay air. The 3D-graph case
-/// (overhangs) is the natural generalization of the same rules.
-#[inline]
-fn surface_block(solid: bool, d: u8, y: i64, blocks: &Blocks) -> BlockStateId {
-    if !solid {
-        BlockStateId::AIR
-    } else if d <= 3 && y + i64::from(d) <= SAND_LEVEL {
-        blocks.sand
-    } else if d == 0 {
-        blocks.grass_block
-    } else if d <= 3 {
-        blocks.dirt
-    } else {
-        blocks.stone
-    }
-}
-
-/// The surface material of one column of a sea-style (overworld) world,
-/// decided from that column's own surface height `h` and its steepest
-/// neighbour step `slope` — local per column, so it is cheap and
-/// LOD-consistent (task 2.8):
-///
-/// - **stone** when `h >= STONE_LEVEL` (bare-rock peaks) or
-///   `slope >= STEEP_SLOPE` (cliffs: soil cannot hold);
-/// - **sand** when `h <= BEACH_LEVEL` (a beach rim one block above the
-///   water, and the seabed);
-/// - **grass** over dirt otherwise.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TopMaterial {
-    Grass,
-    Sand,
-    Stone,
-}
-
-fn column_material(h: i64, slope: i64) -> TopMaterial {
-    if h >= STONE_LEVEL || slope >= STEEP_SLOPE {
-        TopMaterial::Stone
-    } else if h <= BEACH_LEVEL {
-        TopMaterial::Sand
-    } else {
-        TopMaterial::Grass
-    }
-}
-
-/// The sea-style counterpart of [`surface_block`]: the column's material
-/// decides its surface belt (cells within 3 of the surface), stone below,
-/// and air at or below `sea` becomes water. `d` semantics as
-/// [`surface_block`].
-#[inline]
-fn surface_block_sea(
-    solid: bool,
-    d: u8,
-    y: i64,
-    top: TopMaterial,
-    sea: i64,
-    blocks: &Blocks,
-) -> BlockStateId {
-    if !solid {
-        if y <= sea {
-            blocks.water
-        } else {
-            BlockStateId::AIR
-        }
-    } else if d >= SURFACE_LOOKAHEAD as u8 {
-        blocks.stone
-    } else {
-        match top {
-            TopMaterial::Sand => blocks.sand,
-            TopMaterial::Grass if d == 0 => blocks.grass_block,
-            TopMaterial::Grass => blocks.dirt,
-            TopMaterial::Stone => blocks.stone,
-        }
-    }
-}
 
 /// How many `(cx, cz)` columns the generator may cache. Bounded, so memory
 /// stays flat whatever order requests arrive in.
@@ -223,22 +118,22 @@ pub struct Generator {
     graph: Arc<CompiledGraph>,
     /// The preset's sea level: `Some(level)` switches the surface stage to
     /// the overworld style (water below the sea, per-column materials).
-    /// `None` (the classic preset, custom graphs) keeps the pre-2.8
+    /// `None` (the classic preset, custom graphs) keeps the sea-less
     /// surface rules bit-for-bit.
     sea_level: Option<i64>,
     column_cache: Mutex<HashMap<(i32, i32), ColumnData>>,
-    /// Test hooks (task 2.7): how many `generate` and how many
-    /// `sample_lod` mixed-path calls ran. Fast paths count nowhere — the
-    /// LOD tests use `lod_sample_calls` to prove a fast path or a storage
-    /// reload did no sampling, and `generate_calls` to prove `sample_lod`
-    /// never generates LOD0 cubes.
+    /// Test hooks: how many `generate` and how many `sample_lod`
+    /// mixed-path calls ran. Fast paths count nowhere — the LOD tests use
+    /// `lod_sample_calls` to prove a fast path or a storage reload did no
+    /// sampling, and `generate_calls` to prove `sample_lod` never
+    /// generates LOD0 cubes.
     generate_calls: AtomicU64,
     lod_sample_calls: AtomicU64,
 }
 
 impl Generator {
-    /// A generator running the shipped overworld graph (task 2.8:
-    /// continents, mountain ranges, valleys, sea).
+    /// A generator running the shipped overworld graph (continents,
+    /// mountain ranges, valleys, sea).
     pub fn new(seed: u64, blocks: Blocks) -> Self {
         Self::with_preset(seed, blocks, Preset::Overworld)
     }
@@ -257,7 +152,7 @@ impl Generator {
     }
 
     /// A generator running any compiled graph, for tests and (from Stage 3)
-    /// mods. Custom graphs get no sea — the pre-2.8 surface rules — so
+    /// mods. Custom graphs get no sea — the sea-less surface rules — so
     /// tests and mods decide explicitly when they want water.
     pub fn from_graph(seed: u64, blocks: Blocks, graph: &CompiledGraph) -> Self {
         Self {
@@ -484,8 +379,8 @@ impl Generator {
     }
 
     /// The minimum and maximum [`Generator::surface_height`] over cube
-    /// column `(cx, cz)`'s 32² block columns — the surface span task 2.10
-    /// streams by. Banded graphs (the shipped ones) read the cached
+    /// column `(cx, cz)`'s 32² block columns — the surface span streaming
+    /// works through. Banded graphs (the shipped ones) read the cached
     /// per-column heights, so a column already generated costs nothing and
     /// a fresh one costs about one mixed cube's evaluation; unbanded
     /// graphs evaluate their (typically tiny, test-made) columns directly.
@@ -556,67 +451,49 @@ impl Generator {
         }
 
         // Mixed path. Per column: one fused downward pass over the cube's
-        // rows plus the lookahead. `d` tracks the run of consecutive solid
-        // cells above the current row, capped at [`SURFACE_LOOKAHEAD`]; the
+        // rows plus the lookahead, styled by the shared surface stage
+        // (`style_column`; `d` tracks the run of consecutive solid cells
+        // above the current row, capped at [`SURFACE_LOOKAHEAD`], and the
         // pass starts above the cube's top, where the cap makes the unknown
-        // run beyond the lookahead invisible. Cube cells are filled in
+        // run beyond the lookahead invisible). Cube cells are filled in
         // `(y·32 + z)·32 + x` index order — the order `from_fn` reads — so
         // the final pass is a plain lookup.
         //
         // Sea-style worlds (the overworld) decide the column's surface
         // material first — from its own height and steepest neighbour step
         // in the bordered height grid — and fill water over submerged air;
-        // everything else keeps the pre-2.8 block rules bit-for-bit.
+        // everything else keeps the sea-less block rules bit-for-bit.
         let data = self.column_data(pos.x, pos.z);
         let rows = CUBE_SIZE as usize + SURFACE_LOOKAHEAD;
-        let mut flat =
-            vec![BlockStateId::AIR; CUBE_SIZE as usize * CUBE_SIZE as usize * CUBE_SIZE as usize];
+        let side = CUBE_SIZE as usize;
+        let mut flat = vec![BlockStateId::AIR; side * side * side];
+        let mut styled = vec![BlockStateId::AIR; side];
         let blocks = self.blocks;
         let sea = self.sea_level;
         let materials: Option<Vec<TopMaterial>> = sea.map(|_| {
             let grid = self
                 .heights_with_border(pos.x, pos.z)
                 .expect("banded graph");
-            let side = CUBE_SIZE as usize;
+            let stride = side + 2;
             let mut materials = Vec::with_capacity(side * side);
             for z in 0..side {
                 for x in 0..side {
                     let (gx, gz) = (x + 1, z + 1);
-                    let h = grid[gz * (side + 2) + gx];
-                    let slope = (h - grid[gz * (side + 2) + gx - 1])
-                        .abs()
-                        .max((h - grid[gz * (side + 2) + gx + 1]).abs())
-                        .max((h - grid[(gz - 1) * (side + 2) + gx]).abs())
-                        .max((h - grid[(gz + 1) * (side + 2) + gx]).abs());
-                    materials.push(column_material(h, slope));
+                    let h = grid[gz * stride + gx];
+                    let slope = max_neighbor_step(&grid, stride, gx, gz);
+                    materials.push(column_material(h, slope, 1));
                 }
             }
             materials
         });
         let material_at = |x: usize, z: usize| -> Option<TopMaterial> {
-            materials.as_ref().map(|m| m[z * CUBE_SIZE as usize + x])
+            materials.as_ref().map(|m| m[z * side + x])
         };
-        let mut fill_column = |x: i32, z: i32, solid: &mut dyn FnMut(i64) -> bool| {
+        let mut fill_column = |x: i32, z: i32, solid: &mut dyn FnMut(usize) -> bool| {
             let top = material_at(x as usize, z as usize);
-            let mut d: u8 = 0;
-            for j in (0..rows).rev() {
-                let y = bottom + j as i64;
-                let is_solid = solid(y);
-                if j < CUBE_SIZE as usize {
-                    let index =
-                        (j * CUBE_SIZE as usize + z as usize) * CUBE_SIZE as usize + x as usize;
-                    flat[index] = match (sea, top) {
-                        (Some(sea), Some(top)) => {
-                            surface_block_sea(is_solid, d, y, top, sea, &blocks)
-                        }
-                        _ => surface_block(is_solid, d, y, &blocks),
-                    };
-                }
-                d = if is_solid {
-                    (d + 1).min(SURFACE_LOOKAHEAD as u8)
-                } else {
-                    0
-                };
+            style_column(&mut styled, solid, rows, bottom, 1, None, sea, top, &blocks);
+            for (j, &state) in styled.iter().enumerate() {
+                flat[(j * side + z as usize) * side + x as usize] = state;
             }
         };
         match (&data, graph.band()) {
@@ -626,7 +503,8 @@ impl Generator {
                     for x in 0..CUBE_SIZE {
                         let at = ((z * CUBE_SIZE + x) as usize) * words;
                         let column = &bits[at..at + words];
-                        fill_column(x, z, &mut |y| {
+                        fill_column(x, z, &mut |j| {
+                            let y = bottom + j as i64;
                             if y <= band.low() {
                                 true
                             } else if y >= band.high() {
@@ -645,11 +523,11 @@ impl Generator {
                     for x in 0..CUBE_SIZE {
                         let at = ((z * CUBE_SIZE + x) as usize) * n_live;
                         graph.restore_column(&mut regs, &live[at..at + n_live]);
-                        fill_column(x, z, &mut |y| {
+                        fill_column(x, z, &mut |j| {
                             graph.eval_cell_density(
                                 self.seed,
                                 base_x + i64::from(x),
-                                y,
+                                bottom + j as i64,
                                 base_z + i64::from(z),
                                 &mut regs,
                             ) >= 0.0
@@ -661,263 +539,6 @@ impl Generator {
         }
         let mut cells = flat.into_iter();
         Cube::from_fn(move |_| cells.next().unwrap())
-    }
-
-    /// A LOD cube at `level ≥ 1` and `pos`, sampled straight from the
-    /// density graph at that level's resolution — no LOD0 cube is generated
-    /// and the LOD0 world is never consulted (task 2.7).
-    ///
-    /// Density is sampled on the level-(*n*−1) grid: 2·`CUBE_SIZE` points
-    /// per axis at step 2^(*n*−1), each at the minimum corner of its child
-    /// cell, plus the surface lookahead above. The surface stage runs in
-    /// **block units**: a sample's run `d` is its consecutive solid samples
-    /// above times 2^(*n*−1), capped at [`SURFACE_LOOKAHEAD`], and its `y`
-    /// is its block y — so at coarse levels the dirt band vanishes and the
-    /// top stays grass or sand. One refinement: the **top solid sample**
-    /// carries its column's true surface material — the surface is refined
-    /// upward from it (at most 2^(*n*−1)−1 extra rows per column) so the
-    /// sand/grass belt stays one block wide instead of one sample wide; at
-    /// level 1 the refinement is empty and the sample is the surface. Each
-    /// 2×2×2 group of samples then becomes one cell through
-    /// [`downsample_cell`], the same rule as the pyramid.
-    ///
-    /// **Level 1 is exact**: the samples equal the generated LOD0 cells
-    /// (asserted by the tests), so the cube equals `downsample_octant` of
-    /// the eight generated LOD0 cubes. Higher levels are an approximation
-    /// bounded by the accuracy tests.
-    ///
-    /// Fast paths from `bounds`, as `generate`: uniform air or uniform
-    /// stone without touching the graph (zero samples — the fast-path tests
-    /// count them through [`Generator::lod_sample_calls`]). Banded graphs
-    /// (the shipped one included) evaluate the column stage once per sample
-    /// column and take the band's provable solid/air rows for free.
-    pub fn sample_lod(&self, level: u8, pos: CubePos) -> Cube {
-        assert!(level >= 1, "sample_lod is for levels >= 1");
-        let graph = self.graph.as_ref();
-        let step = 1i64 << (level as u32 - 1); // 2^(n-1) blocks between samples
-        let side = i64::from(CUBE_SIZE) << level as u32; // blocks per axis
-        let base = [
-            i64::from(pos.x) * side,
-            i64::from(pos.y) * side,
-            i64::from(pos.z) * side,
-        ];
-        let top = base[1] + side - 1;
-        let max = [base[0] + side - 1, top, base[2] + side - 1];
-        if graph
-            .bounds(base, [max[0], top + SURFACE_LOOKAHEAD as i64, max[2]])
-            .0
-            >= 0.0
-        {
-            return Cube::filled(self.blocks.stone);
-        }
-        if graph.bounds(base, max).1 < 0.0 {
-            return Cube::default();
-        }
-        self.lod_sample_calls.fetch_add(1, Ordering::Relaxed);
-
-        // Sampling runs per column, exactly `generate`'s mixed path but
-        // stepping `step` blocks: rows are the sample j of the column, plus
-        // `lookahead` samples above the cube so top rows see the same
-        // saturated runs `generate` would. Every column's solidity rows are
-        // evaluated once and kept, with the column's true surface (the top
-        // solid sample refined upward, at most `step - 1` rows), so the
-        // fill never re-evaluates density.
-        //
-        // Sea-style worlds (the overworld) first collect every sample
-        // column's surface over the grid plus a one-stride border ring, so
-        // the slope rule sees the neighbours `generate`'s per-block rule
-        // would approximate, then decide per-column materials and fill
-        // water over submerged air — exactly `generate`'s styling.
-        let per_axis = 2 * CUBE_SIZE as usize; // samples per axis
-        let lookahead = SURFACE_LOOKAHEAD.div_ceil(step as usize);
-        let rows = per_axis + lookahead;
-        let mut states = vec![BlockStateId::AIR; per_axis * per_axis * per_axis];
-        let blocks = self.blocks;
-        // Sea styling needs per-column surface heights; only banded graphs
-        // get it (the overworld always is; custom graphs are sea-less).
-        let sea = self.sea_level.filter(|_| graph.band().is_some());
-        let band = graph.band();
-        let mut regs = vec![0.0; graph.register_count()];
-
-        // Evaluates the sample rows of world column `(wx, wz)` into
-        // `is_solid` and returns the column's true surface height. When no
-        // sample in the window is solid the surface sits outside it; the
-        // density `surface(x, z) − y` is monotone in `y` for the shipped
-        // (heightmap) graphs, so a binary search over the band finds the
-        // exact surface in a handful of evaluations — the slope rule needs
-        // the true height of every neighbour column, or `generate`'s and
-        // `sample_lod`'s materials would disagree at level 1.
-        let mut eval_rows = |wx: i64, wz: i64, is_solid: &mut Vec<bool>| -> i64 {
-            graph.eval_column(self.seed, wx, wz, &mut regs);
-            is_solid.clear();
-            is_solid.resize(rows, false);
-            let mut solid_at = |y: i64| match band {
-                Some(b) if y <= b.low() => true,
-                Some(b) if y >= b.high() => false,
-                _ => graph.eval_cell_density(self.seed, wx, y, wz, &mut regs) >= 0.0,
-            };
-            for j in (0..rows).rev() {
-                is_solid[j] = solid_at(base[1] + step * j as i64);
-            }
-            match (0..rows).rev().find(|&j| is_solid[j]) {
-                Some(top) => {
-                    let top_y = base[1] + step * top as i64;
-                    let mut h = top_y;
-                    while h + 1 < top_y + step && solid_at(h + 1) {
-                        h += 1;
-                    }
-                    h
-                }
-                None => match band {
-                    None => MIN_HEIGHT - 1,
-                    Some(b) => {
-                        let window_top = base[1] + step * rows as i64 - 1;
-                        if solid_at(window_top) {
-                            // Surface above the window: least provably-air
-                            // row above it, minus one.
-                            let (mut lo, mut hi) = (window_top, b.high());
-                            while lo + 1 < hi {
-                                let mid = lo.midpoint(hi);
-                                if solid_at(mid) {
-                                    lo = mid;
-                                } else {
-                                    hi = mid;
-                                }
-                            }
-                            lo
-                        } else {
-                            // Surface below the window: greatest solid row
-                            // under it (`b.low()` is provably solid).
-                            let (mut lo, mut hi) = (b.low(), base[1]);
-                            while lo + 1 < hi {
-                                let mid = lo.midpoint(hi);
-                                if solid_at(mid) {
-                                    lo = mid;
-                                } else {
-                                    hi = mid;
-                                }
-                            }
-                            lo
-                        }
-                    }
-                },
-            }
-        };
-
-        let mut columns: Vec<Vec<bool>> = vec![vec![false; rows]; per_axis * per_axis];
-        let mut true_surfaces = vec![0i64; per_axis * per_axis];
-        // The extended surface grid (interior + one-stride ring), sea only.
-        let extended = per_axis + 2;
-        let mut surfaces = vec![0i64; extended * extended];
-        if sea.is_some() {
-            let mut scratch = Vec::new();
-            for z in 0..extended {
-                for x in 0..extended {
-                    let interior = (1..=per_axis).contains(&x) && (1..=per_axis).contains(&z);
-                    let (wx, wz) = (
-                        base[0] + step * (x as i64 - 1),
-                        base[2] + step * (z as i64 - 1),
-                    );
-                    let h = if interior {
-                        let column = &mut columns[(z - 1) * per_axis + (x - 1)];
-                        eval_rows(wx, wz, column)
-                    } else {
-                        eval_rows(wx, wz, &mut scratch)
-                    };
-                    surfaces[z * extended + x] = h;
-                    if interior {
-                        true_surfaces[(z - 1) * per_axis + (x - 1)] = h;
-                    }
-                }
-            }
-        } else {
-            for z in 0..per_axis {
-                for x in 0..per_axis {
-                    let (wx, wz) = (base[0] + step * x as i64, base[2] + step * z as i64);
-                    let column = &mut columns[z * per_axis + x];
-                    let h = eval_rows(wx, wz, column);
-                    true_surfaces[z * per_axis + x] = h;
-                }
-            }
-        }
-
-        let material_at = |x: usize, z: usize| -> TopMaterial {
-            if sea.is_none() {
-                return TopMaterial::Grass;
-            }
-            let (gx, gz) = (x + 1, z + 1);
-            let h = surfaces[gz * extended + gx];
-            // The slope bar scales with the sample stride so a level-*n*
-            // cube classifies the same terrain `generate`'s per-block rule
-            // would: a cliff is a [`STEEP_SLOPE`]-block step per block, not
-            // per sample. At `step` 1 (level 1) this is exactly
-            // `generate`'s rule, which the level-1 exactness test asserts.
-            let bar = STEEP_SLOPE * step;
-            let slope = (h - surfaces[gz * extended + gx - 1])
-                .abs()
-                .max((h - surfaces[gz * extended + gx + 1]).abs())
-                .max((h - surfaces[(gz - 1) * extended + gx]).abs())
-                .max((h - surfaces[(gz + 1) * extended + gx]).abs());
-            if h >= STONE_LEVEL || slope >= bar {
-                TopMaterial::Stone
-            } else if h <= BEACH_LEVEL {
-                TopMaterial::Sand
-            } else {
-                TopMaterial::Grass
-            }
-        };
-
-        for z in 0..per_axis {
-            for x in 0..per_axis {
-                let is_solid = &columns[z * per_axis + x];
-                let true_surface = true_surfaces[z * per_axis + x];
-                let top = material_at(x, z);
-                let top_sample = (0..rows).rev().find(|&j| is_solid[j]);
-                let mut d: u8 = 0; // consecutive solid samples above, unscaled
-                for j in (0..rows).rev() {
-                    let y = base[1] + step * j as i64;
-                    let solid_j = is_solid[j];
-                    if j < per_axis {
-                        // d in block units, as the surface stage defines it;
-                        // the top solid sample carries the true surface's
-                        // material via its `block_y`.
-                        let d_blocks = ((d as i64) * step).min(SURFACE_LOOKAHEAD as i64) as u8;
-                        let at = (j * per_axis + z) * per_axis + x;
-                        let block_y = if Some(j) == top_sample {
-                            true_surface
-                        } else {
-                            y
-                        };
-                        states[at] = match sea {
-                            Some(sea) => {
-                                surface_block_sea(solid_j, d_blocks, block_y, top, sea, &blocks)
-                            }
-                            None => surface_block(solid_j, d_blocks, block_y, &blocks),
-                        };
-                    }
-                    d = if solid_j {
-                        (d + 1).min(SURFACE_LOOKAHEAD as u8)
-                    } else {
-                        0
-                    };
-                }
-            }
-        }
-        // Each cell's eight children are the samples at 2·cell + (dx, dy, dz)
-        // — the same gather `downsample_octant` does, on the doubled grid.
-        Cube::from_fn(|p| {
-            let (px, py, pz) = (p.x as usize, p.y as usize, p.z as usize);
-            let mut children = [BlockStateId::AIR; 8];
-            for dy in 0..2usize {
-                for dz in 0..2usize {
-                    for dx in 0..2usize {
-                        let at = ((2 * py + dy) * per_axis + 2 * pz + dz) * per_axis + 2 * px + dx;
-                        children[dx + 2 * dz + 4 * dy] = states[at];
-                    }
-                }
-            }
-            downsample_cell(children)
-        })
     }
 }
 
@@ -931,7 +552,7 @@ mod tests {
     use jbm_core::cube::Cube;
     use std::collections::HashMap;
 
-    /// The classic preset: these tests assert the pre-2.8 terrain's exact
+    /// The classic preset: these tests assert the classic terrain's exact
     /// layering and heights, so they pin it.
     fn generator(seed: u64) -> Generator {
         let mut registry = BlockRegistry::new();
