@@ -30,7 +30,12 @@ classic graph's narrower `[36, 92]` sits inside them).
   otherwise grass over a 3-deep dirt belt, stone below. Local per column,
   so it is cheap and LOD-consistent. `sample_lod` scales the slope bar by
   the sample stride, so a level-*n* cube classifies the terrain
-  `generate`'s per-block rule would.
+  `generate`'s per-block rule would. The sand belt stays narrow (task
+  2.10): the continental spline rises steeply off the waterline (62.5 →
+  67 over 0.03 of continentalness), so lowland clears the beach level
+  within a few blocks of the shore — sand covers ~3% of land in the
+  8 km shape sample (`beaches_stay_narrow_but_coasts_still_show_sand`)
+  where the 2.8 spline's gentler rise left ~8% sand plains.
 - **Spawn search (overworld):** outward from `(0, 0)` in a fixed spiral
   (ring by ring, each ring in a fixed order) for the first land column at
   or above sea level whose steepest neighbour step is ≤ 2. Deterministic
@@ -122,7 +127,8 @@ band/heightmap fast paths and `sample_lod` keep working):
    coasts.
 2. **Continentalness** (`cont`, `base`): a warped fbm2 over a few
    kilometres, through a spline to the base height — deep ocean floor
-   around y = 28, coasts near sea level, lowlands and highlands up to 79.
+   around y = 28, a steep rise off the waterline (task 2.10, so beaches
+   stay narrow), lowlands and highlands up to 79.
 3. **Erosion** (`ero`, `rugged`): a second warped low-frequency field
    through a step spline, deciding how much of the mountain field applies —
    ranges sit in bands, plains stay plain.

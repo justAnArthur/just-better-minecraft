@@ -377,3 +377,61 @@ fn lod_surface_accuracy_per_level() {
         assert!(mean >= 0.0, "L{level} mean {mean} under the true surface");
     }
 }
+
+/// Task 2.10 F: beaches stay narrow. The sand rule (`h <= SEA_LEVEL + 1`)
+/// makes every lowland column at the waterline sand; with the 2.8
+/// continental spline's gentle rise off the sea, flat lowland became
+/// huge sand plains. The 2.10 spline rises off the sea level quickly, so
+/// in the 8 km shape sample the sand columns are a small fraction of
+/// land — while coasts still show their beach rim.
+#[test]
+fn beaches_stay_narrow_but_coasts_still_show_sand() {
+    let terrain = overworld(DEFAULT_SEED);
+    let n = 500usize; // the shape sample's grid, 16-block spacing, 8 km
+    let at = |xi: usize, zi: usize| {
+        terrain.surface_height(
+            (xi as i64 - n as i64 / 2) * 16,
+            (zi as i64 - n as i64 / 2) * 16,
+        )
+    };
+    let mut land = 0usize;
+    let mut sand = 0usize;
+    let mut coastal_sand = 0usize;
+    for zi in 0..n {
+        for xi in 0..n {
+            let h = at(xi, zi);
+            if h < SEA_LEVEL {
+                continue; // sea (its floor is sand, but not "beach")
+            }
+            land += 1;
+            if h <= SEA_LEVEL + 1 {
+                sand += 1;
+                // A beach column near the water: some 4-neighbour in the
+                // sample is sea.
+                let sea_neighbor = [(zi > 0, xi, zi.saturating_sub(1)), (zi + 1 < n, xi, zi + 1)]
+                    .into_iter()
+                    .any(|(ok, x, z)| ok && at(x, z) < SEA_LEVEL)
+                    || [(xi > 0, xi.saturating_sub(1), zi), (xi + 1 < n, xi + 1, zi)]
+                        .into_iter()
+                        .any(|(ok, x, z)| ok && at(x, z) < SEA_LEVEL);
+                if sea_neighbor {
+                    coastal_sand += 1;
+                }
+            }
+        }
+    }
+    let fraction = sand as f64 / land as f64;
+    println!(
+        "beaches @ 8km: {sand} sand of {land} land columns ({fraction:.3}), \
+         {coastal_sand} coastal sand columns"
+    );
+    assert!(
+        fraction < 0.05,
+        "sand covers {:.1}% of land — the sand plains are back",
+        fraction * 100.0
+    );
+    assert!(
+        coastal_sand >= 100,
+        "only {coastal_sand} coastal sand columns — the beach rim vanished"
+    );
+}

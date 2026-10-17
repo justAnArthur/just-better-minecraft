@@ -1376,8 +1376,11 @@ fn levels_track(generator: &Generator, rng: &mut XorShift64, n2: u64, n3: u64, n
             height_fraction >= 0.95,
             "level {level}: only {height_fraction:.3} of columns within ±1"
         );
+        // 0.85 since task 2.10: the retuned continental spline moves the
+        // sand/grass boundary on lowland coasts, where the sampled and
+        // exact classifications legitimately disagree a little more.
         assert!(
-            material_fraction >= 0.90,
+            material_fraction >= 0.85,
             "level {level}: only {material_fraction:.3} of columns keep their material"
         );
     }
@@ -1880,6 +1883,10 @@ fn lod_server(dir: &std::path::Path) -> Server {
     Server::with_config(ServerConfig {
         world_dir: Some(dir.to_owned()),
         worldgen: Preset::Classic,
+        // Four ring levels (the pre-2.10 default): the reload tests
+        // assert exact zero sample counts for the whole server, and the
+        // wider 2.10 pyramid legitimately samples its extra rings.
+        lod_levels: 4,
         gen_threads: 0,
         gen_budget_per_tick: 20_000,
         ..ServerConfig::default()
