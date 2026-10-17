@@ -9,12 +9,14 @@ use jbm_core::block::{BlockRegistry, BlockStateId, builtin};
 use jbm_core::coords::{BlockPos, CubePos};
 use jbm_core::protocol::{ClientMsg, ServerMsg};
 use jbm_server::terrain::Generator;
+use jbm_server::worldgen::Preset;
 use jbm_server::{DEFAULT_SEED, ServerConfig};
 use jbm_testkit::HeadlessServer;
 
 /// The streaming shape of the spec: R = 3, V = 2, inline generation.
 fn config() -> ServerConfig {
     ServerConfig {
+        worldgen: Preset::Classic, // pin the pre-2.8 terrain: these scenes and their goldens predate it
         seed: DEFAULT_SEED,
         streaming: true,
         view_radius: 3,
@@ -30,6 +32,7 @@ fn config() -> ServerConfig {
         lod_vertical_radius: 3,
         lod_send_budget_per_tick: 32,
         lod_max_in_flight: 256,
+        ..ServerConfig::default()
     }
 }
 
@@ -70,7 +73,8 @@ fn breaking_a_surface_block_lands_within_one_tick() {
     // next to spawn, in reach, not air.
     let mut registry = BlockRegistry::new();
     let blocks = builtin::Blocks::register(&mut registry);
-    let surface = Generator::new(DEFAULT_SEED, blocks).surface_height(0, 0);
+    let surface =
+        Generator::with_preset(DEFAULT_SEED, blocks, Preset::Classic).surface_height(0, 0);
     let at = BlockPos {
         x: 0,
         y: surface,

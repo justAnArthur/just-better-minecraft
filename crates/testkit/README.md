@@ -73,6 +73,9 @@ edit made while a batch is held mid-save (`Storage::hold_saves`) keeps the
 cube pinned until the *second* batch commits, and a failed save
 (`Storage::fail_next_save`) keeps cubes pinned and retries next interval.
 Each uses a temp world dir, inline generation and a one-tick save interval.
+These tests pin `ServerConfig { worldgen: Preset::Classic }` — their height
+and reachability assumptions are about the pre-2.8 terrain, which 2.8 keeps
+generatable as a preset.
 
 `tests/kill_during_save.rs` proves crash atomicity by re-executing its own
 binary as a child (`--exact kill_child_* --nocapture`, gated by

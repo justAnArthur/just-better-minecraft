@@ -52,21 +52,25 @@ coordinates and cfg-gated off under the crate's own `cube16` passthrough;
   shares and the coverage rule (`Coverage`).
 - `render::texture_array::BlockTextures` + `placeholder_layers(n)` —
   block texture array with CPU-generated mipmaps (repeat addressing so
-  merged faces tile per block).
+  merged faces tile per block), plus each layer's average color (task
+  2.9) as a CPU table (`averages()`) and a storage buffer
+  (`averages_buffer()`) the terrain pass binds.
 - `render::offscreen::OffscreenTarget` — an `Rgba8UnormSrgb` render
   target with `read_rgba(&Gpu) -> image::RgbaImage` readback.
 - `render::triangle` — the minimal test pipeline.
 - `predict::Predictor` — client-side prediction of the shared physics
   (see below).
 - `app::run(link)` — opens the window and runs the frame loop against a
-  server link. `JBM_AUTOFLY=<blocks>` (task 2.6 gate) turns the app into
-  an autopilot: once spawned it toggles flying, climbs 40 blocks above
-  spawn, flies straight at sprint speed for `<blocks>` blocks through
-  the normal `PlayerInput` path (prediction and the server both see a
-  real player), then exits printing a frame-time summary (count, mean,
-  p50, p95, p99, max, frames over 33 ms and 50 ms). The autopilot
-  ignores the window-occlusion pause so an unattended gate run
-  finishes even when its window is never shown.
+  server link, with the default view distances; `app::run_with_view`
+  takes a `ViewSetup` (the ring radii the far look keys on — the game
+  derives it from its `ServerConfig`). `JBM_AUTOFLY=<blocks>` (task 2.6
+  gate) turns the app into an autopilot: once spawned it toggles flying,
+  climbs 40 blocks above spawn, flies straight at sprint speed for
+  `<blocks>` blocks through the normal `PlayerInput` path (prediction
+  and the server both see a real player), then exits printing a
+  frame-time summary (count, mean, p50, p95, p99, max, frames over
+  33 ms and 50 ms). The autopilot ignores the window-occlusion pause so
+  an unattended gate run finishes even when its window is never shown.
 - `testing::screenshot` (only with `--features testing` or in unit tests)
   — golden-image comparison helpers, see below.
 
@@ -258,6 +262,17 @@ reference):
   faces are ordinary faces (same AO from same-level neighbors, same
   texture, greedy-merged within the octant rule); `MeshOutput::skirts`
   counts them for the overhead report.
+- **Lids** (+Y only, wave D), the skirts' counterpart for horizontal
+  seams. Emit cell *c*'s top face even though the cell above is filled
+  when *c* is filled and sits at y = `CUBE_SIZE / 2 − 1` (the octant
+  plane) or y = `CUBE_SIZE − 1` (the cube border). The upper octants or
+  the cube above may be drawn by finer cubes that are air at that height;
+  without the lid a slope crossing the seam shows a contour line of holes
+  (the lod_fly test over the 2.8 mountains found it). No column
+  restriction, since a cliff can leave a finer column air at the seam
+  however high the coarse one reaches; buried lids are hidden in terrain
+  and greedy-merge to a few quads per octant. `MeshOutput::lids` counts
+  them.
 
 The mesher also feeds the renderer a per-face skirt bit and counts
 skirt faces; the render expands level ≥ 1 quads by ~1/512 block
@@ -288,6 +303,82 @@ the rings hole tests.
   rings tests); the 2.6 re-measurement of gpu-cull at ring scale
   (cpu-cull ≈ 621 µs vs gpu-cull ≈ 948 µs, Apple M5 Pro / Metal) is in
   the game README.
+
+### The far look: flat material colors and distance fog (task 2.9)
+
+The far view reads as a smooth landscape (the Distant Horizons look),
+not as noisy repeated block textures, and the LOD0/LOD1 switch is
+invisible:
+
+- **Per-layer average colors.** At texture load, `BlockTextures`
+  computes each layer's average **in linear space** from the base mip,
+  weighting every pixel by its alpha so cutout holes (leaves, glass) do
+  not darken it; a fully transparent layer falls back to the
+  unweighted mean. The averages live as a CPU table (`averages()`, for
+  tests) and one storage buffer of `vec4f` per layer bound in the
+  terrain group (binding 4). Grass top and grass side are different
+  layers, so a hillside reads green on top and earthy on the sides.
+- **`far_color(tex, layer, dist, level)`** (documented in
+  `terrain.wgsl`) returns the base color before shade and fog:
+  level ≥ 1 draws the layer's average, flat — no texture look, no
+  cutout discard (a LOD cell is solid by the downsampling rule; the
+  sample itself still happens because `textureSample` must stay in
+  uniform control flow, and `mix(x, y, 1.0)` drops its value). Level 0
+  mixes `mix(texture, average, fade(dist))` where `fade` is a
+  smoothstep over **40%..85% of the LOD0 ring radius** — by the
+  LOD0/LOD1 border (85%) both sides are flat, so the border cannot
+  show. The cutout discard still applies while `fade < 1`.
+- **AO softening:** AO contrast scales with cell size and reads blotchy
+  far away, so coarse levels pull the corner AO factor toward fully
+  open by a per-level factor (`AO_SOFTEN` = 1.0 / 0.6 / 0.45 / 0.3,
+  clamped at the last entry). Level 0 keeps the exact factor, so
+  pre-2.9 LOD0 goldens stay bit-stable. Directional face shading stays
+  on every level.
+- **Distance fog.** Every terrain fragment blends into the sky color
+  along its own view ray with the ray's y clamped just above the
+  horizon (`max(dir.y, 1e-6)`): the same gradient the sky pass paints
+  behind it, so far rings dissolve into the sky with no visible band
+  and the outermost ring's edge is never visible. The factor is a
+  smoothstep over **35%..98% of the furthest ring radius** (98% keeps
+  the edge inside the fog). WGSL has no includes, so the gradient
+  lives once in `shaders/sky_gradient.wgsl` and pipeline creation
+  concatenates that snippet ahead of both `sky.wgsl` and `terrain.wgsl`
+  — the two can never drift.
+- **Where the radii come from:** the client cannot learn them from the
+  link, so the game derives a `ViewSetup` from its `ServerConfig`
+  (`view_radius · CUBE_SIZE` and `lod_view_radius · CUBE_SIZE ·
+  2^lod_levels`) and `app::run_with_view` passes it to
+  `TerrainPass::set_view_distance`. Defaults match the `ServerConfig`
+  defaults (`DEFAULT_LOD0_RING_RADIUS`, `DEFAULT_FURTHEST_RING_RADIUS`).
+- **Test hooks:** `Renderer::set_fog(bool)` (also `JBM_NO_FOG=1` at
+  construction) switches the fog off entirely so screenshot tests can
+  isolate geometry from fog; the fade always stays. Fog paints terrain
+  fragments only — never the sky pass — so the sentinel hole tests keep
+  working with fog on: a hole still shows the sentinel sky.
+- **Tuning:** every window is a fraction of a radius; the fractions are
+  the consts at the top of `render/chunks.rs` (`FADE_START_FRACTION`,
+  `FADE_END_FRACTION`, `FOG_START_FRACTION`, `FOG_END_FRACTION`,
+  `AO_SOFTEN`) mirrored as WGSL consts in `terrain.wgsl` — keep the two
+  in sync (tests compute expectations from the Rust ones).
+
+Every draw path shares the one fragment shader, so cpu-cull, gpu-cull
+and fallback stay pixel-identical under the far look (the rings
+path-equality tests cover it).
+
+### Level tint debug view (task 2.10)
+
+**F4** (or `JBM_LOD_TINT=1` at startup) multiplies every fragment by a
+fixed color per LOD level — one uniform flag (`TerrainUniforms.tint`),
+applied before shade and fog, identical on all three draw paths because
+they share the one fragment shader. LOD0 stays white; the others follow
+`LOD_TINT_COLORS` in `render/chunks.rs` (mirrored by `lod_tint` in
+`terrain.wgsl`): L1 (2×2×2 cells) red, L2 (4×4) yellow, L3 (8×8) green,
+L4 (16×16) cyan, L5 (32×32) blue, L6 (64×64) purple — never pure
+magenta, the hole-test sentinel. While it is on, the overlay shows the
+legend (`LOD TINT L1 2x2 red L2 4x4 yellow …`). Use it to see which
+level draws where; the rings test `level_tint_marks_each_drawn_level`
+pins that each level's color appears exactly where the coverage rule
+draws that level.
 
 ### Terrain rendering
 
@@ -499,7 +590,9 @@ Terrain pipeline: depth `Greater` with reverse-Z, back-face culling,
 samples `BlockTextures` (nearest, linear mips, repeat addressing so
 merged faces tile per block), `discard` below alpha 0.5, directional
 shading (top 1.0, ±Z 0.8, ±X 0.6, bottom 0.5) times the AO factor
-(0.4/0.6/0.8/1.0).
+(0.4/0.6/0.8/1.0). The far look (task 2.9, see above) replaces the
+texel with the layer average on level ≥ 1, fades level 0's texel into
+it with distance, and fogs every fragment toward the horizon sky color.
 
 ### App runtime
 
@@ -598,6 +691,7 @@ Above the horizon the color rises from horizon pale to zenith blue with
 | Shift | Fly down |
 | Ctrl | Sprint (walk 5.6, fly 22 blocks/s) |
 | F | Toggle fly (one edge per press) |
+| F4 | Toggle the LOD level tint debug view (task 2.10) |
 | Mouse | Look (while cursor grabbed) |
 | Left click | Grab + hide cursor (Locked, falls back to Confined); once grabbed, break the target block (hold to repeat every 0.25 s) |
 | Right click | Place the hotbar block against the targeted face (hold to repeat) |
@@ -678,6 +772,17 @@ must render the scene pixel-identically; a LOD1 cube renders like its
 LOD0 pattern at the same camera (the ×2 scale invariance), and masking
 hides exactly the masked volume with fully masked cubes emitting no
 commands.
+
+`tests/far_look.rs` (task 2.9) has no goldens either: it asserts
+pixels directly. A single LOD1 cube's lit top face is the layer's flat
+average within ±1 LSB (times shade and AO); a long LOD0 strip keeps the
+textured look near, reaches the flat average far (±2 LSB), and every
+transition row matches the analytic smoothstep at its distance; with
+fog on, a fragment beyond the fog end equals the sky behind it (±1 LSB)
+while a near pixel is byte-identical with fog off. The border test in
+`tests/lod_rings.rs` (`lod0_lod1_border_is_invisible_with_flat_colors`)
+checks 16×16 windows either side of the LOD0/LOD1 border for
+`zoom_border01` and `down_border01`: mean luminance within 3%, fog off.
 
 `tests/terrain_pages.rs` (task 2.2, extended by 2.5) has no golden of
 its own: it churns 200 cubes through tiny face pages (re-uploads that

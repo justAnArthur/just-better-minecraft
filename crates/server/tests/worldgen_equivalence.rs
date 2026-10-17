@@ -11,15 +11,19 @@ use jbm_core::coords::{CubePos, LocalPos};
 use jbm_server::DEFAULT_SEED;
 use jbm_server::terrain::{Generator, MAX_HEIGHT, MIN_HEIGHT};
 use jbm_server::worldgen::reference::ReferenceGenerator;
-use jbm_server::worldgen::{self, GRID_SIDE, Graph, Node, NodeValue, Outputs, Salt, compile};
+use jbm_server::worldgen::{GRID_SIDE, Graph, Node, NodeValue, Outputs, Preset, Salt, compile};
 
 fn blocks() -> Blocks {
     let mut registry = BlockRegistry::new();
     Blocks::register(&mut registry)
 }
 
+/// The graph side of every equivalence test here is the **classic** preset:
+/// it is the graph that re-expresses the task 1.5 reference terrain
+/// bit-for-bit (the overworld is a different world, asserted in
+/// tests/overworld.rs).
 fn graph_generator(seed: u64) -> Generator {
-    Generator::new(seed, blocks())
+    Generator::with_preset(seed, blocks(), Preset::Classic)
 }
 
 fn reference_generator(seed: u64) -> ReferenceGenerator {
@@ -117,7 +121,7 @@ fn graph_surface_heights_equal_reference_heights_far_away() {
 
 #[test]
 fn sample_grid_step_one_signs_match_generated_solidity() {
-    let compiled = worldgen::overworld();
+    let compiled = Preset::Classic.compiled();
     let mut out = Box::new([0.0; GRID_SIDE * GRID_SIDE * GRID_SIDE]);
     for seed in [DEFAULT_SEED, 42] {
         let terrain = graph_generator(seed);
@@ -250,6 +254,8 @@ fn an_unbanded_graph_still_generates_consistently() {
             salt: Salt(1),
             x_scale: 0.05,
             z_scale: 0.05,
+            x_offset: None,
+            z_offset: None,
         })),
         b: NodeValue::Const(0.3),
     });

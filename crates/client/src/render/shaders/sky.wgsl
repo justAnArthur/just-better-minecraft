@@ -42,13 +42,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     // world-space ray direction.
     let near = u.inv_view_proj * vec4f(in.ndc, 1.0, 1.0);
     let dir = normalize(near.xyz / near.w);
-
-    if (dir.y >= 0.0) {
-        // Above the horizon: pale horizon color rising into the zenith.
-        let t = pow(min(dir.y, 1.0), 0.45);
-        return vec4f(mix(u.horizon_color.rgb, u.zenith_color.rgb, t), 1.0);
-    }
-    // Below the horizon: fade into the darker ground-haze color.
-    let t = min(-dir.y * 4.0, 1.0);
-    return vec4f(mix(u.horizon_color.rgb, u.ground_color.rgb, t), 1.0);
+    // The gradient itself lives in sky_gradient.wgsl, concatenated ahead
+    // of this text at pipeline creation (task 2.9): terrain.wgsl's fog
+    // evaluates the very same function.
+    return vec4f(
+        sky_gradient(dir, u.horizon_color.rgb, u.zenith_color.rgb, u.ground_color.rgb),
+        1.0,
+    );
 }

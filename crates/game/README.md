@@ -6,13 +6,31 @@ a channel (see docs/design.md, "Architecture overview").
 **Wiring (task 1.4):** `main` spawns the server with
 `jbm_server::run::spawn(Server::new())` (dedicated `"jbm-server"` thread),
 builds an `in_process_pair()` link, hands the server end to the thread via
-`handle.connect(server_end)`, and runs `jbm_client::app::run(client_end)`
+`handle.connect(server_end)`, and runs
+`jbm_client::app::run_with_view(client_end, view)` (task 2.9; see
+"Far-look wiring" below)
 — the window, the link polling, the mesh pool and the terrain renderer.
 When the window closes (or the server drops the link), `app::run` returns
 and `handle.stop()` joins the server thread. The server thread is never
 detached; stopping it propagates a server panic rather than swallowing it.
 
-`Server::new()` streams generated terrain around the player (task 1.5).
+`Server::new()` streams generated terrain around the player (task 1.5); it
+runs the default `Overworld` worldgen preset (task 2.8's continents,
+mountain ranges and sea). Every test, bench and example here that depends
+on the pre-2.8 terrain pins `ServerConfig { worldgen: Preset::Classic }`
+(`terrain_screenshot`, `edit_screenshot`, `edit_e2e`, `prediction`,
+`terrain_paths`, the draw benches and the cube-size metrics) so their
+goldens and height assumptions keep their meaning; `lod_fly` alone uses
+the new `Overworld`, as the real-flight check.
+
+**Far-look wiring (task 2.9):** `main` derives a
+`jbm_client::app::ViewSetup` from its `ServerConfig` before the config
+moves into the server — the LOD0 ring radius (`view_radius ·
+CUBE_SIZE`) and the furthest ring radius (`lod_view_radius · CUBE_SIZE
+· 2^lod_levels`) — and runs the client with `app::run_with_view`. The
+client cannot learn these from the link; its terrain pass scales the
+texture→flat fade and the distance-fog windows on them (see the client
+README, "The far look").
 
 **World persistence (task 2.3):** the server saves into `saves/default`
 under the current directory. `JBM_WORLD_DIR=<path>` overrides the
@@ -78,9 +96,10 @@ play on gpu-cull, run `JBM_GPU_CULL=1 cargo run -p jbm-game --release`
 
 **LOD rings (task 2.6).** `terrain_draw` adds `rings/cpu_cull` and
 `rings/gpu_cull`: the rings scene at game scale (default
-`lod_view_radius`, 4 levels) built in `benches/common/rings.rs` —
+`lod_view_radius`, 6 levels since task 2.10) built in
+`benches/common/rings.rs` —
 levels 0–1 from the real generator (level 1 by the core downsampling
-rule over level-0 data), levels 2–3 sampled from the generator's
+rule over level-0 data), levels 2–5 sampled from the generator's
 surface at each level's resolution, every cube pre-meshed with
 same-level neighbors and uploaded through the real coverage rule.
 Setup asserts every level has resident **and** drawn cubes (the
@@ -100,11 +119,28 @@ speed for `<blocks>` blocks through the normal `PlayerInput` path
 printing a frame-time summary (count, mean, p50, p95, p99, max, frames
 over 33 ms and over 50 ms).
 
+**Surface-following windows (task 2.10).**
+`tests/surface_windows.rs` covers the 2.10 streaming fix on the real
+overworld: it deterministically finds a valley with a ≥90-block wall
+within 160 blocks (the play-test's geometry), streams a threaded server
+there and asserts (1) every surface cube of the LOD0 disk — sampled
+five blocks per cube column — was sent, and (2) with the client's level
+tint on, no pixel whose depth places it within 200 blocks of the camera
+is drawn by a LOD ring (per-pixel distance via `DepthTarget::read_depth`,
+reverse-Z `distance = NEAR / depth`); farther ring pixels are legitimate
+and only counted. The ignored `surface_window_measurements` test prints
+the task's before/after numbers (cubes sent per level, settle time,
+memory) at spawn and on a mountain with `max_column_cubes` 0 (the
+pre-2.10 fixed windows) and 16 (the default).
+
 **LOD fly test (task 2.6).** `tests/lod_fly.rs` (GPU, `#[ignore]`d —
 slow real-server flight; run with `cargo test -p jbm-game --test
 lod_fly -- --ignored`) flies a real client against a threaded real
 server: 1.5 km straight, then a 90° turn for 300 m, 40 blocks above the
-terrain at pitch −15°. Every 100 blocks it waits (20 s cap) for the
+terrain at pitch −15°, then (task 2.10) 600 m low along a valley
+(20 over the terrain, cliffs towering over the camera) and one final
+stop looking straight down from 400 blocks. Every 100 blocks it waits
+(20 s cap) for the
 client mesh queue to be clear for a run of ticks (server ring readiness
 is never checked — whatever arrived and meshed by then is what the
 check sees), then checks the sentinel pixels below the horizon

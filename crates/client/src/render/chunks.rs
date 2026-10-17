@@ -143,6 +143,72 @@ pub struct TerrainUniforms {
     /// xyz = `camera − camera_cube · CUBE_SIZE` (f64 on the CPU, rounded
     /// to f32); w = CUBE_SIZE, so the shaders are cube-size agnostic.
     pub camera_frac: [f32; 4],
+    /// Task 2.9 far look. x = the LOD0 ring radius in blocks (the
+    /// texture→flat fade window is a fraction of it); y = the furthest
+    /// ring radius in blocks (the fog window is a fraction of it);
+    /// z = fog on (1.0) / off (0.0 — `Renderer::set_fog` / `JBM_NO_FOG`);
+    /// w spare.
+    pub far: [f32; 4],
+    /// Task 2.10 level tint. x = tint on (1.0) / off (0.0 — F4 /
+    /// `JBM_LOD_TINT=1`); the fragment shader multiplies each fragment by
+    /// [`LOD_TINT_COLORS`] at its cube's level. y, z, w spare.
+    pub tint: [f32; 4],
+}
+
+/// The level tint colors (task 2.10), linear RGB, indexed by LOD level;
+/// level 0 is white (untinted). One fixed color per level so a screenshot
+/// shows at a glance which level draws where: L1 (2×2×2 cells) red, L2
+/// (4×4) yellow, L3 (8×8) green, L4 (16×16) cyan, L5 (32×32) blue, L6
+/// (64×64) purple. Never pure magenta at any level: that is the hole
+/// sentinel the tests look for. Levels above the table clamp to the last
+/// entry.
+pub const LOD_TINT_COLORS: [[f32; 3]; 7] = [
+    [1.0, 1.0, 1.0],   // LOD0: untinted
+    [1.0, 0.0, 0.0],   // L1 2x2 red
+    [1.0, 1.0, 0.0],   // L2 4x4 yellow
+    [0.0, 1.0, 0.0],   // L3 8x8 green
+    [0.0, 1.0, 1.0],   // L4 16x16 cyan
+    [0.0, 0.0, 1.0],   // L5 32x32 blue
+    [0.55, 0.15, 1.0], // L6 64x64 purple (magenta-free)
+];
+
+/// The tint color of `level` (clamped at the last entry).
+pub fn lod_tint_color(level: u8) -> [f32; 3] {
+    LOD_TINT_COLORS[(level as usize).min(LOD_TINT_COLORS.len() - 1)]
+}
+
+/// Fractions of the ring radii the far look (task 2.9) keys on, mirrored
+/// as WGSL consts in `shaders/terrain.wgsl` — keep the two in sync. The
+/// fade covers 40%..85% of the LOD0 ring radius (flat on both sides of
+/// the LOD0/LOD1 border); the fog starts at 35% of the furthest ring
+/// radius and saturates at 98%, just inside the outermost ring.
+pub const FADE_START_FRACTION: f32 = 0.40;
+pub const FADE_END_FRACTION: f32 = 0.85;
+pub const FOG_START_FRACTION: f32 = 0.35;
+pub const FOG_END_FRACTION: f32 = 0.98;
+
+/// AO softening per LOD level (task 2.9), mirrored by `ao_soften` in
+/// `shaders/terrain.wgsl` — keep the two in sync. Level 0 keeps the exact
+/// AO factor (pre-2.9 goldens stay bit-stable); coarser levels pull the
+/// factor toward fully open, because AO contrast scales with cell size and
+/// reads blotchy far away. Levels beyond the table clamp to the last entry.
+pub const AO_SOFTEN: [f32; 4] = [1.0, 0.6, 0.45, 0.3];
+
+/// Default view distances for the far look (task 2.9), matching the
+/// `ServerConfig` defaults (`view_radius` 8, `lod_levels` 6 since task
+/// 2.10, `lod_view_radius` 8): the LOD0 ring radius and the furthest
+/// (level-6) ring radius, in blocks.
+pub const DEFAULT_LOD0_RING_RADIUS: f32 = 8.0 * CUBE_SIZE as f32;
+pub const DEFAULT_FURTHEST_RING_RADIUS: f32 = 8.0 * CUBE_SIZE as f32 * 64.0;
+
+/// The `far` words of [`TerrainUniforms`] from the radii and fog flag.
+fn far_uniform_words(far_radii: [f32; 2], fog: bool) -> [f32; 4] {
+    [far_radii[0], far_radii[1], if fog { 1.0 } else { 0.0 }, 0.0]
+}
+
+/// The `tint` words of [`TerrainUniforms`] from the tint flag (task 2.10).
+fn tint_uniform_words(tint: bool) -> [f32; 4] {
+    [if tint { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0]
 }
 
 /// The cull shader's per-frame uniform (group 1, binding 0 of cull.wgsl).
@@ -368,8 +434,12 @@ impl MeshBookkeeping {
         slot
     }
 
-    /// An empty mesh: entry kept, no allocation, no slot.
-    fn commit_empty(&mut self, key: CubeKey) {
+    /// An empty mesh: entry kept, no allocation, no slot. `drawn`/`mask`
+    /// carry the cube's coverage state over, exactly as a non-empty
+    /// re-mesh does: resetting them here once let a cube the coverage
+    /// rule had hidden draw again after an empty-then-non-empty re-mesh
+    /// (two levels drawing the same water, z-fighting).
+    fn commit_empty(&mut self, key: CubeKey, drawn: bool, mask: u8) {
         self.meshes.insert(
             key,
             CubeMesh {
@@ -378,8 +448,8 @@ impl MeshBookkeeping {
                 slot: None,
                 ranges: std::array::from_fn(|_| 0u32..0),
                 skirts: 0,
-                drawn: true,
-                mask: 0,
+                drawn,
+                mask,
             },
         );
     }
@@ -857,6 +927,18 @@ pub struct TerrainPass {
     /// ref-counted clones.
     texture_view: wgpu::TextureView,
     sampler: wgpu::Sampler,
+    /// The per-layer average colors (task 2.9), kept for the shared bind
+    /// group rebuilds.
+    averages_buffer: wgpu::Buffer,
+    /// Far-look view distances (task 2.9): LOD0 ring radius and furthest
+    /// ring radius, in blocks. See `set_view_distance`.
+    far_radii: [f32; 2],
+    /// Whether distance fog is on (task 2.9); propagated from
+    /// `Renderer::set_fog` every frame.
+    fog: bool,
+    /// Whether the level tint is on (task 2.10); propagated from
+    /// `Renderer::set_lod_tint` every frame.
+    lod_tint: bool,
     pages: Vec<FacePage>,
     /// Faces per page (every page is the same size).
     page_faces: u32,
@@ -985,8 +1067,10 @@ impl TerrainPass {
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
+                    // VERTEX: the origin formula; FRAGMENT: the far-look
+                    // fade and fog windows (task 2.9).
                     binding: 1,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -1008,6 +1092,17 @@ impl TerrainPass {
                     binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    // Per-layer average colors (task 2.9's flat far look).
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
                     count: None,
                 },
             ],
@@ -1050,12 +1145,25 @@ impl TerrainPass {
                     binding: 3,
                     resource: wgpu::BindingResource::Sampler(textures.sampler()),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: textures.averages_buffer().as_entire_binding(),
+                },
             ],
         });
 
+        // The sky gradient snippet is concatenated ahead of the terrain
+        // text so the fog evaluates the identical function the sky pass
+        // shows (WGSL has no includes; task 2.9). It has no dependencies,
+        // so leading with it is valid.
+        let terrain_source = format!(
+            "{}{}",
+            include_str!("shaders/sky_gradient.wgsl"),
+            include_str!("shaders/terrain.wgsl")
+        );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("jbm terrain"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/terrain.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(terrain_source.into()),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("jbm terrain layout"),
@@ -1305,6 +1413,10 @@ impl TerrainPass {
             shared_bind_group,
             texture_view,
             sampler,
+            averages_buffer: textures.averages_buffer().clone(),
+            far_radii: [DEFAULT_LOD0_RING_RADIUS, DEFAULT_FURTHEST_RING_RADIUS],
+            fog: true,
+            lod_tint: false,
             pages: Vec::new(),
             page_faces,
             book: MeshBookkeeping::default(),
@@ -1506,7 +1618,11 @@ impl TerrainPass {
                 self.zero_meta_slot(gpu, slot);
                 self.book.free_meta_slot(slot);
             }
-            self.book.commit_empty(key);
+            self.book.commit_empty(
+                key,
+                released.drawn.unwrap_or(true),
+                released.mask.unwrap_or(0),
+            );
             return;
         }
         let len = output.faces.len() as u32;
@@ -1678,8 +1794,61 @@ impl TerrainPass {
                     binding: 3,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.averages_buffer.as_entire_binding(),
+                },
             ],
         });
+    }
+
+    /// Sets the far-look view distances (task 2.9): the LOD0 ring radius
+    /// and the furthest ring radius, both in blocks. The LOD0 radius sets
+    /// where LOD0's textures fade into the flat average colors
+    /// ([`FADE_START_FRACTION`]..[`FADE_END_FRACTION`] of it, so both
+    /// sides of the LOD0/LOD1 border are flat); the furthest radius sets
+    /// the distance-fog window ([`FOG_START_FRACTION`]..[`FOG_END_FRACTION`]
+    /// of it, so the outermost ring's edge is never visible). Defaults
+    /// match the `ServerConfig` defaults; the game passes its own values.
+    pub fn set_view_distance(&mut self, lod0_ring_radius: f32, furthest_ring_radius: f32) {
+        self.far_radii = [lod0_ring_radius, furthest_ring_radius];
+    }
+
+    /// Enables or disables distance fog (task 2.9). The
+    /// `Renderer::set_fog` / `JBM_NO_FOG=1` hook propagates here every
+    /// frame; the fade from textures to flat average colors always stays.
+    pub fn set_fog(&mut self, enabled: bool) {
+        self.fog = enabled;
+    }
+
+    /// Enables or disables the level tint (task 2.10). The F4 /
+    /// `JBM_LOD_TINT=1` hook propagates here every frame through the
+    /// renderer; every draw path shares the one fragment shader, so the
+    /// tint is identical on all three.
+    pub fn set_lod_tint(&mut self, enabled: bool) {
+        self.lod_tint = enabled;
+    }
+
+    /// Whether the level tint is on (task 2.10).
+    pub fn lod_tint(&self) -> bool {
+        self.lod_tint
+    }
+
+    /// The per-frame terrain uniform for `camera` (the one object both
+    /// draw paths write; task 2.10 gathered it into one place).
+    fn terrain_uniforms_for(&self, camera: &Camera) -> TerrainUniforms {
+        let (camera_cube, camera_frac) = camera_split(camera.position);
+        TerrainUniforms {
+            camera_cube: [camera_cube.x, camera_cube.y, camera_cube.z, 0],
+            camera_frac: [
+                camera_frac.x,
+                camera_frac.y,
+                camera_frac.z,
+                CUBE_SIZE as f32,
+            ],
+            far: far_uniform_words(self.far_radii, self.fog),
+            tint: tint_uniform_words(self.lod_tint),
+        }
     }
 
     pub fn stats(&self) -> TerrainStats {
@@ -1894,15 +2063,7 @@ impl TerrainPass {
 
         // The shared origin uniform (also read by the vertex shader).
         let (camera_cube, camera_frac) = camera_split(camera.position);
-        let terrain_uniforms = TerrainUniforms {
-            camera_cube: [camera_cube.x, camera_cube.y, camera_cube.z, 0],
-            camera_frac: [
-                camera_frac.x,
-                camera_frac.y,
-                camera_frac.z,
-                CUBE_SIZE as f32,
-            ],
-        };
+        let terrain_uniforms = self.terrain_uniforms_for(camera);
         gpu.queue.write_buffer(
             &self.terrain_uniforms,
             0,
@@ -2136,18 +2297,11 @@ impl TerrainPass {
         uniforms: &wgpu::BindGroup,
     ) {
         let (camera_cube, camera_frac) = camera_split(camera.position);
+        let terrain_uniforms = self.terrain_uniforms_for(camera);
         gpu.queue.write_buffer(
             &self.terrain_uniforms,
             0,
-            bytemuck::bytes_of(&TerrainUniforms {
-                camera_cube: [camera_cube.x, camera_cube.y, camera_cube.z, 0],
-                camera_frac: [
-                    camera_frac.x,
-                    camera_frac.y,
-                    camera_frac.z,
-                    CUBE_SIZE as f32,
-                ],
-            }),
+            bytemuck::bytes_of(&terrain_uniforms),
         );
 
         let frustum = Frustum::from_view_proj(&camera.view_proj());
@@ -2534,9 +2688,81 @@ mod tests {
 
     #[test]
     fn terrain_uniforms_layout_matches_wgsl() {
-        assert_eq!(std::mem::size_of::<TerrainUniforms>(), 32);
+        // The WGSL mirror (terrain.wgsl) is vec4i + vec4f + vec4f + vec4f =
+        // 64 bytes, every field 16-byte aligned (task 2.9 added `far`,
+        // task 2.10 added `tint`).
+        assert_eq!(std::mem::size_of::<TerrainUniforms>(), 64);
         assert_eq!(std::mem::offset_of!(TerrainUniforms, camera_cube), 0);
         assert_eq!(std::mem::offset_of!(TerrainUniforms, camera_frac), 16);
+        assert_eq!(std::mem::offset_of!(TerrainUniforms, far), 32);
+        assert_eq!(std::mem::offset_of!(TerrainUniforms, tint), 48);
+        assert!(
+            std::mem::size_of::<TerrainUniforms>().is_multiple_of(16),
+            "no tail padding"
+        );
+    }
+
+    /// The level tint colors (task 2.10): LOD0 white, every level's
+    /// zero-channel pattern unique (so a pixel identifies its level),
+    /// no two adjacent levels sharing a channel that stays, and never
+    /// pure magenta (the hole sentinel) anywhere.
+    #[test]
+    fn lod_tint_colors_identify_levels_and_avoid_magenta() {
+        assert_eq!(lod_tint_color(0), [1.0, 1.0, 1.0], "LOD0 untinted");
+        for level in 1..=6u8 {
+            let color = lod_tint_color(level);
+            assert!(
+                color != [1.0, 0.0, 1.0],
+                "level {level} must never tint pure magenta (the hole sentinel)"
+            );
+        }
+        // The zero-channel signature of each color is unique: red
+        // (r only), yellow (r,g), green (g only), cyan (g,b), blue (b
+        // only), purple (r reduced, b full).
+        let signatures: Vec<[bool; 3]> = (1..=6u8)
+            .map(|level| lod_tint_color(level).map(|c| c > 0.25))
+            .collect();
+        for i in 0..signatures.len() {
+            for j in i + 1..signatures.len() {
+                assert_ne!(
+                    signatures[i],
+                    signatures[j],
+                    "levels {} and {} are indistinguishable",
+                    i + 1,
+                    j + 1
+                );
+            }
+        }
+        // Above the table clamps to purple, still magenta-free.
+        assert_eq!(lod_tint_color(7), lod_tint_color(6));
+        assert_eq!(tint_uniform_words(true), [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(tint_uniform_words(false), [0.0; 4]);
+    }
+
+    /// The far-look uniform words follow the radii and fog flag exactly
+    /// (task 2.9).
+    #[test]
+    fn far_uniform_words_follow_the_fog_flag() {
+        assert_eq!(
+            far_uniform_words([256.0, 4096.0], true),
+            [256.0, 4096.0, 1.0, 0.0]
+        );
+        assert_eq!(
+            far_uniform_words([256.0, 4096.0], false),
+            [256.0, 4096.0, 0.0, 0.0]
+        );
+        assert_eq!(
+            far_uniform_words([64.0, 1280.0], false),
+            [64.0, 1280.0, 0.0, 0.0]
+        );
+        // The defaults follow the ServerConfig defaults' shape at any cube
+        // size: 8 cubes for the LOD0 ring, and the level-6 disk (64x
+        // coarser, task 2.10) for the furthest.
+        assert_eq!(DEFAULT_LOD0_RING_RADIUS, 8.0 * CUBE_SIZE as f32);
+        assert_eq!(
+            DEFAULT_FURTHEST_RING_RADIUS,
+            DEFAULT_LOD0_RING_RADIUS * 64.0
+        );
     }
 
     #[test]
@@ -2685,7 +2911,7 @@ mod tests {
                     book.free_meta_slot(slot);
                 }
                 if rng.next().is_multiple_of(8) {
-                    book.commit_empty(pos);
+                    book.commit_empty(pos, true, 0);
                     live.swap_remove(i);
                 } else {
                     let ranges = random_ranges(&mut rng);

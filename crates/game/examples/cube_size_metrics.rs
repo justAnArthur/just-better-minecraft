@@ -336,10 +336,14 @@ fn main() {
 
     // Task 2.6: the LOD rings scene at game scale, per path and per
     // level.
-    println!("\nrings scene (task 2.6, default lod_view_radius, 4 levels)");
+    println!("\nrings scene (task 2.6, default lod_view_radius, 6 levels since task 2.10)");
     let mut registry = jbm_core::block::BlockRegistry::new();
     let blocks = jbm_core::block::builtin::Blocks::register(&mut registry);
-    let generator = jbm_server::terrain::Generator::new(DEFAULT_SEED, blocks);
+    let generator = jbm_server::terrain::Generator::with_preset(
+        DEFAULT_SEED,
+        blocks,
+        jbm_server::worldgen::Preset::Classic,
+    );
     let rings = common::rings::RingsScene::new(&generator, &blocks, &region.appearance);
     let mut coverage = jbm_client::lod::Coverage::default();
     let upload_rings =

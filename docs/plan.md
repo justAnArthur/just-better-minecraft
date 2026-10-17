@@ -98,8 +98,13 @@ Blocks are hardcoded in Rust for now.
 | B | [x] 2.5 GPU frustum and Hi-Z occlusion culling in compute | `client` | Golden images match; bench shows culled counts in caves |
 | C | [x] 2.6 Clipmap streaming of LOD rings, skirts at seams | `client`, `server` | Fly test: no holes at ring borders (screenshots) |
 | C | [x] 2.7 LOD sampled straight from worldgen for unvisited terrain; stored LOD in redb | `server` | Far terrain appears without generating full detail; reload shows it instantly |
-| D | [ ] 2.8 Dramatic worldgen: continents, ridged mountain ranges a few hundred blocks tall, valleys and plateaus, domain warp — authored as a new density graph | `server` | Screenshots from altitude show mountain ranges and valleys; heights bounded by the graph's own interval bounds; gen bench within budget |
-| D | [ ] 2.9 Distant-Horizons-style far look: flat per-material colors on LOD ≥ 1, LOD0 textures fading to those colors with distance, sky-colored distance fog | `client` | Ring borders invisible in close-up screenshots; far view reads as smooth landscape (you approve) |
+| D | [x] 2.8 Dramatic worldgen: continents, ridged mountain ranges a few hundred blocks tall, valleys and plateaus, domain warp — authored as a new density graph | `server` | Screenshots from altitude show mountain ranges and valleys; heights bounded by the graph's own interval bounds; gen bench within budget |
+| D | [x] 2.9 Distant-Horizons-style far look: flat per-material colors on LOD ≥ 1, LOD0 textures fading to those colors with distance, sky-colored distance fog | `client` | Ring borders invisible in close-up screenshots; far view reads as smooth landscape (you approve) |
+| D | [x] 2.10 LOD on tall terrain: surface-following vertical windows, level tint debug view (F4), six rings (~16 km), narrow beaches | `server`, `client` | Near terrain is LOD0 in valleys and from altitude (tinted test); fly test 0 holes |
+| E | [ ] 2.11 Code review and restructuring: module boundaries, file sizes, duplicated logic, dead code, naming, docs | all | Review findings triaged; agreed refactors land with no behavior change (goldens, benches unchanged) |
+| E | [ ] 2.12 Playground: a debug world and an egui panel (faces/triangles/draws, wireframe, chunk borders, exploded cubes, per-level toggles, view radius, freeze culling) | `client`, `game`, `server` | You can switch every view on and off live and read the stats |
+| E | [ ] 2.13 Meshing optimization and a larger full-detail radius (LOD only far away) | `client`, `server` | Full detail to ~512 blocks at frame budget; triangle count measured before/after |
+| E | [ ] 2.14 Height-exact Distant-Horizons-style LOD (per-column exact top and material) | `core`, `server`, `client` | Coarse surface within a block of the true one; you approve the look |
 
 **Gate:** fly across kilometres without frame hitches; bench records frame times. Then `/clear`.
 

@@ -1,7 +1,14 @@
-//! The real-server LOD fly test (task 2.6). Spawn, fly 1.5 km straight
-//! and then 90 degrees for 300 m more, 40 blocks above the terrain at
-//! pitch -15 degrees, through the real client world, mesh pool and
-//! renderer against a threaded real server. Every 100 blocks it waits
+//! The real-server LOD fly test (task 2.6; task 2.10 added the low
+//! valley leg and the lookdown stop). Spawn, fly 1.5 km straight and
+//! then 90 degrees for 300 m more, 40 blocks above the terrain at
+//! pitch -15 degrees, then 600 m low along a valley (20 over the
+//! terrain, the cliffs towering over the camera), and finally stop
+//! looking straight down from 400 blocks — through the real client
+//! world, mesh pool and renderer against a threaded real server. On the 2.8 overworld the
+//! altitude follows the terrain: the target is the highest surface in a
+//! 512-block look-ahead plus 40, so the flight rides over the ridges
+//! (a fixed spawn-relative altitude would wedge into the first range).
+//! Every 100 blocks it waits
 //! (bounded) for the client mesh queue — no dirty cubes, no in-flight
 //! mesh jobs — to be clear, polled about once per 50 ms server tick;
 //! server ring readiness is never checked (whatever arrived and meshed
@@ -41,10 +48,15 @@ use jbm_client::render::renderer::{
 use jbm_client::render::texture_array::BlockTextures;
 use jbm_client::testing::holes::{assert_only_pinholes, describe_holes, sentinel_components};
 use jbm_client::world::ClientWorld;
+use jbm_core::block::BlockRegistry;
+use jbm_core::block::builtin::Blocks;
 use jbm_core::link::ClientLink;
 use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION, ServerMsg};
+use jbm_server::DEFAULT_SEED;
 use jbm_server::run::{self, ServerHandle};
 use jbm_server::server::{Server, ServerConfig};
+use jbm_server::terrain::Generator;
+use jbm_server::worldgen::Preset;
 
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 360;
@@ -55,9 +67,70 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(600);
 /// Per-stop wait for the client mesh queue to clear.
 const STOP_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// One leg of the fly course: yaw, distance, and whether it flies high
+/// (ridge-riding, 40 over the tallest surface ahead) or low (task 2.10:
+/// 20 over the terrain with a short look-ahead, so the camera threads
+/// valleys with cliff walls around it — the surface-following-window
+/// view).
+#[derive(Clone, Copy)]
+struct Leg {
+    yaw: f64,
+    distance: f64,
+    low: bool,
+}
+
 /// The fly course: 1500 blocks at yaw 0 (toward -Z), then 300 at yaw
-/// +90 degrees (toward +X), 40 above the surface, pitch -15 degrees.
-const COURSE: [(f32, f64); 2] = [(0.0, 1500.0), (std::f32::consts::FRAC_PI_2, 300.0)];
+/// +90 degrees (toward +X), then 600 more low along whatever valley the
+/// turn lands in — pitch -15 degrees throughout.
+const COURSE: [Leg; 3] = [
+    Leg {
+        yaw: 0.0,
+        distance: 1500.0,
+        low: false,
+    },
+    Leg {
+        yaw: std::f64::consts::FRAC_PI_2,
+        distance: 300.0,
+        low: false,
+    },
+    Leg {
+        yaw: std::f64::consts::FRAC_PI_2,
+        distance: 600.0,
+        low: true,
+    },
+];
+
+/// How far ahead (blocks) the terrain-following altitude target looks:
+/// the flyer climbs at half its cruise speed, so a window of 512 blocks
+/// buys ~250 blocks of climb before a ridge arrives — the overworld's
+/// whole relief. Terrain is a heightmap (no overhangs, task 2.8), so a
+/// full-`up` climb always escapes a wall even if it starts late.
+const LOOKAHEAD: i64 = 512;
+
+/// The low leg's shorter window: threading a valley needs the floor's
+/// height, not the ridges' — the shorter target keeps the camera down
+/// where the cliffs tower over it.
+const LOW_LOOKAHEAD: i64 = 256;
+
+/// The cruise altitude target under `(x, z)` looking along `yaw`: the
+/// highest surface ahead (task 2.10: the highest within the low leg's
+/// shorter window) plus the leg's clearance. The flight rides over the
+/// ridges instead of wedging into them the way a fixed spawn-relative
+/// altitude would on the 2.8 terrain.
+fn cruise_target(generator: &Generator, x: f64, z: f64, leg: Leg) -> f64 {
+    let (fx, fz) = (leg.yaw.sin(), -leg.yaw.cos());
+    let (lookahead, clearance) = if leg.low {
+        (LOW_LOOKAHEAD, 20.0)
+    } else {
+        (LOOKAHEAD, 40.0)
+    };
+    let mut highest = i64::MIN;
+    for d in (0..=lookahead).step_by(32) {
+        let (sx, sz) = (x + fx * d as f64, z + fz * d as f64);
+        highest = highest.max(generator.surface_height(sx.round() as i64, sz.round() as i64));
+    }
+    (highest as f64) + clearance
+}
 
 /// The client half: world, mesh pool, coverage, renderer.
 struct FlyClient {
@@ -218,18 +291,25 @@ impl FlyClient {
 
 /// The row margin per camera: the sky's ~15 degree below-horizon fade
 /// (pure ground color only below `asin(0.25)`) plus the rings' far-edge
-/// drop angle, plus slack for the outer cubes' missing far walls.
+/// drop angle, plus slack for the outer cubes' missing far walls. Rows
+/// clamp into the frame first, so a steep-down camera (task 2.10's
+/// lookdown stop, where every row is below the horizon) checks the whole
+/// frame instead of underflowing its region.
 fn margin_rows(camera: &Camera) -> u32 {
     let row_of = |angle: f64| -> f64 {
         let below_axis = angle + f64::from(camera.pitch);
         let ndc_y = -below_axis.tan() / (f64::from(camera.fov_y) / 2.0).tan();
         (0.5 - ndc_y * 0.5) * f64::from(HEIGHT)
     };
-    let horizon = row_of(0.0);
-    let fade = row_of((0.25f64).asin());
-    let ring_extent = 8.0 * 256.0 + 512.0;
-    let edge = row_of(((camera.position.y - 76.0) / ring_extent).atan());
-    ((fade - horizon).max(edge - horizon) + 8.0).ceil().max(0.0) as u32
+    let clamp_row = |row: f64| row.clamp(0.0, f64::from(HEIGHT));
+    let horizon = clamp_row(row_of(0.0));
+    let fade = clamp_row(row_of((0.25f64).asin()));
+    // Task 2.10: lod_levels 6 puts the outermost ring ~16 km out.
+    let ring_extent = 8.0 * 256.0 * 8.0 + 512.0;
+    let edge = clamp_row(row_of(((camera.position.y - 76.0) / ring_extent).atan()));
+    ((fade - horizon).max(edge - horizon) + 8.0)
+        .ceil()
+        .clamp(0.0, f64::from(HEIGHT)) as u32
 }
 
 /// The checked region below the horizon margin: all columns from
@@ -322,10 +402,19 @@ fn fly_1p5km_over_real_rings_shows_no_holes() {
     );
     camera.set_pitch(-15.0_f32.to_radians());
 
-    // Climb to cruise altitude, 40 blocks over spawn. The toggle keeps
-    // being re-sent (one unacked in flight) until the server confirms
-    // flying, for the same lost-step race as above.
-    while fly.server_pos.is_none_or(|p| p.y < spawn_at.y + 40.0) {
+    // Climb to cruise altitude: 40 blocks over the highest ridge the
+    // first leg will meet (task 2.8's terrain-following target; the
+    // classic terrain needed only spawn + 40). The toggle keeps being
+    // re-sent (one unacked in flight) until the server confirms flying,
+    // for the same lost-step race as above.
+    let mut registry = BlockRegistry::new();
+    let blocks = Blocks::register(&mut registry);
+    let nav = Generator::with_preset(DEFAULT_SEED, blocks, Preset::Overworld);
+    let cruise = |x: f64, z: f64, leg: Leg| cruise_target(&nav, x, z, leg);
+    while fly
+        .server_pos
+        .is_none_or(|p| p.y < cruise(p.x, p.z, COURSE[0]))
+    {
         seq += 1;
         let fly_toggle = fly.needs_fly_toggle(toggle_seq);
         if fly_toggle {
@@ -383,14 +472,21 @@ fn fly_1p5km_over_real_rings_shows_no_holes() {
         describe_holes(&sentinel_components(&image, below_margin_region(&camera)))
     );
 
-    let mut course_flown = [0.0f64; 2];
-    for (leg_index, &(yaw, leg)) in COURSE.iter().enumerate() {
+    let mut course_flown = [0.0f64; 3];
+    for (leg_index, &leg) in COURSE.iter().enumerate() {
+        let yaw = leg.yaw as f32;
         camera.set_yaw(yaw);
-        while course_flown[leg_index] < leg {
+        while course_flown[leg_index] < leg.distance {
             // 100 blocks at sprint-fly speed (22 blocks/s): about 5
-            // seconds of 20 Hz ticks.
+            // seconds of 20 Hz ticks. `up` holds the terrain-following
+            // target: full climb while below it, level above. The target
+            // only rises (a look-ahead max), so the flight never descends
+            // back into a ridge it just cleared.
             for _ in 0..100 {
                 seq += 1;
+                let up = fly
+                    .server_pos
+                    .map_or(0, |p| i8::from(p.y < cruise(p.x, p.z, leg)));
                 client
                     .send(ClientMsg::PlayerInput {
                         seq,
@@ -398,6 +494,7 @@ fn fly_1p5km_over_real_rings_shows_no_holes() {
                             forward: 1,
                             sprint: true,
                             yaw,
+                            up,
                             ..jbm_core::physics::MoveInput::IDLE
                         },
                         pitch: -15.0_f32.to_radians(),
@@ -477,6 +574,67 @@ fn fly_1p5km_over_real_rings_shows_no_holes() {
             assert!(start.elapsed() < TEST_TIMEOUT, "timeout at a stop");
         }
     }
+
+    // Task 2.10: one stop looking straight down from 400 blocks above
+    // the ground — the play-test's "coarse blocks in the valley under a
+    // flying player" view. The surface-following windows must have LOD0
+    // (or its own level's finest) under the camera; the pinhole rule
+    // covers the whole frame (at pitch -89° the horizon margin row
+    // clamps to the top).
+    let ground = fly.server_pos.map_or(0.0, |p| {
+        nav.surface_height(p.x.floor() as i64, p.z.floor() as i64) as f64
+    });
+    while fly.server_pos.is_none_or(|p| p.y < ground + 400.0) {
+        seq += 1;
+        client
+            .send(ClientMsg::PlayerInput {
+                seq,
+                input: jbm_core::physics::MoveInput {
+                    up: 1,
+                    ..jbm_core::physics::MoveInput::IDLE
+                },
+                pitch: -89.0_f32.to_radians(),
+            })
+            .unwrap();
+        fly.frames_for_one_tick(&gpu, &camera);
+        if let Some(reason) = fly.pump_link(&gpu, &mut client, &mut spawn) {
+            panic!("link died while climbing to the lookdown: {reason}");
+        }
+        if let Some(p) = fly.server_pos {
+            camera.position = p + DVec3::new(0.0, EYE, 0.0);
+        }
+        assert!(
+            start.elapsed() < TEST_TIMEOUT,
+            "never reached lookdown altitude"
+        );
+    }
+    camera.set_pitch(-89.0_f32.to_radians());
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    loop {
+        fly.frames_for_one_tick(&gpu, &camera);
+        if let Some(reason) = fly.pump_link(&gpu, &mut client, &mut spawn) {
+            panic!("link died at the lookdown: {reason}");
+        }
+        if fly.queue_clear() || Instant::now() > deadline {
+            break;
+        }
+    }
+    for _ in 0..200 {
+        fly.pump_meshing(&gpu, &camera);
+        if fly.queue_clear() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let image = fly.render(&gpu, &camera);
+    let path = std::path::Path::new("target/fly/lookdown_400.png");
+    image.save(path).ok();
+    assert_only_pinholes(
+        &image,
+        below_margin_region(&camera),
+        "fly lookdown from 400 blocks",
+        path,
+    );
 
     handle.stop();
 }

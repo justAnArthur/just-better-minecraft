@@ -55,10 +55,42 @@ const UPLOAD_BUDGET: usize = 32;
 
 /// Spawns the game window and runs the frame loop until the user quits
 /// (or the server link dies). `link` is the client's end of a connection;
-/// `main` wires it to an in-process server.
+/// `main` wires it to an in-process server. Uses the default view
+/// distances; [`run_with_view`] takes explicit ones.
 pub fn run(link: ClientLink) -> Result<(), Box<dyn Error>> {
+    run_with_view(link, ViewSetup::default())
+}
+
+/// The view distances the far look (task 2.9) keys on: ServerConfig-like
+/// values the client cannot learn from the link itself. The LOD0 ring
+/// radius sets where LOD0's textures fade into the flat average colors;
+/// the furthest ring radius sets the distance-fog window (see
+/// `TerrainPass::set_view_distance`).
+#[derive(Debug, Clone, Copy)]
+pub struct ViewSetup {
+    /// The LOD0 streaming disk radius, in blocks (`view_radius ·
+    /// CUBE_SIZE`).
+    pub lod0_ring_radius: f32,
+    /// The furthest (outermost LOD level's) ring radius, in blocks
+    /// (`lod_view_radius · CUBE_SIZE · 2^lod_levels`).
+    pub furthest_ring_radius: f32,
+}
+
+impl Default for ViewSetup {
+    fn default() -> ViewSetup {
+        ViewSetup {
+            lod0_ring_radius: crate::render::chunks::DEFAULT_LOD0_RING_RADIUS,
+            furthest_ring_radius: crate::render::chunks::DEFAULT_FURTHEST_RING_RADIUS,
+        }
+    }
+}
+
+/// [`run`] with explicit view distances (task 2.9): the game knows its
+/// `ServerConfig` and passes the ring radii the fog and fade scale on.
+pub fn run_with_view(link: ClientLink, view: ViewSetup) -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::new()?;
     let mut app = App::new(link);
+    app.view = view;
     event_loop.run_app(&mut app)?;
     Ok(())
 }
@@ -115,6 +147,9 @@ struct App {
     /// `JBM_AUTOFLY=<blocks>` autopilot (task 2.6 gate): fly straight for
     /// that many blocks after spawn, then exit with a frame-time summary.
     autofly: Option<Autofly>,
+    /// View distances for the far look (task 2.9), applied to the terrain
+    /// pass at window init.
+    view: ViewSetup,
     /// Every frame's duration (seconds), for the autopilot summary.
     frame_times: Vec<f64>,
     /// When the last presented frame rendered; spans skipped loops.
@@ -205,6 +240,7 @@ impl App {
             registry: Arc::new(registry),
             coverage: Coverage::default(),
             autofly: Autofly::from_env(),
+            view: ViewSetup::default(),
             frame_times: Vec::new(),
             last_present: None,
         }
@@ -251,13 +287,21 @@ impl App {
         surface.configure(&gpu.device, &config);
 
         let mut renderer = Renderer::new(&gpu, format);
+        // The level tint debug view (task 2.10) can start on from the
+        // environment; F4 toggles it afterwards.
+        if std::env::var_os("JBM_LOD_TINT").is_some_and(|v| v == "1") {
+            renderer.set_lod_tint(true);
+        }
         let depth = DepthTarget::new(&gpu.device, config.width, config.height);
         renderer.set_viewport(config.width, config.height);
         self.camera.aspect = config.width as f32 / config.height as f32;
 
         let (layers, _) = crate::mesh::appearance::builtin_textures();
         let textures = BlockTextures::new(&gpu, &layers)?;
-        let terrain = TerrainPass::new(&gpu, format, renderer.uniform_layout(), &textures);
+        let mut terrain = TerrainPass::new(&gpu, format, renderer.uniform_layout(), &textures);
+        // The far look's fade and fog windows scale on the ring radii the
+        // caller knows (task 2.9).
+        terrain.set_view_distance(self.view.lod0_ring_radius, self.view.furthest_ring_radius);
 
         window.request_redraw();
         self.windowed = Some(Windowed {
@@ -638,8 +682,15 @@ impl App {
             cull.occluded
         ));
         // Per LOD level: resident cubes, drawn cubes, masked octants —
-        // plus the LOD mesh queue length.
+        // plus the LOD mesh queue length. While the level tint is on
+        // (task 2.10), the legend names each level's color.
         overlay.push(self.lod_overlay_line(w));
+        if w.renderer.lod_tint() {
+            overlay.push(concat!(
+                "LOD TINT L1 2x2 red L2 4x4 yellow L3 8x8 green ",
+                "L4 16x16 cyan L5 32x32 blue L6 64x64 purple",
+            ));
+        }
 
         // The autopilot finishes once its distance is flown: print the
         // frame-time summary and end the loop after this frame.
@@ -837,6 +888,12 @@ impl ApplicationHandler for App {
                         // the next sim tick.
                         if pressed && matches!(key, Key::Character(c) if c.to_lowercase() == "f") {
                             self.input.press_fly_toggle();
+                        }
+                        // F4 toggles the level tint debug view (task 2.10):
+                        // every fragment multiplied by a fixed color per LOD
+                        // level, on every draw path.
+                        if pressed && matches!(key, Key::Named(NamedKey::F4)) {
+                            w.renderer.set_lod_tint(!w.renderer.lod_tint());
                         }
                         // Keys 1-9 select a hotbar slot (task 1.7).
                         if pressed

@@ -19,9 +19,11 @@ use jbm_core::raycast::REACH;
 
 use crate::gen_pool::GenPool;
 use crate::lod::LodPyramid;
+use crate::spans::SurfaceSpans;
 use crate::storage::{PlayerRecord, Storage, StorageError};
 use crate::streaming::{
-    LodWalkEntry, Offset, desired_offsets, in_keep, level_center, lod_walk, offset_pos,
+    LodWalkEntry, Offset, desired_offsets_surface, extra_dy_keeps, in_keep, level_center,
+    lod_walk_surface, offset_pos,
 };
 use crate::terrain::Generator;
 use crate::tick::{TICK_PERIOD, TICKS_PER_SECOND, TickClock};
@@ -106,6 +108,11 @@ struct EditVersions {
 pub struct ServerConfig {
     /// World seed fed to the terrain generator.
     pub seed: u64,
+    /// Which shipped worldgen graph generates the world (task 2.8).
+    /// `Overworld` (the default) is the dramatic terrain with a sea;
+    /// `Classic` is the pre-2.8 terrain, pinned by tests, benches and
+    /// goldens that depend on it.
+    pub worldgen: crate::worldgen::Preset,
     /// Whether cubes are streamed to players at all.
     pub streaming: bool,
     /// Horizontal streaming radius, in cubes (`dx² + dz² ≤ r²`).
@@ -128,8 +135,10 @@ pub struct ServerConfig {
     pub world_dir: Option<PathBuf>,
     /// How often dirty cubes are snapshotted to the save thread.
     pub save_interval: Duration,
-    /// Top LOD level the server keeps (4 keeps LOD1–LOD4). `0` disables
-    /// the pyramid entirely: no allocation, no work per cube or edit.
+    /// Top LOD level the server keeps (6 keeps LOD1–LOD6; task 2.10
+    /// raised it from 4 — L5 cells are 32 blocks, L6 64, and the outer
+    /// ring reaches ~16 km). `0` disables the pyramid entirely: no
+    /// allocation, no work per cube or edit.
     pub lod_levels: u8,
     /// Horizontal radius of every LOD ring, in cubes of that ring's level
     /// (task 2.6). Each level streams a full disk; the client draws the
@@ -143,6 +152,12 @@ pub struct ServerConfig {
     /// Cap on LOD cubes requested from the pyramid but not yet ready
     /// ([`LodPyramid::in_flight`]).
     pub lod_max_in_flight: usize,
+    /// Task 2.10's surface-following windows: the most cubes desired per
+    /// column per level **beyond the camera's vertical window**, nearest
+    /// to the camera first. 16 cubes of cliff face over a valley camera;
+    /// flat terrain around the camera is never affected (its span sits
+    /// inside the window).
+    pub max_column_cubes: usize,
 }
 
 impl Default for ServerConfig {
@@ -150,6 +165,7 @@ impl Default for ServerConfig {
         let parallelism = std::thread::available_parallelism().map_or(1, |n| n.get());
         Self {
             seed: DEFAULT_SEED,
+            worldgen: crate::worldgen::Preset::Overworld,
             streaming: true,
             view_radius: 8,
             vertical_radius: 4,
@@ -159,11 +175,12 @@ impl Default for ServerConfig {
             max_in_flight: 512,
             world_dir: None,
             save_interval: Duration::from_secs(5),
-            lod_levels: 4,
+            lod_levels: 6,
             lod_view_radius: 8,
             lod_vertical_radius: 3,
             lod_send_budget_per_tick: 32,
             lod_max_in_flight: 256,
+            max_column_cubes: 16,
         }
     }
 }
@@ -247,9 +264,15 @@ struct Player {
     /// Cubes this player has been sent and not yet had unloaded. A cube is
     /// never sent twice while it stays in this set.
     sent: HashSet<CubePos>,
-    /// Index into the precomputed nearest-first desired offsets: the next
-    /// cube that may still need sending. Reset whenever the center moves,
-    /// so an idle player costs O(1) per tick.
+    /// The desired offsets (task 2.10: the camera window plus the
+    /// surface-following span extras), sorted nearest-first. Rebuilt when
+    /// the center moves or a span lands; empty until the first tick.
+    desired: Vec<Offset>,
+    /// The span version `desired` was built at.
+    desired_version: u64,
+    /// Index into the nearest-first desired offsets: the next cube that
+    /// may still need sending. Reset whenever the center moves or the
+    /// desired list is rebuilt, so an idle player costs O(1) per tick.
     cursor: usize,
     /// Look direction from the newest accepted input (radians); persisted
     /// with the player and handed back in the next `Welcome`.
@@ -258,9 +281,16 @@ struct Player {
     /// LOD ring state per level (`lod[l - 1]` is level `l`); empty when
     /// the pyramid is off (`lod_levels == 0`).
     lod: Vec<PlayerLodLevel>,
+    /// This player's merged LOD walk (task 2.10: level 1's window plus
+    /// its surface spans), sorted like the window-only walk. Rebuilt when
+    /// any level's center moves or a span lands; empty until the first
+    /// streaming tick.
+    lod_walk: Vec<LodWalkEntry>,
+    /// The span version `lod_walk` was built at.
+    lod_walk_version: u64,
     /// Cursor into the merged LOD walk: every entry before it is sent.
-    /// Reset whenever any level's center moves; while cubes are missing
-    /// it sits at the first unsent entry.
+    /// Reset whenever any level's center moves or the walk is rebuilt;
+    /// while cubes are missing it sits at the first unsent entry.
     lod_cursor: usize,
     /// Queued re-sends: cubes the pyramid changed that this player
     /// already has. Drained ahead of the walk within the LOD budget, and
@@ -369,9 +399,10 @@ pub struct Server {
     /// Block edits handled in phase 1, flushed early in phase 5 before the
     /// streaming pass and the `Tick` message.
     pending_changes: Vec<QueuedChange>,
-    /// Desired-set offsets for the configured radii, sorted nearest-first.
-    /// Computed once per config.
-    desired: Vec<Offset>,
+    /// The surface span store (task 2.10): per-column surface height
+    /// bounds, filled incrementally, feeding the surface-following
+    /// vertical windows of LOD0 and the level-1 ring.
+    spans: SurfaceSpans,
     /// The spawn position handed out in every `Welcome`.
     spawn: [f64; 3],
     /// Whether world eviction should run this tick: set when anything might
@@ -385,8 +416,6 @@ pub struct Server {
     /// never touches it: LOD cubes outlive their LOD0 children, so builds
     /// stay visible from far away.
     lod: LodPyramid,
-    /// The merged LOD ring walk (task 2.6), precomputed from the config.
-    lod_walk: Vec<LodWalkEntry>,
 }
 
 impl Server {
@@ -415,9 +444,8 @@ impl Server {
             None => None,
         };
         let seed = storage.as_ref().map_or(config.seed, |s| s.seed());
-        let generator = Arc::new(Generator::new(seed, blocks));
+        let generator = Arc::new(Generator::with_preset(seed, blocks, config.worldgen));
         let pool = GenPool::new(config.gen_threads, Arc::clone(&generator), storage.clone());
-        let desired = desired_offsets(config.view_radius, config.vertical_radius);
         let spawn = generator.spawn();
         let solid = SolidTable::new(&registry);
         let state_count = registry.state_count();
@@ -427,7 +455,7 @@ impl Server {
         if let Some(storage) = &storage
             && config.lod_levels > 0
             && let Err(error) =
-                storage.set_worldgen_fingerprint(crate::worldgen::overworld().fingerprint())
+                storage.set_worldgen_fingerprint(config.worldgen.compiled().fingerprint())
         {
             return Err(error);
         }
@@ -447,11 +475,6 @@ impl Server {
                 .spawn(move || save_loop(storage, save_rx, ack_tx))
                 .expect("spawning the jbm-save thread")
         });
-        let lod_walk = lod_walk(
-            config.lod_levels,
-            config.lod_view_radius,
-            config.lod_vertical_radius,
-        );
 
         Ok(Self {
             clock: TickClock::new(),
@@ -479,12 +502,11 @@ impl Server {
             failed_batches: 0,
             sent_batches: 0,
             pending_changes: Vec::new(),
-            desired,
+            spans: SurfaceSpans::new(),
             spawn,
             eviction_dirty: true,
             joined_count: 0,
             lod,
-            lod_walk,
         })
     }
 
@@ -633,10 +655,41 @@ impl Server {
         &self.lod
     }
 
+    /// Surface-span store counters (task 2.10): columns whose exact LOD0
+    /// bounds and sampled level-1 bounds have been computed, jobs still
+    /// queued, and the store's version (bumped per landed span).
+    pub fn span_stats(&self) -> (u64, u64, usize, u64) {
+        (
+            self.spans.computed_lod0,
+            self.spans.computed_l1,
+            self.spans.pending(),
+            self.spans.version(),
+        )
+    }
+
     /// Cubes queued for generation, generating, or generated but not yet
     /// collected.
     pub fn in_flight(&self) -> usize {
         self.pool.in_flight()
+    }
+
+    /// LOD0 streaming completeness (task 2.10's test hook): how many of
+    /// the player's desired LOD0 cubes are not yet sent. Zero once the
+    /// whole surface-following desired set has streamed.
+    pub fn lod0_pending(&self, id: PlayerId) -> usize {
+        let Some(player) = self
+            .connections
+            .iter()
+            .filter_map(Connection::joined_player)
+            .find(|player| player.id == id)
+        else {
+            return 0;
+        };
+        player
+            .desired
+            .iter()
+            .filter(|offset| !player.sent.contains(&offset_pos(player.center, **offset)))
+            .count()
     }
 
     /// LOD ring completeness for the fly test: how many of the player's
@@ -658,7 +711,8 @@ impl Server {
             .enumerate()
             .map(|(index, level_state)| {
                 let level = index as u8 + 1;
-                self.lod_walk
+                player
+                    .lod_walk
                     .iter()
                     .filter(|(l, _)| *l == level)
                     .filter(|&(_, offset)| {
@@ -678,6 +732,21 @@ impl Server {
             .filter_map(Connection::joined_player)
             .find(|player| player.id == id)
             .map_or(0, |player| player.sent.len())
+    }
+
+    /// Per-level LOD ring cubes sent to the player (index 0 = level 1),
+    /// plus the LOD0 sent count at the end — the task 2.10 measurement
+    /// hook (cubes desired per level).
+    pub fn sent_counts_per_level(&self, id: PlayerId) -> Vec<usize> {
+        self.connections
+            .iter()
+            .filter_map(Connection::joined_player)
+            .find(|player| player.id == id)
+            .map_or(Vec::new(), |player| {
+                let mut counts: Vec<usize> = player.lod.iter().map(|l| l.sent.len()).collect();
+                counts.push(player.sent.len());
+                counts
+            })
     }
 
     /// Cubes pinned by an accepted edit (never evicted). Without
@@ -879,6 +948,11 @@ impl Server {
                     pending_ack: false,
                     center: cube_containing(DVec3::from(spawn)),
                     sent: HashSet::new(),
+                    desired: Vec::new(),
+                    // u64::MAX forces the first streaming tick to build
+                    // the desired list (and feed the span store) even
+                    // though a stationary player never moves a center.
+                    desired_version: u64::MAX,
                     cursor: 0,
                     yaw: record.yaw,
                     pitch: record.pitch,
@@ -888,6 +962,8 @@ impl Server {
                             sent: HashSet::new(),
                         })
                         .collect(),
+                    lod_walk: Vec::new(),
+                    lod_walk_version: u64::MAX,
                     lod_cursor: 0,
                     lod_resend: VecDeque::new(),
                 }));
@@ -1455,6 +1531,11 @@ impl Server {
         //    world/pool/config) are disjoint fields of `self`.
         let mut dropped: Vec<usize> = Vec::new();
         let mut eviction_dirty = dirty;
+        // Task 2.10: drain the surface-span fill queue within its
+        // per-tick budgets before anyone streams from it. A settled view
+        // queues nothing and this computes nothing.
+        self.spans.poll(&self.generator);
+
         for idx in 0..self.connections.len() {
             let conn = &mut self.connections[idx];
             let ConnectionState::Joined(player) = &mut conn.state else {
@@ -1466,7 +1547,7 @@ impl Server {
                 &self.world,
                 &mut self.pool,
                 &self.config,
-                &self.desired,
+                &mut self.spans,
                 &mut eviction_dirty,
             ) {
                 dropped.push(idx);
@@ -1478,7 +1559,7 @@ impl Server {
                     player,
                     &mut self.lod,
                     &self.config,
-                    &self.lod_walk,
+                    &self.spans,
                 )
             {
                 dropped.push(idx);
@@ -1497,14 +1578,18 @@ impl Server {
         //    acknowledged yet — stay pinned forever. Without persistence
         //    (world_dir: None) every edited cube stays pinned, as before
         //    2.3. This replaces the 1.7 "pinned cubes grow without bound"
-        //    rule.
+        //    rule. The keep set is surface-following (task 2.10): a cube
+        //    of a column whose span reaches it stays even outside the
+        //    camera window.
         if eviction_dirty {
             let (r, v) = (self.config.view_radius, self.config.vertical_radius);
+            let cap = self.config.max_column_cubes;
             let centers: Vec<CubePos> = self
                 .connections
                 .iter()
                 .filter_map(|conn| conn.joined_player().map(|player| player.center))
                 .collect();
+            let spans = &self.spans;
             let Server {
                 world,
                 pinned,
@@ -1519,8 +1604,12 @@ impl Server {
                     .is_some_and(|edit| edit.version > edit.saved_version),
                 None => pinned.contains(pos),
             };
-            world
-                .retain(|pos, _| is_pinned(pos) || centers.iter().any(|&c| in_keep(*pos, c, r, v)));
+            world.retain(|pos, _| {
+                is_pinned(pos)
+                    || centers
+                        .iter()
+                        .any(|&c| lod0_keeps(spans, *pos, c, r, v, cap))
+            });
             // Evicted cubes take their edit bookkeeping with them: their
             // committed edits are on disk, and a reload starts fresh.
             versions.retain(|pos, _| world.contains_key(pos));
@@ -1566,37 +1655,113 @@ impl BlockShapes for ServerShapes<'_> {
     }
 }
 
+/// Is `pos` in a player's LOD0 keep set (task 2.10)? The camera keep
+/// (radii +1, as before) plus, for a column of the keep ring, the span
+/// extras trimmed one looser than the desired set — the same hysteresis
+/// in window and cap the radii get.
+fn lod0_keeps(
+    spans: &SurfaceSpans,
+    pos: CubePos,
+    center: CubePos,
+    r: u32,
+    v: u32,
+    cap: usize,
+) -> bool {
+    if in_keep(pos, center, r, v) {
+        return true;
+    }
+    let dx = i64::from(pos.x - center.x);
+    let dz = i64::from(pos.z - center.z);
+    let keep_r = i64::from(r + 1);
+    if dx * dx + dz * dz > keep_r * keep_r {
+        return false;
+    }
+    let span = spans.lod0(pos.x, pos.z);
+    extra_dy_keeps(
+        span,
+        i64::from(jbm_core::coords::CUBE_SIZE),
+        i64::from(center.y),
+        v + 1,
+        cap + 1,
+        pos.y - center.y,
+    )
+}
+
+/// The level-`level` form of [`lod0_keeps`] for ring cubes: level 1
+/// unions its span, coarser levels are camera-keep only (their default
+/// window already covers the shipped relief; see `lod_walk_surface`).
+fn lod_level_keeps(
+    spans: &SurfaceSpans,
+    level: u8,
+    pos: CubePos,
+    center: CubePos,
+    r: u32,
+    v: u32,
+    cap: usize,
+) -> bool {
+    if in_keep(pos, center, r, v) {
+        return true;
+    }
+    let dx = i64::from(pos.x - center.x);
+    let dz = i64::from(pos.z - center.z);
+    let keep_r = i64::from(r + 1);
+    if dx * dx + dz * dz > keep_r * keep_r {
+        return false;
+    }
+    if level != 1 {
+        return false;
+    }
+    let span = spans.l1(pos.x, pos.z);
+    extra_dy_keeps(
+        span,
+        i64::from(jbm_core::coords::CUBE_SIZE) * 2,
+        i64::from(center.y),
+        v + 1,
+        cap + 1,
+        pos.y - center.y,
+    )
+}
+
 /// One player's slice of the streaming pass. Returns `true` when the link
 /// closed and the connection must be dropped.
 ///
-/// Cost contract: with an unchanged center and everything sent, this is a
-/// handful of map lookups (the cursor already sits at the end of the offset
-/// list) — no scans of the desired or sent sets.
+/// Cost contract: with an unchanged center, a settled span store and
+/// everything sent, this is a handful of map lookups (the cursor already
+/// sits at the end of the offset list) — no scans of the desired or sent
+/// sets. While spans fill (task 2.10), each landed span rebuilds the
+/// desired list and resets the cursor; the re-walk skips sent entries and
+/// pauses at the first missing cube, so it stays cheap.
 fn stream_player(
     link: &mut ServerLink,
     player: &mut Player,
     world: &HashMap<CubePos, jbm_core::cube::Cube>,
     pool: &mut GenPool,
     config: &ServerConfig,
-    desired: &[Offset],
+    spans: &mut SurfaceSpans,
     eviction_dirty: &mut bool,
 ) -> bool {
     // Center: the cube containing the authoritative state position.
     let center = cube_containing(player.state.position);
     let (r, v) = (config.view_radius, config.vertical_radius);
+    let cap = config.max_column_cubes;
 
     if center != player.center {
         player.center = center;
         // Everything must be re-walked nearest-first from the new center.
         player.cursor = 0;
         *eviction_dirty = true;
-        // Unload what left the keep set (the desired set grown by one in
-        // each radius — hysteresis against border flapping).
+        // Feed the span store's fill queue around the new center (task
+        // 2.10); it covers the LOD0 and level-1 keep squares, so keep
+        // tests always find a span near the view.
+        spans.ensure_around((center.x, center.z), r, config.lod_levels);
+        // Unload what left the keep set (the desired shape grown by one
+        // in each radius, surface spans included — hysteresis against
+        // border flapping).
         let to_unload: Vec<CubePos> = player
             .sent
             .iter()
             .copied()
-            .filter(|&pos| !in_keep(pos, center, r, v))
+            .filter(|&pos| !lod0_keeps(spans, pos, center, r, v, cap))
             .collect();
         for pos in to_unload {
             player.sent.remove(&pos);
@@ -1605,6 +1770,23 @@ fn stream_player(
             }
         }
     }
+
+    // The desired list follows the span store (task 2.10): a landed span
+    // may add that column's surface cubes. Rebuilding resets the cursor —
+    // the re-walk skips already-sent entries for free. The first build
+    // (empty list) also feeds the span store around this center, so a
+    // player who never moves still gets surface-following windows.
+    if player.desired_version != spans.version() {
+        if player.desired.is_empty() {
+            spans.ensure_around((center.x, center.z), r, config.lod_levels);
+        }
+        player.desired = desired_offsets_surface(r, v, cap, i64::from(center.y), |dx, dz| {
+            spans.lod0(center.x + dx, center.z + dz)
+        });
+        player.desired_version = spans.version();
+        player.cursor = 0;
+    }
+    let desired = &player.desired;
 
     // Send walk, nearest-first from the cursor. Already-sent cubes advance
     // the cursor for free; a missing cube stops the walk (the order stays
@@ -1658,8 +1840,9 @@ fn stream_player(
     false
 }
 
-/// One player's slice of LOD ring streaming (task 2.6). Returns `true`
-/// when the link closed and the connection must be dropped.
+/// One player's slice of LOD ring streaming (task 2.6, surface-following
+/// windows from task 2.10). Returns `true` when the link closed and the
+/// connection must be dropped.
 ///
 /// Cost contract, like the LOD0 one: a settled player whose rings are
 /// complete costs a few center comparisons per level per tick — the
@@ -1673,35 +1856,32 @@ fn stream_player_lod(
     player: &mut Player,
     lod: &mut LodPyramid,
     config: &ServerConfig,
-    walk: &[LodWalkEntry],
+    spans: &SurfaceSpans,
 ) -> bool {
     let lod0_center = cube_containing(player.state.position);
     let (r, v) = (config.lod_view_radius, config.lod_vertical_radius);
+    let cap = config.max_column_cubes;
 
     // 1. Level centers: unload what left that level's keep set (the
-    //    desired shape at +1 in both radii), then reset the walk cursor.
+    //    desired shape at +1 in both radii, level-1 surface spans
+    //    included), then reset the walk cursor.
     let mut center_moved = false;
     for (index, level_state) in player.lod.iter_mut().enumerate() {
         let center = level_center(lod0_center, index as u8 + 1);
         if center == level_state.center {
             continue;
         }
+        let level = index as u8 + 1;
         level_state.center = center;
         let to_unload: Vec<CubePos> = level_state
             .sent
             .iter()
             .copied()
-            .filter(|&pos| !in_keep(pos, center, r, v))
+            .filter(|&pos| !lod_level_keeps(spans, level, pos, center, r, v, cap))
             .collect();
         for pos in to_unload {
             level_state.sent.remove(&pos);
-            if link
-                .send(ServerMsg::UnloadLodCube {
-                    level: index as u8 + 1,
-                    pos,
-                })
-                .is_err()
-            {
+            if link.send(ServerMsg::UnloadLodCube { level, pos }).is_err() {
                 return true;
             }
         }
@@ -1746,10 +1926,27 @@ fn stream_player_lod(
         budget -= 1;
     }
 
-    // 3. The merged walk. Sent entries advance the head cursor for free;
-    //    a not-ready cube is requested and skipped (the client's coverage
-    //    rule makes any arrival order hole-free); the scan stops at the
-    //    skip window even when the near cubes stay missing.
+    // 3. The merged walk (task 2.10: rebuilt when a center moved or a
+    //    level-1 span landed — the span store's version covers both
+    //    players' views being rebuilt lazily). Sent entries advance the
+    //    head cursor for free; a not-ready cube is requested and skipped
+    //    (the client's coverage rule makes any arrival order hole-free);
+    //    the scan stops at the skip window even when the near cubes stay
+    //    missing.
+    if center_moved || player.lod_walk_version != spans.version() {
+        let l1_center = player.lod.first().map(|state| state.center);
+        player.lod_walk = lod_walk_surface(
+            config.lod_levels,
+            r,
+            v,
+            cap,
+            l1_center.map_or(0, |c| i64::from(c.y)),
+            |dx, dz| l1_center.and_then(|c| spans.l1(c.x + dx, c.z + dz)),
+        );
+        player.lod_walk_version = spans.version();
+        player.lod_cursor = 0;
+    }
+    let walk = &player.lod_walk;
     let mut head = player.lod_cursor.min(walk.len());
     let mut i = head;
     let end = (head + LOD_SKIP_WINDOW).min(walk.len());
@@ -2720,6 +2917,12 @@ mod tests {
     fn lod_config(lod_budget: usize) -> ServerConfig {
         ServerConfig {
             streaming: true,
+            // Classic terrain (task 2.10): these tests pin the walk order,
+            // budgets and keep sets, whose meaning is the window shape.
+            // On the overworld the surface-following windows (2.10) add
+            // span cubes beyond the small `lod_vertical_radius` 2 ring
+            // here, which would be a change of terrain, not of rule.
+            worldgen: crate::worldgen::Preset::Classic,
             view_radius: 1,
             vertical_radius: 1,
             send_budget_per_tick: 64,
@@ -2799,9 +3002,15 @@ mod tests {
         for &(level, pos) in &sent {
             *counts.entry((level, pos)).or_insert(0usize) += 1;
             let center = crate::streaming::level_center(lod0_center, level);
+            // The sent set is inside the player's own surface-following
+            // walk (task 2.10: level 1's spans add cubes beyond the plain
+            // window on this spawn's hill), whose window part is exactly
+            // the old disk shape.
+            let player_walk = &player.lod_walk;
+            let offset = (pos.x - center.x, pos.y - center.y, pos.z - center.z);
             assert!(
-                crate::streaming::in_desired(pos, center, 3, 2),
-                "sent outside the desired disk: level {level} {pos:?}"
+                player_walk.contains(&(level, offset)),
+                "sent outside the desired walk: level {level} {pos:?}"
             );
         }
         for (index, level_state) in player.lod.iter().enumerate() {
@@ -2932,8 +3141,18 @@ mod tests {
         assert_eq!(per_tick_over, 0, "the per-tick budget was exceeded");
         assert!(!order.is_empty());
 
-        // The first-send order is a subsequence of the merged walk.
-        let walk = crate::streaming::lod_walk(3, 3, 2);
+        // The first-send order is a subsequence of the merged walk —
+        // the player's own surface-following walk (task 2.10: level 1
+        // unions the column spans, which on this spawn's hill adds one
+        // cube below the plain window).
+        let player = server
+            .connections
+            .iter()
+            .filter_map(|c| c.joined_player())
+            .next()
+            .unwrap();
+        let walk = player.lod_walk.clone();
+        assert!(walk.len() >= crate::streaming::lod_walk(3, 3, 2).len());
         let mut walk_index = 0;
         for entry in &order {
             let mut found = false;

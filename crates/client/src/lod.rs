@@ -159,12 +159,15 @@ impl Coverage {
         // ready ancestor" clause is dead, below a not-ready one it revives.
         let (drawn_parent, ready_above) = self.context(key);
         let new_drawn = ready && (drawn_parent || !ready_above);
-        let drawn_changed = self.entries.get_mut(&key).is_some_and(|entry| {
-            let changed = entry.drawn != new_drawn;
+        if let Some(entry) = self.entries.get_mut(&key) {
             entry.drawn = new_drawn;
-            changed
-        });
-        if drawn_changed && ready {
+        }
+        // A cube that just became ready (the early return above leaves only
+        // real transitions) always reports its state, changed or not: its
+        // fresh upload defaults to drawn, so an unchanged "not drawn"
+        // verdict — a cube unloaded and reloaded under a ready ancestor —
+        // must still reach the renderer, or two levels draw one volume.
+        if ready {
             self.note(key);
         }
         if key.level > 0 {
@@ -477,6 +480,33 @@ mod tests {
         coverage.set_ready(k, true);
         assert_eq!(coverage.work(), 0, "no readiness change, no work");
         assert!(coverage.take_changed().is_empty());
+    }
+
+    /// The play-test's z-fighting water: a level-1 cube under a ready
+    /// level-4 ancestor (levels 2 and 3 absent) is unloaded and reloaded.
+    /// Its verdict, "not drawn", never changes — but its fresh upload
+    /// defaults to drawn, so the reload must still report the state, or
+    /// the renderer draws both levels over the same volume.
+    #[test]
+    fn a_reloaded_cube_reports_its_state_even_when_unchanged() {
+        let mut coverage = Coverage::default();
+        let ancestor = key(4, 1, 0, 0);
+        let cube = key(1, 10, 0, 0);
+        coverage.set_ready(cube, true);
+        coverage.set_ready(ancestor, true);
+        assert_eq!(
+            coverage.state(cube),
+            Some((false, 0)),
+            "hidden by the ancestor"
+        );
+        coverage.set_ready(cube, false);
+        coverage.take_changed();
+        coverage.set_ready(cube, true);
+        let changes = coverage.take_changed();
+        assert!(
+            changes.contains(&(cube, false, 0)),
+            "the reload reports (not drawn) for the fresh upload: {changes:?}"
+        );
     }
 
     /// The property: over seeded random readiness sets on a small region

@@ -45,11 +45,18 @@ impl std::error::Error for TextureError {}
 
 /// A block texture array: all layers one square power-of-two size, full
 /// mip chain generated on the CPU, nearest filtering with linear mips.
+/// Also carries each layer's average color (task 2.9's far look) as a CPU
+/// table and a storage buffer the terrain pass binds for flat far colors.
 pub struct BlockTextures {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     sampler: wgpu::Sampler,
     layers: u32,
+    /// Per-layer average color, linear RGB + mean alpha (task 2.9).
+    averages: Vec<[f32; 4]>,
+    /// The same averages as a storage buffer (one vec4f per layer), bound
+    /// by the terrain pass in group 2.
+    averages_buffer: wgpu::Buffer,
 }
 
 impl BlockTextures {
@@ -132,11 +139,27 @@ impl BlockTextures {
             address_mode_w: wgpu::AddressMode::Repeat,
             ..Default::default()
         });
+
+        // Task 2.9: each layer's average color, for flat far-terrain
+        // shading. Computed in linear space from the base layer (not the
+        // 1x1 mip, which is 8-bit quantized), alpha-weighted so cutout
+        // holes in leaves and glass do not darken it.
+        let averages: Vec<[f32; 4]> = layers.iter().map(layer_average).collect();
+        let averages_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("jbm layer averages"),
+            size: (count as u64) * 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        gpu.queue
+            .write_buffer(&averages_buffer, 0, bytemuck::cast_slice(&averages));
         Ok(BlockTextures {
             texture,
             view,
             sampler,
             layers: count,
+            averages,
+            averages_buffer,
         })
     }
 
@@ -152,9 +175,67 @@ impl BlockTextures {
         self.layers
     }
 
+    /// Per-layer average colors (task 2.9), linear RGB with the mean alpha
+    /// in w — the CPU mirror of the storage buffer, for tests.
+    pub fn averages(&self) -> &[[f32; 4]] {
+        &self.averages
+    }
+
+    /// The averages as a storage buffer (one vec4f per layer), bound by the
+    /// terrain pass in group 2.
+    pub fn averages_buffer(&self) -> &wgpu::Buffer {
+        &self.averages_buffer
+    }
+
     pub fn format(&self) -> wgpu::TextureFormat {
         self.texture.format()
     }
+}
+
+/// One layer's average color (task 2.9): linear RGB averaged from the base
+/// layer, each pixel weighted by its alpha so cutout holes (leaves, glass)
+/// contribute nothing, plus the mean alpha in w. A fully transparent layer
+/// falls back to the unweighted mean — there is nothing to weight by, and
+/// such layers are never sampled where their color shows.
+fn layer_average(image: &RgbaImage) -> [f32; 4] {
+    let mut sum = [0.0f64; 3];
+    let mut weight = 0.0f64;
+    let mut alpha_sum = 0.0f64;
+    for pixel in image.pixels() {
+        let alpha = f64::from(pixel.0[3]) / 255.0;
+        let linear = [
+            f64::from(srgb_to_linear(pixel.0[0])),
+            f64::from(srgb_to_linear(pixel.0[1])),
+            f64::from(srgb_to_linear(pixel.0[2])),
+        ];
+        for c in 0..3 {
+            sum[c] += linear[c] * alpha;
+        }
+        weight += alpha;
+        alpha_sum += alpha;
+    }
+    let n = (image.width() * image.height()) as f64;
+    let mean_alpha = alpha_sum / n;
+    if weight <= f64::EPSILON * n {
+        let mut plain = [0.0f64; 3];
+        for pixel in image.pixels() {
+            for (c, acc) in plain.iter_mut().enumerate() {
+                *acc += f64::from(srgb_to_linear(pixel.0[c]));
+            }
+        }
+        return [
+            (plain[0] / n) as f32,
+            (plain[1] / n) as f32,
+            (plain[2] / n) as f32,
+            mean_alpha as f32,
+        ];
+    }
+    [
+        (sum[0] / weight) as f32,
+        (sum[1] / weight) as f32,
+        (sum[2] / weight) as f32,
+        mean_alpha as f32,
+    ]
 }
 
 /// Uploads one mip level of one layer, padding rows to the copy alignment.
@@ -485,5 +566,98 @@ mod tests {
             let border = layer.get_pixel(0, 4).0;
             assert!(border[0] < inner[0] || border[1] < inner[1] || border[2] < inner[2]);
         }
+    }
+
+    /// Task 2.9: a 2x2 layer of known colors averages to the linear-space
+    /// mean of the four sRGB-decoded primaries.
+    #[test]
+    fn layer_average_of_known_2x2_is_the_linear_mean() {
+        let mut layer = RgbaImage::new(2, 2);
+        layer.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
+        layer.put_pixel(1, 0, Rgba([0, 255, 0, 255]));
+        layer.put_pixel(0, 1, Rgba([0, 0, 255, 255]));
+        layer.put_pixel(1, 1, Rgba([255, 255, 255, 255]));
+        // Every channel is full-scale in exactly two of the four pixels
+        // (its primary and white), so each linear mean is half the decoded
+        // full scale. The expectation goes through the same sRGB decode as
+        // the implementation, so it follows the curve rather than assuming
+        // srgb(255) == 1.0.
+        let half = f64::from(srgb_to_linear(255)) / 2.0;
+        let avg = layer_average(&layer);
+        for (c, channel) in avg.iter().enumerate().take(3) {
+            assert!(
+                (f64::from(*channel) - half).abs() < 1e-6,
+                "channel {c}: {channel} vs {half}"
+            );
+        }
+        assert!((avg[3] - 1.0).abs() < 1e-6, "mean alpha of opaque layer");
+    }
+
+    /// Task 2.9: transparent pixels do not darken the average — a cutout
+    /// layer averages only what it shows. The black transparent pixels
+    /// would halve every channel under an unweighted mean.
+    #[test]
+    fn layer_average_ignores_transparent_pixels() {
+        let mut layer = RgbaImage::new(2, 2);
+        layer.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
+        layer.put_pixel(1, 0, Rgba([255, 0, 0, 255]));
+        layer.put_pixel(0, 1, Rgba([0, 0, 0, 0]));
+        layer.put_pixel(1, 1, Rgba([0, 0, 0, 0]));
+        let avg = layer_average(&layer);
+        let red = f64::from(srgb_to_linear(255));
+        assert!((f64::from(avg[0]) - red).abs() < 1e-6, "r = {}", avg[0]);
+        assert!(
+            avg[1] < 1e-6 && avg[2] < 1e-6,
+            "g/b = {}/{}",
+            avg[1],
+            avg[2]
+        );
+        assert!((avg[3] - 0.5).abs() < 1e-6, "mean alpha = {}", avg[3]);
+    }
+
+    /// A fully transparent layer has nothing to weight by: the unweighted
+    /// linear mean, so the far color of such a layer is still defined.
+    #[test]
+    fn layer_average_of_fully_transparent_layer_falls_back() {
+        let mut layer = RgbaImage::new(2, 2);
+        layer.put_pixel(0, 0, Rgba([255, 0, 0, 0]));
+        layer.put_pixel(1, 0, Rgba([0, 255, 0, 0]));
+        layer.put_pixel(0, 1, Rgba([0, 0, 255, 0]));
+        layer.put_pixel(1, 1, Rgba([0, 0, 0, 0]));
+        let avg = layer_average(&layer);
+        // Each channel is full-scale in exactly one of the four pixels,
+        // so every unweighted mean is a quarter of the decoded scale.
+        let quarter = f64::from(srgb_to_linear(255)) / 4.0;
+        for (c, channel) in avg.iter().enumerate().take(3) {
+            assert!(
+                (f64::from(*channel) - quarter).abs() < 1e-6,
+                "channel {c}: {channel} vs {quarter}"
+            );
+        }
+        assert!(avg[3] < 1e-6);
+    }
+
+    /// The builtin layers have usable averages: cutout layers (glass,
+    /// leaves) stay bright, grass top is green, and every average is a
+    /// finite color in [0, 1].
+    #[test]
+    fn builtin_layer_averages_are_sane() {
+        let (layers, _) = crate::mesh::appearance::builtin_textures();
+        for layer in &layers {
+            let avg = layer_average(layer);
+            for c in 0..4 {
+                assert!(
+                    avg[c].is_finite() && (0.0..=1.0).contains(&avg[c]),
+                    "{avg:?}"
+                );
+            }
+        }
+        let grass = layer_average(&layers[2]); // grass_top
+        assert!(grass[1] > grass[0] && grass[1] > grass[2], "{grass:?}");
+        let leaves = layer_average(&layers[10]); // leaves (cutout)
+        assert!(
+            leaves[1] > 0.05,
+            "cutout holes must not blacken: {leaves:?}"
+        );
     }
 }

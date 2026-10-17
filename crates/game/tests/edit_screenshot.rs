@@ -19,6 +19,7 @@ use jbm_core::block::{BlockRegistry, BlockStateId, builtin};
 use jbm_core::coords::BlockPos;
 use jbm_core::protocol::{ClientMsg, ServerMsg};
 use jbm_server::terrain::Generator;
+use jbm_server::worldgen::Preset;
 use jbm_server::{DEFAULT_SEED, ServerConfig};
 use jbm_testkit::HeadlessServer;
 
@@ -44,6 +45,7 @@ fn edited_spawn_scene_matches_golden() {
     };
 
     let mut server = HeadlessServer::with_config(ServerConfig {
+        worldgen: Preset::Classic, // pin the pre-2.8 terrain: this golden predates it
         seed: DEFAULT_SEED,
         streaming: true,
         view_radius: 3,
@@ -59,10 +61,11 @@ fn edited_spawn_scene_matches_golden() {
         lod_vertical_radius: 3,
         lod_send_budget_per_tick: 32,
         lod_max_in_flight: 256,
+        ..ServerConfig::default()
     });
     let mut registry = BlockRegistry::new();
     let blocks = builtin::Blocks::register(&mut registry);
-    let generator = Generator::new(DEFAULT_SEED, blocks);
+    let generator = Generator::with_preset(DEFAULT_SEED, blocks, Preset::Classic);
     let surface = |x: i64, z: i64| generator.surface_height(x, z);
 
     let mut client = server.connect("builder");

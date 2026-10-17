@@ -6,12 +6,14 @@
 use jbm_core::block::{BlockRegistry, builtin};
 use jbm_core::physics::MoveInput;
 use jbm_core::protocol::{ClientMsg, ServerMsg};
+use jbm_server::worldgen::Preset;
 use jbm_server::{DEFAULT_SEED, ServerConfig};
 use jbm_testkit::HeadlessServer;
 
 /// The streaming shape of the spec: R = 3, V = 2, inline generation.
 fn config() -> ServerConfig {
     ServerConfig {
+        worldgen: Preset::Classic, // today's terrain, as before 2.8
         seed: DEFAULT_SEED,
         streaming: true,
         view_radius: 3,
@@ -23,6 +25,7 @@ fn config() -> ServerConfig {
         world_dir: None,
         save_interval: std::time::Duration::from_secs(5),
         lod_levels: 4,
+        max_column_cubes: 0,
         lod_view_radius: 8,
         lod_vertical_radius: 3,
         lod_send_budget_per_tick: 32,

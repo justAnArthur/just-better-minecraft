@@ -9,7 +9,7 @@
 //   0: shared frame uniforms (same layout as sky.wgsl)
 //   1: the face page's storage buffer (array<vec2u>, one vec2 per face)
 //   2: shared terrain resources: cube meta, the terrain-only uniform,
-//      textures, sampler
+//      textures, sampler, per-layer average colors (task 2.9)
 //
 // Each draw covers one cube and one face direction: vertex_count faces * 6
 // vertices, one instance, with first_vertex = (page range start + direction
@@ -51,11 +51,19 @@ struct CubeMeta {
     dirs: array<vec4u, 3>,  // six per-direction (offset, count) pairs
 };
 
-// Mirrored by `TerrainUniforms` in render/chunks.rs (32 bytes). Terrain
+// Mirrored by `TerrainUniforms` in render/chunks.rs (64 bytes). Terrain
 // only: sky, outline and overlay share just FrameUniforms.
 struct TerrainUniforms {
     camera_cube: vec4i, // xyz = floor(camera / CUBE_SIZE)
     camera_frac: vec4f, // xyz = camera - camera_cube * CUBE_SIZE (f32); w = CUBE_SIZE
+    // Task 2.9 far look. x = the LOD0 ring radius in blocks (sets the
+    // texture-to-flat fade window); y = the furthest ring radius in blocks
+    // (sets the fog window); z = fog on (1.0) or off (0.0, the
+    // Renderer::set_fog / JBM_NO_FOG hook); w spare.
+    far: vec4f,
+    // Task 2.10 level tint. x = tint on (1.0) or off (0.0, the F4 /
+    // JBM_LOD_TINT hook); y, z, w spare.
+    tint: vec4f,
 };
 
 @group(0) @binding(0) var<uniform> u: FrameUniforms;
@@ -64,6 +72,9 @@ struct TerrainUniforms {
 @group(2) @binding(1) var<uniform> terrain: TerrainUniforms;
 @group(2) @binding(2) var block_textures: texture_2d_array<f32>;
 @group(2) @binding(3) var block_sampler: sampler;
+// One vec4f per texture layer: the alpha-weighted linear average color
+// (task 2.9), computed by BlockTextures at load.
+@group(2) @binding(4) var<storage, read> layer_avg: array<vec4f>;
 
 // The one origin formula, scaled by the cube's LOD level and shared by
 // this shader, cull.wgsl and `cube_origin` in render/chunks.rs:
@@ -120,13 +131,115 @@ fn face_shade() -> array<f32, 6> {
     return array<f32, 6>(0.6, 0.6, 1.0, 0.5, 0.8, 0.8);
 }
 
+// ---------------------------------------------------------------------------
+// Task 2.9: the far look — flat material colors and distance fog.
+//
+// far_color(layer, dist, level) is the base color before directional shade
+// and fog:
+//   - level >= 1 (a LOD cube): the layer's average color, flat. No cutout
+//     discard — a LOD cell is solid by the downsampling rule.
+//   - level 0: mix(texture, average, fade(dist)) where fade is a
+//     smoothstep from FADE_START_FRACTION to FADE_END_FRACTION of the
+//     LOD0 ring radius (terrain.far.x). By the LOD0/LOD1 border (85% of
+//     the radius) LOD0 is flat-colored too, so both sides of the border
+//     match. The cutout discard still applies while fade < 1, i.e. while
+//     any of the texture still shows.
+//
+// Distance fog then blends every terrain fragment into the sky color
+// along its view ray at the horizon (sky_gradient below, y clamped just
+// above 0): a smoothstep from FOG_START_FRACTION to FOG_END_FRACTION of
+// the furthest ring radius (terrain.far.y), reaching 1 just inside the
+// outermost ring so its edge is never visible. terrain.far.z switches the
+// fog off entirely (Renderer::set_fog / JBM_NO_FOG; the fade stays).
+//
+// The fractions are mirrored by the FADE_* / FOG_* constants in
+// render/chunks.rs (tests compute expected values from them) — keep the
+// two in sync.
+const FADE_START_FRACTION: f32 = 0.40;
+const FADE_END_FRACTION: f32 = 0.85;
+const FOG_START_FRACTION: f32 = 0.35;
+const FOG_END_FRACTION: f32 = 0.98;
+// The fog color's view direction clamps y to just above zero (never a
+// negative pow argument, and the fogged terrain meets the horizon color
+// the sky shows at the horizon line).
+const FOG_DIR_MIN_Y: f32 = 1e-6;
+
+fn fade(dist: f32) -> f32 {
+    return smoothstep(
+        FADE_START_FRACTION * terrain.far.x,
+        FADE_END_FRACTION * terrain.far.x,
+        dist,
+    );
+}
+
+fn fog_factor(dist: f32) -> f32 {
+    return smoothstep(
+        FOG_START_FRACTION * terrain.far.y,
+        FOG_END_FRACTION * terrain.far.y,
+        dist,
+    ) * terrain.far.z;
+}
+
+// The base color of a fragment before shade and fog (see the block
+// comment above). `tex` is the already-sampled texture (the sample itself
+// must stay in uniform control flow).
+fn far_color(tex: vec4f, layer: u32, dist: f32, level: u32) -> vec3f {
+    let avg = layer_avg[layer].rgb;
+    if (level >= 1u) {
+        return avg;
+    }
+    return mix(tex.rgb, avg, fade(dist));
+}
+
+// AO softening per LOD level (task 2.9): AO contrast scales with cell
+// size and reads blotchy far away, so coarse levels pull the AO factor
+// toward fully open. Level 0 keeps the exact factor (pre-2.9 goldens stay
+// bit-stable). Mirrored by AO_SOFTEN in render/chunks.rs — keep in sync.
+fn ao_soften(level: u32) -> f32 {
+    if (level == 0u) {
+        return 1.0;
+    }
+    if (level == 1u) {
+        return 0.6;
+    }
+    if (level == 2u) {
+        return 0.45;
+    }
+    return 0.3;
+}
+
+// The level tint (task 2.10), mirrored by LOD_TINT_COLORS in
+// render/chunks.rs — keep in sync. One fixed color per level so a debug
+// view shows which level draws where; level 0 stays white. The last entry
+// is purple, deliberately not pure magenta (the hole sentinel).
+fn lod_tint(level: u32) -> vec3f {
+    let colors = array<vec3f, 7>(
+        vec3f(1.0, 1.0, 1.0),   // LOD0: untinted
+        vec3f(1.0, 0.0, 0.0),   // L1 2x2 red
+        vec3f(1.0, 1.0, 0.0),   // L2 4x4 yellow
+        vec3f(0.0, 1.0, 0.0),   // L3 8x8 green
+        vec3f(0.0, 1.0, 1.0),   // L4 16x16 cyan
+        vec3f(0.0, 0.0, 1.0),   // L5 32x32 blue
+        vec3f(0.55, 0.15, 1.0), // L6 64x64 purple
+    );
+    return colors[min(level, 6u)];
+}
+
 struct VsOut {
     @builtin(position) pos: vec4f,
     // UV in whole-texture tiles: one tile per block.
     @location(0) uv: vec2f,
     @location(1) @interpolate(flat) layer: u32,
-    // Directional shade times the corner's AO factor, interpolated.
+    // Directional shade times the corner's (level-softened) AO factor,
+    // interpolated.
     @location(2) shade: f32,
+    // The camera-relative position (task 2.9): its length is the fragment
+    // distance the fade and fog smoothsteps run on. Interpolation is
+    // exact for positions (affine in clip space via perspective-correct
+    // varying interpolation) and the length is taken per fragment.
+    @location(3) rel: vec3f,
+    // The cube's LOD level (task 2.9), flat: far_color switches on it.
+    @location(4) @interpolate(flat) level: u32,
 };
 
 @vertex
@@ -222,26 +335,66 @@ fn vs_main(
         out.uv = vec2f(0.0);
         out.layer = layer;
         out.shade = 0.0;
+        out.rel = vec3f(0.0);
+        out.level = 0u;
         return out;
     }
 
     let ao_factor = array<f32, 4>(0.4, 0.6, 0.8, 1.0);
+    // AO softening (task 2.9): pull the corner's AO factor toward fully
+    // open by the level's factor — see ao_soften above.
+    let ao = mix(1.0, ao_factor[corner_ao[corner_index]], ao_soften(level));
     var out: VsOut;
     out.pos = u.view_proj * vec4f(relative_expanded, 1.0);
     out.uv = uv;
     out.layer = layer;
-    out.shade = face_shade()[direction] * ao_factor[corner_ao[corner_index]];
+    out.shade = face_shade()[direction] * ao;
+    out.rel = relative_expanded;
+    out.level = level;
     return out;
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
     // wgpu 30 follows the WGSL spec where the array layer is a separate
-    // argument (not packed into coords.z).
+    // argument (not packed into coords.z). The sample must stay in uniform
+    // control flow (WGSL requires it for textureSample), and the LOD level
+    // arrives as a flat varying the uniformity analysis cannot prove
+    // constant — so the level >= 1 path fetches the texel it then ignores;
+    // far_color drops its value exactly (mix(x, y, 1.0) == y).
     let tex = textureSample(block_textures, block_sampler, in.uv, in.layer);
-    // Cutout: glass, leaves and holes in textures discard below 0.5.
-    if (tex.a < 0.5) {
+    let dist = length(in.rel);
+    var base = far_color(tex, in.layer, dist, in.level);
+    // Level tint (task 2.10): the debug view that shows which level draws
+    // where, before shade and fog. One uniform flag, shared by every draw
+    // path (they share this fragment shader).
+    if (terrain.tint.x > 0.5) {
+        base = base * lod_tint(in.level);
+    }
+    // Cutout: glass, leaves and holes in textures discard below 0.5 —
+    // only while any texture still shows (level 0, not fully faded; a LOD
+    // cell is solid by the downsampling rule). The alpha test leads so
+    // opaque fragments (almost all terrain) never evaluate the fade.
+    if (tex.a < 0.5 && in.level == 0u && fade(dist) < 1.0) {
         discard;
     }
-    return vec4f(tex.rgb * in.shade, 1.0);
+    var color = base * in.shade;
+    // Distance fog (task 2.9): blend into the sky color along this
+    // fragment's view ray at the horizon — the same gradient the sky pass
+    // paints behind the terrain — so the far rings dissolve into it with
+    // no visible band. See the far-look block comment above. The
+    // direction reuses the already-computed distance instead of a second
+    // length() (normalize).
+    let f = fog_factor(dist);
+    if (f > 0.0) {
+        let dir = in.rel / dist;
+        let fog_color = sky_gradient(
+            vec3f(dir.x, max(dir.y, FOG_DIR_MIN_Y), dir.z),
+            u.horizon_color.rgb,
+            u.zenith_color.rgb,
+            u.ground_color.rgb,
+        );
+        color = mix(color, fog_color, f);
+    }
+    return vec4f(color, 1.0);
 }

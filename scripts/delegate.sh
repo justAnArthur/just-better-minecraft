@@ -50,7 +50,10 @@ allowed=(
   "Bash(find:*)" "Bash(grep:*)" "Bash(rg:*)" "Bash(mkdir:*)" "Bash(cp:*)"
   "Bash(mv:*)" "Bash(touch:*)" "Bash(uname:*)" "Bash(sysctl:*)" "Bash(lscpu:*)"
   "Bash(diff:*)" "Bash(file:*)" "Bash(python3:*)"
-  "Bash(JBM_UPDATE_GOLDEN=1 cargo test:*)"
+  "Bash(perl:*)" "Bash(command:*)" "Bash(sed:*)" "Bash(sort:*)" "Bash(date:*)"
+  "Bash(JBM_UPDATE_GOLDEN=1 cargo:*)" "Bash(JBM_NO_MDI=1 cargo:*)"
+  "Bash(JBM_GPU_CULL=1 cargo:*)" "Bash(JBM_NO_FOG=1 cargo:*)"
+  "Bash(JBM_REGION_SIDE=544 cargo:*)"
 )
 flags=(--allowedTools "${allowed[@]}")
 [[ "$role" != "implementer" ]] && flags+=(--disallowedTools Edit Write NotebookEdit)

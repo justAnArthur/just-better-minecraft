@@ -233,13 +233,17 @@ fn bench(c: &mut Criterion) {
     }
 
     // Task 2.6: the LOD rings scene at game scale (default
-    // lod_view_radius, 4 levels), through the CPU-culled and GPU-culled
-    // paths. Every level must have drawn cubes (the coverage rule
-    // accepted the rings) — asserted at setup.
+    // lod_view_radius, 6 levels since task 2.10), through the CPU-culled
+    // and GPU-culled paths. Every level must have drawn cubes (the
+    // coverage rule accepted the rings) — asserted at setup.
     let region_for_rings = common::Region::new(DEFAULT_SEED);
     let mut registry = jbm_core::block::BlockRegistry::new();
     let blocks = jbm_core::block::builtin::Blocks::register(&mut registry);
-    let generator = jbm_server::terrain::Generator::new(DEFAULT_SEED, blocks);
+    let generator = jbm_server::terrain::Generator::with_preset(
+        DEFAULT_SEED,
+        blocks,
+        jbm_server::worldgen::Preset::Classic,
+    );
     let rings = common::rings::RingsScene::new(&generator, &blocks, &region_for_rings.appearance);
     for (level, count) in rings.resident.iter().enumerate() {
         assert!(

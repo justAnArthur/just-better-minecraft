@@ -15,6 +15,8 @@
 //!   slope +-1 per axis.)
 //! - **Skirts** (side directions +-X/+-Z only), the crack hider at level
 //!   seams. See `SKIRT_NOTE` below.
+//! - **Lids** (+Y only), the same crack hider for horizontal seams. See
+//!   [`lid`].
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -109,6 +111,10 @@ pub struct MeshOutput {
     /// the skirt overhead. They carry the skirt bit in their merge key, so
     /// a counted face never merged with a non-skirt one.
     pub skirts: u32,
+    /// Faces emitted under the lid rule (level >= 1, +Y at an octant plane
+    /// or the cube's top row). Like skirts they carry their own merge-key
+    /// bit, so a counted face never merged with an ordinary one.
+    pub lids: u32,
 }
 
 impl MeshOutput {
@@ -286,6 +292,7 @@ fn mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u8) -> MeshOutp
         faces: Vec::new(),
         ranges: std::array::from_fn(|_| 0u32..0),
         skirts: 0,
+        lids: 0,
     };
     let size = CUBE_SIZE as usize;
     let half = size / 2;
@@ -331,11 +338,26 @@ fn mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u8) -> MeshOutp
                     let b = pad[b_index];
                     let a_air = a & (F_AIR << FLAGS_SHIFT) != 0;
                     let b_cull = b & (F_OPAQUE_CULL << FLAGS_SHIFT) != 0;
-                    let culled = a_air || b_cull || (a == b && a & (F_CUTOUT << FLAGS_SHIFT) != 0);
+                    // Same state on both sides culls: opaque blocks via
+                    // b_cull, and non-opaque ones too — water, glass and
+                    // cutout leaves draw no faces between equal neighbors
+                    // (an ocean once emitted every internal water face).
+                    let culled = a_air || b_cull || a == b;
                     let key = if culled {
                         if level > 0 && side && !a_air && b_cull && skirt(pad, a_index, direction) {
                             (1 << 31)
                                 | SKIRT_KEY_BIT
+                                | (u32::from(layer_of_kind[(a & 0xFFFF) as usize]) << 15)
+                                | (corner_ao(pad, b_index as isize, u, v) << 7)
+                                | LIGHT
+                        } else if level > 0
+                            && direction == Direction::PosY
+                            && !a_air
+                            && b_cull
+                            && lid(a_index)
+                        {
+                            (1 << 31)
+                                | LID_KEY_BIT
                                 | (u32::from(layer_of_kind[(a & 0xFFFF) as usize]) << 15)
                                 | (corner_ao(pad, b_index as isize, u, v) << 7)
                                 | LIGHT
@@ -396,11 +418,16 @@ fn mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u8) -> MeshOutp
                         width: w as u32,
                         height: h as u32,
                         direction,
-                        layer: (key >> 15) & 0xFFFF,
+                        // 15 bits: bit 30 of the key is SKIRT_KEY_BIT, not
+                        // part of the layer (reading 16 bits gave skirt faces
+                        // layer + 32768: the texture array clamped it, the
+                        // 2.9 per-layer color buffer read out of bounds).
+                        layer: (key >> 15) & LAYER_KEY_MASK,
                         ao: [ao8 & 3, (ao8 >> 2) & 3, (ao8 >> 4) & 3, (ao8 >> 6) & 3],
                         light: key & 0xF,
                     }));
                     output.skirts += u32::from(key & SKIRT_KEY_BIT != 0);
+                    output.lids += u32::from(key & LID_KEY_BIT != 0);
                 }
             }
         }
@@ -412,6 +439,10 @@ fn mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u8) -> MeshOutp
 /// Marks a face key emitted under the skirt rule (bit 30; bit 31 is the
 /// non-zero flag).
 const SKIRT_KEY_BIT: u32 = 1 << 30;
+
+/// The texture layer field of a face key: bits 15..30, below
+/// [`SKIRT_KEY_BIT`].
+const LAYER_KEY_MASK: u32 = 0x7FFF;
 
 /// The skirt rule (task 2.6), applied at level >= 1 in the side directions
 /// +-X/+-Z. A skirt stands in for a coarse cell's side wall at a level
@@ -474,6 +505,35 @@ fn skirt(pad: &[u32], a_index: usize, direction: Direction) -> bool {
     }
     let two_above = a_index + 2 * PAD_Y;
     (y as usize) < size - 1 && air(two_above)
+}
+
+/// Marks a face key emitted under the lid rule (bit 6: above the 4 light
+/// bits, below the AO byte at bit 7, so no packed field reads it).
+const LID_KEY_BIT: u32 = 1 << 6;
+
+/// The lid rule (wave D), applied at level >= 1 in direction +Y: the
+/// skirt rule's counterpart for horizontal seams. A cube whose upper
+/// octants (or the cube above) are drawn by finer cubes would otherwise
+/// cull its top faces at the seam against its OWN coarse cells across it,
+/// though the finer cubes drawn there may be air at that height. Looking
+/// down a slope that crosses the seam, the ray then meets no face at all:
+/// a line of holes along the contour at the seam height (found by the
+/// lod_fly test over the 2.8 mountains; the flat classic terrain never
+/// crossed a seam).
+///
+/// Emit c's +Y face even though the cell above is filled, when c is
+/// filled, the cell above is filled (or in a missing neighbor cube), and c
+/// sits at y = CUBE_SIZE / 2 - 1 (the octant plane) or y = CUBE_SIZE - 1
+/// (the cube border). There is no column restriction (unlike skirts): on
+/// a cliff a finer column can be air at the seam however high the coarse
+/// column above it reaches. Where the volume above is solid at the seam
+/// (the same coarse cube's unmasked octant, or a finer cube that is
+/// solid there) the lid lies inside terrain and is hidden; greedy merging
+/// folds a buried lid plane into a few quads per octant.
+fn lid(a_index: usize) -> bool {
+    let size = CUBE_SIZE as usize;
+    let y = a_index / PAD_Y - 1;
+    y == size / 2 - 1 || y == size - 1
 }
 
 /// Light is always 15 until lighting exists (task 2.x).
@@ -957,6 +1017,7 @@ mod tests {
             faces: Vec::new(),
             ranges: std::array::from_fn(|_| 0u32..0),
             skirts: 0,
+            lids: 0,
         };
         let size = CUBE_SIZE as usize;
         let mut mask = [0u32; MASK_LEN];
@@ -982,9 +1043,12 @@ mod tests {
                     for ui in 0..CUBE_SIZE as isize {
                         let a = pad[(a_row + ui * u + vi * v) as usize];
                         let b = pad[(b_row + ui * u + vi * v) as usize];
+                        // Same-state culling for non-opaque blocks (wave D)
+                        // updated here too: the reference pins everything
+                        // else about the pre-2.6 sweep.
                         let culled = a & (F_AIR << FLAGS_SHIFT) != 0
                             || b & (F_OPAQUE_CULL << FLAGS_SHIFT) != 0
-                            || (a == b && a & (F_CUTOUT << FLAGS_SHIFT) != 0);
+                            || a == b;
                         let key = if culled {
                             0
                         } else {
@@ -1128,6 +1192,13 @@ mod tests {
         assert!(faces_covering(&output, Direction::PosX, half - 1, 8, 5).is_empty());
         assert!(faces_covering(&output, Direction::PosX, half - 1, 3, 5).is_empty());
         assert!(output.skirts > 0);
+        // Skirt faces carry the block's real texture layer: the skirt key
+        // bit must not leak into the layer field (it once read as layer +
+        // 32768, out of bounds for the per-layer color buffer).
+        let stone_layer = appearance.get(blocks.stone).layers[0] as u32;
+        for f in faces_covering(&output, Direction::PosX, half - 1, 10, 5) {
+            assert_eq!(f.layer, stone_layer, "skirt face layer");
+        }
         // Interior columns (away from the plane) never skirt toward +X.
         assert!(faces_covering(&output, Direction::PosX, half - 3, 10, 5).is_empty());
     }
@@ -1188,6 +1259,68 @@ mod tests {
         let input = MeshInput::isolated_at_level(Arc::new(make()), 0);
         let output = mesh(&input, &appearance);
         assert!(faces_covering(&output, Direction::PosX, last, 10, 5).is_empty());
+    }
+
+    #[test]
+    fn a_body_of_water_meshes_only_its_outer_faces() {
+        let (_, appearance, blocks) = setup();
+        // An 8x8x8 block of water in air: equal non-opaque neighbors cull,
+        // so the mesh is its six outer sides, one merged quad each — not
+        // the 3 x 7 x 64 internal faces it once also emitted. Glass too.
+        for state in [blocks.water, blocks.glass] {
+            let cube = Cube::from_fn(|p| {
+                if p.x < 8 && p.y < 8 && p.z < 8 {
+                    state
+                } else {
+                    BlockStateId::AIR
+                }
+            });
+            let output = mesh_air_surrounded(cube, &appearance);
+            assert_eq!(output.faces.len(), 6, "{state:?}: outer faces only");
+        }
+    }
+
+    #[test]
+    fn terrain_through_the_octant_plane_and_cube_top_gets_lids() {
+        let (_, appearance, blocks) = setup();
+        let half = CUBE_SIZE / 2;
+        let last = CUBE_SIZE - 1;
+        // A slope that crosses the y octant plane: columns x < 8 reach the
+        // cube's top row (into the missing cube above), the rest end at
+        // y = half + 3, so the plane cells under it are buried.
+        let make = || {
+            Cube::from_fn(|p| {
+                let surface = if (p.x as i32) < 8 { last } else { half + 3 };
+                if (p.y as i32) <= surface {
+                    blocks.stone
+                } else {
+                    BlockStateId::AIR
+                }
+            })
+        };
+        let input = MeshInput::isolated_at_level(Arc::new(make()), 1);
+        let output = mesh(&input, &appearance);
+        // A lid at the octant plane (y = half - 1) in every column: the
+        // upper octants may be drawn by finer cubes that are air there.
+        for x in [2, 12, 20] {
+            assert!(
+                !faces_covering(&output, Direction::PosY, x, half - 1, 5).is_empty(),
+                "plane lid missing at x = {x}"
+            );
+        }
+        // A lid at the cube's top row under the missing cube above.
+        assert!(!faces_covering(&output, Direction::PosY, 2, last, 5).is_empty());
+        // No lid in the interior (between the planes).
+        assert!(faces_covering(&output, Direction::PosY, 2, half + 2, 5).is_empty());
+        assert!(output.lids > 0);
+        // Buried lid planes merge: a few quads per octant (AO at the
+        // slope's foot splits some), not one per cell (2 x 32 x 32).
+        assert!(output.lids <= 32, "lids {} did not merge", output.lids);
+        // Level 0 has no lids: LOD0 output stays the pre-2.6 mesher's.
+        let input = MeshInput::isolated_at_level(Arc::new(make()), 0);
+        let output = mesh(&input, &appearance);
+        assert_eq!(output.lids, 0);
+        assert!(faces_covering(&output, Direction::PosY, 2, half - 1, 5).is_empty());
     }
 
     #[test]

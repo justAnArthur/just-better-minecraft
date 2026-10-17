@@ -2,7 +2,7 @@
 
 ## Next up
 
-Stage 2 · Far view, wave D: 2.8 dramatic worldgen (continents, ridged mountain ranges, valleys, sea level water; `classic` preset keeps today's terrain for tests and goldens) and 2.9 Distant-Horizons-style far look (flat per-material colors on LOD ≥ 1, LOD0 fading to them, sky-colored distance fog). Specs in docs/tasks/2.8.md and 2.9.md; they share no files and run in parallel. Then the Stage 2 gate (fly across kilometres without hitches, user approves the look). Wave C merged (2.6 clipmap rings and skirts, 2.7 worldgen LOD fill and stored LOD).
+Stage 2 · Far view, wave E (redesign after the wave D play-test, in this order): 2.11 code review and restructuring; 2.12 playground with an egui debug panel; 2.13 meshing optimization and a larger full-detail radius so LOD draws only far away; 2.14 height-exact Distant-Horizons-style LOD. Then the Stage 2 gate (fly across kilometres without hitches, you approve the look). Wave D merged (2.8 overworld, 2.9 far look, 2.10 LOD on tall terrain).
 
 ## Benchmarks
 
@@ -94,6 +94,9 @@ Baselines are bench worker runs on an otherwise idle machine. Run-to-run noise o
 - `worldgen::reference` (the 1.5 noise code) is kept only for equivalence tests; delete it once LOD sampling (2.7) has its own coverage.
 - Golden tolerance (0.5% of pixels differing) is larger than thin features such as the target outline (~40–140 px). Tests for thin features must also assert directly: `edit_screenshot` renders with and without the outline and requires a difference.
 - Reviewers passed 1.4 with three visible bugs (one-block face offset for +X/−Z, stale mesh race, magenta grass side). The orchestrator must keep inspecting goldens zoomed in, and golden cameras must be close enough to show per-block detail.
+- LOD surfaces lean high: coarse top minus true top averages +0.6 (L1), +1.7 (L2), +4.0 (L3), +9.7 (L4), +19.8 (L5), +44 (L6) blocks, p99 about 1.5 cells (2.10 measurement). The downsampling rule (2 of 8 children) is what the skirts rely on; 2.14 replaces it with height-exact columns.
+- Level ≥ 1 quads overlap by 1/512 block at convex edges (the T-junction expansion), so draw paths may disagree on an exact edge pixel; the rings path-identity test allows 2.
+- Ring surface spans are exact for LOD0, sampled 8×8 for L1 and skipped for L2+ (their camera windows cover the overworld's height range).
 - First release/bench build is slow (wgpu + thin LTO + codegen-units=1). Revisit profile if CI bench-smoke gets too slow.
 
 ## Log
@@ -144,3 +147,10 @@ Baselines are bench worker runs on an otherwise idle machine. Run-to-run noise o
 - 2.6 merged: per-level ring streaming (full disks, merged walk coarse-first at ties, re-sends first, keep-set unloads), the client LOD world, the exactly-once coverage rule (10k-case property, incremental == from scratch), octant-split meshing with skirts, level-scaled rendering on all three paths, `JBM_AUTOFLY` autopilot. The real-server fly test (1.5 km + 300 m) passes all 18 stops. Its first failures were harness bugs (meshing 3× slower than the app, camera off the server position, a lost fly toggle) plus LOD0 T-junction pinholes, now tolerated (see Known issues). Several GLM sessions edited the 2.6 worktree at once after a launcher retried; one owner session finished it.
 - Play-test of wave C: no holes, cracks or flicker at ring borders. Autopilot over 2 km: ~10 ms mean, max ~40 ms, one frame over 33 ms, none over 50 ms. The user found the terrain too flat to show the LOD and the textured far LOD noisy, and chose wave D (2.8 dramatic worldgen, 2.9 Distant-Horizons-style far look) before closing Stage 2.
 - Commits now follow scoped Conventional Commits (`type(scope): subject`, crate scopes); release automation reads them on main (PR #12). Wave PRs squash-merge.
+
+### 2026-10-17
+- Wave D: both GLM implementers hit the 5-hour limit, were resumed, then hung for ~7 h: a headless `claude -p` never wakes from a background task. The orchestrator finished 2.8/2.9 itself. Briefs now forbid background commands; `glm-watch <dir>` streams a GLM session's thinking and tool calls live.
+- Found by the real fly test over the new mountains: slopes crossing a horizontal LOD seam showed a contour line of holes (lids added to the mesher); the sea surface stepped up at every ring border (sea surface moved to y = 64, a multiple of 16); skirt faces carried layer + 32768 (the skirt key bit leaked into the layer field; harmless until 2.9's per-layer color buffer read out of bounds — black on lavapipe).
+- 2.10 after the play-test: coarse LOD was drawn next to the player because LOD0 streamed a fixed ±128-block window; windows now follow the terrain surface. Six rings (~16 km), F4 level tint, narrow beaches (~3% sand).
+- Play-test fixes: a cube reloaded under a ready ancestor drew again (coverage did not re-report an unchanged "hidden" verdict; two levels z-fought on water); faces between equal non-opaque blocks (water, glass) were all meshed.
+- The user does not approve the look yet: LOD too close, coarse shapes inaccurate, wants a playground with debug views and a code cleanup. Wave D merged as a checkpoint; wave E (2.11–2.14) is the redesign.

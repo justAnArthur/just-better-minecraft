@@ -70,7 +70,9 @@ impl DepthTarget {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -96,6 +98,77 @@ impl DepthTarget {
 
     pub fn view(&self) -> &wgpu::TextureView {
         &self.view
+    }
+
+    /// The last frame's per-pixel depths, row-major, `width * height`
+    /// f32s (task 2.10's test hook; reverse-Z, so
+    /// distance = [`crate::camera::NEAR`] / depth). Blocking: encodes one
+    /// texture→buffer copy of the whole target and maps it.
+    pub fn read_depth(&self, gpu: &Gpu) -> Vec<f32> {
+        let bytes_per_pixel = 4;
+        let unaligned = bytes_per_pixel * self.width;
+        let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT.max(bytes_per_pixel);
+        let padded = unaligned.div_ceil(alignment) * alignment;
+
+        let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("jbm depth readback"),
+            size: u64::from(padded) * u64::from(self.height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("jbm depth readback"),
+            });
+        encoder.copy_texture_to_buffer(
+            self.texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        gpu.queue.submit([encoder.finish()]);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        buffer.map_async(wgpu::MapMode::Read, .., move |result| {
+            let _ = sender.send(result);
+        });
+        let poll = gpu.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        assert!(poll.is_ok(), "device poll failed: {poll:?}");
+        receiver
+            .recv()
+            .expect("map callback dropped without sending")
+            .expect("buffer mapping failed");
+        let data = buffer
+            .slice(..)
+            .get_mapped_range()
+            .expect("range was just mapped for reading");
+        let mut depths = Vec::with_capacity((self.width * self.height) as usize);
+        let row_bytes = unaligned as usize;
+        for y in 0..self.height as usize {
+            let row = &data[y * padded as usize..y * padded as usize + row_bytes];
+            depths.extend(
+                row.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+            );
+        }
+        drop(data);
+        buffer.unmap();
+        depths
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -139,6 +212,14 @@ pub struct Renderer {
     viewport: (u32, u32),
     /// Sky color overrides (task 2.6 hole tests): linear RGB per slot.
     sky_override: Option<([f32; 4], [f32; 4], [f32; 4])>,
+    /// Whether terrain distance fog applies (task 2.9); `JBM_NO_FOG=1` at
+    /// construction, later `set_fog`. Propagated to the terrain pass every
+    /// frame — the flag rides in the terrain uniform.
+    fog: bool,
+    /// Whether the level tint applies (task 2.10); set by the app's F4
+    /// toggle / `JBM_LOD_TINT=1` at startup, propagated to the terrain
+    /// pass every frame like the fog flag.
+    lod_tint: bool,
 }
 
 impl Renderer {
@@ -175,9 +256,18 @@ impl Renderer {
             }],
         });
 
+        // The sky gradient snippet is concatenated ahead of the sky text so
+        // the terrain pass's fog can evaluate the identical function (WGSL
+        // has no includes; task 2.9). It has no dependencies, so leading
+        // with it is valid.
+        let sky_source = format!(
+            "{}{}",
+            include_str!("shaders/sky_gradient.wgsl"),
+            include_str!("shaders/sky.wgsl")
+        );
         let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("jbm sky"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/sky.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(sky_source.into()),
         });
         let sky_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("jbm sky layout"),
@@ -228,7 +318,36 @@ impl Renderer {
             outline,
             viewport: (1, 1),
             sky_override: None,
+            fog: !std::env::var_os("JBM_NO_FOG").is_some_and(|v| v == "1"),
+            lod_tint: false,
         }
+    }
+
+    /// Enables or disables terrain distance fog (task 2.9). Off via
+    /// `JBM_NO_FOG=1` at construction; screenshot tests use this to isolate
+    /// geometry from fog. Fog never touches the sky pass, so the sentinel
+    /// hole tests keep working with it on: a hole still shows the sentinel
+    /// sky, while fogged terrain dissolves into the horizon color.
+    pub fn set_fog(&mut self, enabled: bool) {
+        self.fog = enabled;
+    }
+
+    /// Whether distance fog is on (task 2.9).
+    pub fn fog(&self) -> bool {
+        self.fog
+    }
+
+    /// Enables or disables the level tint (task 2.10), the debug view
+    /// that multiplies every fragment by a fixed color per LOD level.
+    /// The app's F4 key toggles it; `JBM_LOD_TINT=1` starts it on.
+    /// Propagates to the terrain pass every frame like the fog flag.
+    pub fn set_lod_tint(&mut self, enabled: bool) {
+        self.lod_tint = enabled;
+    }
+
+    /// Whether the level tint is on (task 2.10).
+    pub fn lod_tint(&self) -> bool {
+        self.lod_tint
     }
 
     /// Overrides the sky colors (horizon, zenith, ground haze; linear
@@ -321,6 +440,11 @@ impl Renderer {
         }
 
         if let Some(terrain) = frame.terrain {
+            // The fog on/off hook rides along each frame (task 2.9): the
+            // terrain pass bakes it into its per-frame uniform. The level
+            // tint flag (task 2.10) rides the same way.
+            terrain.set_fog(self.fog);
+            terrain.set_lod_tint(self.lod_tint);
             terrain.draw(
                 gpu,
                 &mut encoder,

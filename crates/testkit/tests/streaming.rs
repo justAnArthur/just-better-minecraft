@@ -11,12 +11,14 @@ use jbm_core::coords::{BlockPos, CUBE_SIZE, CubePos};
 use jbm_core::physics::{MoveInput, PlayerState};
 use jbm_core::protocol::{ClientMsg, ServerMsg};
 use jbm_server::terrain::Generator;
+use jbm_server::worldgen::Preset;
 use jbm_server::{DEFAULT_SEED, ServerConfig};
 use jbm_testkit::{HeadlessServer, TestClient};
 
 /// The spec's streaming test shape: R = 3, V = 2, budgets 16.
 fn streaming_config(gen_threads: usize) -> ServerConfig {
     ServerConfig {
+        worldgen: Preset::Classic, // today's terrain, as before 2.8
         seed: DEFAULT_SEED,
         streaming: true,
         view_radius: 3,
@@ -28,6 +30,7 @@ fn streaming_config(gen_threads: usize) -> ServerConfig {
         world_dir: None,
         save_interval: std::time::Duration::from_secs(5),
         lod_levels: 4,
+        max_column_cubes: 0,
         lod_view_radius: 8,
         lod_vertical_radius: 3,
         lod_send_budget_per_tick: 32,
@@ -39,7 +42,7 @@ fn streaming_config(gen_threads: usize) -> ServerConfig {
 fn reference_generator() -> Generator {
     let mut registry = BlockRegistry::new();
     let blocks = Blocks::register(&mut registry);
-    Generator::new(DEFAULT_SEED, blocks)
+    Generator::with_preset(DEFAULT_SEED, blocks, Preset::Classic)
 }
 
 /// The cube containing a world position in block coordinates.
