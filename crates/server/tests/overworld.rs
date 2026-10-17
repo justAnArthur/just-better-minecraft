@@ -283,3 +283,155 @@ fn spawn_lands_on_gentle_land_for_ten_seeds() {
         );
     }
 }
+
+/// Task 2.10 E: the per-level accuracy of the coarse surface against the
+/// true surface. For a seeded sample of land columns, the height error
+/// `coarse_top − true_top` (the topmost solid cell of the level-*n*
+/// `sample_lod` cube over the column, minus `surface_height`) — mean and
+/// p99 per level 1..=6. The downsampling rule leans solid, so the errors
+/// sit mostly ≥ 0 and within the documented `2^n − 1` bias; the printed
+/// numbers are the task's report. Water cells count as surface (the sea
+/// is flat and aligned, so sea columns are skipped for the solid
+/// comparison instead).
+#[test]
+fn lod_surface_accuracy_per_level() {
+    let terrain = overworld(DEFAULT_SEED);
+    let blocks = blocks();
+    let spawn = terrain.spawn();
+    // A seeded sample of land columns within ±2 km of spawn.
+    let mut rng = XorShift64(0x00a1_1ce5_2a10);
+    let mut columns = Vec::new();
+    while columns.len() < 512 {
+        let x = spawn[0] as i64 + (rng.next() % 4096) as i64 - 2048;
+        let z = spawn[2] as i64 + (rng.next() % 4096) as i64 - 2048;
+        let h = terrain.surface_height(x, z);
+        if h >= SEA_LEVEL {
+            columns.push((x, z, h));
+        }
+    }
+
+    let mut cube_cache =
+        std::collections::HashMap::<(u8, CubePos), std::sync::Arc<jbm_core::cube::Cube>>::new();
+    for level in 1..=6u8 {
+        let cell = 1i64 << level;
+        let cube_side = i64::from(jbm_core::coords::CUBE_SIZE) * cell;
+        let mut errors: Vec<i64> = Vec::with_capacity(columns.len());
+        for &(x, z, h) in &columns {
+            // The level-n cube containing the column's true surface; the
+            // solid lean (at most 2^n - 1 blocks) can push the coarse top
+            // into the cube above, so scan that one too when needed.
+            let xz = (
+                x.div_euclid(cube_side) as i32,
+                z.div_euclid(cube_side) as i32,
+            );
+            let mut coarse_top = None;
+            for cube_y in [
+                h.div_euclid(cube_side) as i32,
+                h.div_euclid(cube_side) as i32 + 1,
+            ] {
+                let pos = CubePos {
+                    x: xz.0,
+                    y: cube_y,
+                    z: xz.1,
+                };
+                let cube = cube_cache
+                    .entry((level, pos))
+                    .or_insert_with(|| std::sync::Arc::new(terrain.sample_lod(level, pos)));
+                let local_x = ((x - i64::from(xz.0) * cube_side) / cell) as u8;
+                let local_z = ((z - i64::from(xz.1) * cube_side) / cell) as u8;
+                for local_y in (0..32u8).rev() {
+                    let state = cube.get(LocalPos::new_unchecked(local_x, local_y, local_z));
+                    if state != BlockStateId::AIR && state != blocks.water {
+                        coarse_top =
+                            Some(i64::from(cube_y) * cube_side + i64::from(local_y + 1) * cell - 1);
+                        break;
+                    }
+                }
+                if coarse_top.is_some() {
+                    break;
+                }
+            }
+            if let Some(coarse) = coarse_top {
+                errors.push(coarse - h);
+            }
+        }
+        errors.sort_unstable();
+        let mean = errors.iter().sum::<i64>() as f64 / errors.len() as f64;
+        let p99 = errors[(errors.len() * 99) / 100];
+        let min = errors[0];
+        println!(
+            "lod accuracy L{level}: n {} mean {mean:+.2} p99 {p99:+} min {min:+} \
+             (one-cell lean {})",
+            errors.len(),
+            1i64 << level
+        );
+        // The solid lean keeps the coarse surface over the true one on
+        // average (mean >= 0), with a p99 within two cells — the measured
+        // lean (e.g. L2 reaching +6 = 1.5 cells) compounds the sampled
+        // stride's own lean with the downsample's; the exact worst case
+        // is not derived here, the printed numbers are the measurement.
+        assert!(
+            p99 <= 2i64 << level,
+            "L{level} p99 {p99} beyond the two-cell sanity bound"
+        );
+        assert!(mean >= 0.0, "L{level} mean {mean} under the true surface");
+    }
+}
+
+/// Task 2.10 F: beaches stay narrow. The sand rule (`h <= SEA_LEVEL + 1`)
+/// makes every lowland column at the waterline sand; with the 2.8
+/// continental spline's gentle rise off the sea, flat lowland became
+/// huge sand plains. The 2.10 spline rises off the sea level quickly, so
+/// in the 8 km shape sample the sand columns are a small fraction of
+/// land — while coasts still show their beach rim.
+#[test]
+fn beaches_stay_narrow_but_coasts_still_show_sand() {
+    let terrain = overworld(DEFAULT_SEED);
+    let n = 500usize; // the shape sample's grid, 16-block spacing, 8 km
+    let at = |xi: usize, zi: usize| {
+        terrain.surface_height(
+            (xi as i64 - n as i64 / 2) * 16,
+            (zi as i64 - n as i64 / 2) * 16,
+        )
+    };
+    let mut land = 0usize;
+    let mut sand = 0usize;
+    let mut coastal_sand = 0usize;
+    for zi in 0..n {
+        for xi in 0..n {
+            let h = at(xi, zi);
+            if h < SEA_LEVEL {
+                continue; // sea (its floor is sand, but not "beach")
+            }
+            land += 1;
+            if h <= SEA_LEVEL + 1 {
+                sand += 1;
+                // A beach column near the water: some 4-neighbour in the
+                // sample is sea.
+                let sea_neighbor = [(zi > 0, xi, zi.saturating_sub(1)), (zi + 1 < n, xi, zi + 1)]
+                    .into_iter()
+                    .any(|(ok, x, z)| ok && at(x, z) < SEA_LEVEL)
+                    || [(xi > 0, xi.saturating_sub(1), zi), (xi + 1 < n, xi + 1, zi)]
+                        .into_iter()
+                        .any(|(ok, x, z)| ok && at(x, z) < SEA_LEVEL);
+                if sea_neighbor {
+                    coastal_sand += 1;
+                }
+            }
+        }
+    }
+    let fraction = sand as f64 / land as f64;
+    println!(
+        "beaches @ 8km: {sand} sand of {land} land columns ({fraction:.3}), \
+         {coastal_sand} coastal sand columns"
+    );
+    assert!(
+        fraction < 0.05,
+        "sand covers {:.1}% of land — the sand plains are back",
+        fraction * 100.0
+    );
+    assert!(
+        coastal_sand >= 100,
+        "only {coastal_sand} coastal sand columns — the beach rim vanished"
+    );
+}

@@ -61,6 +61,7 @@ fn edited_spawn_scene_matches_golden() {
         lod_vertical_radius: 3,
         lod_send_budget_per_tick: 32,
         lod_max_in_flight: 256,
+        ..ServerConfig::default()
     });
     let mut registry = BlockRegistry::new();
     let blocks = builtin::Blocks::register(&mut registry);

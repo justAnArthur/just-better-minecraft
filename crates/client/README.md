@@ -365,6 +365,21 @@ Every draw path shares the one fragment shader, so cpu-cull, gpu-cull
 and fallback stay pixel-identical under the far look (the rings
 path-equality tests cover it).
 
+### Level tint debug view (task 2.10)
+
+**F4** (or `JBM_LOD_TINT=1` at startup) multiplies every fragment by a
+fixed color per LOD level — one uniform flag (`TerrainUniforms.tint`),
+applied before shade and fog, identical on all three draw paths because
+they share the one fragment shader. LOD0 stays white; the others follow
+`LOD_TINT_COLORS` in `render/chunks.rs` (mirrored by `lod_tint` in
+`terrain.wgsl`): L1 (2×2×2 cells) red, L2 (4×4) yellow, L3 (8×8) green,
+L4 (16×16) cyan, L5 (32×32) blue, L6 (64×64) purple — never pure
+magenta, the hole-test sentinel. While it is on, the overlay shows the
+legend (`LOD TINT L1 2x2 red L2 4x4 yellow …`). Use it to see which
+level draws where; the rings test `level_tint_marks_each_drawn_level`
+pins that each level's color appears exactly where the coverage rule
+draws that level.
+
 ### Terrain rendering
 
 All cube meshes live in a few large face **pages**: one `STORAGE |
@@ -676,6 +691,7 @@ Above the horizon the color rises from horizon pale to zenith blue with
 | Shift | Fly down |
 | Ctrl | Sprint (walk 5.6, fly 22 blocks/s) |
 | F | Toggle fly (one edge per press) |
+| F4 | Toggle the LOD level tint debug view (task 2.10) |
 | Mouse | Look (while cursor grabbed) |
 | Left click | Grab + hide cursor (Locked, falls back to Confined); once grabbed, break the target block (hold to repeat every 0.25 s) |
 | Right click | Place the hotbar block against the targeted face (hold to repeat) |

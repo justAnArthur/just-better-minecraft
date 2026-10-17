@@ -149,6 +149,32 @@ pub struct TerrainUniforms {
     /// z = fog on (1.0) / off (0.0 — `Renderer::set_fog` / `JBM_NO_FOG`);
     /// w spare.
     pub far: [f32; 4],
+    /// Task 2.10 level tint. x = tint on (1.0) / off (0.0 — F4 /
+    /// `JBM_LOD_TINT=1`); the fragment shader multiplies each fragment by
+    /// [`LOD_TINT_COLORS`] at its cube's level. y, z, w spare.
+    pub tint: [f32; 4],
+}
+
+/// The level tint colors (task 2.10), linear RGB, indexed by LOD level;
+/// level 0 is white (untinted). One fixed color per level so a screenshot
+/// shows at a glance which level draws where: L1 (2×2×2 cells) red, L2
+/// (4×4) yellow, L3 (8×8) green, L4 (16×16) cyan, L5 (32×32) blue, L6
+/// (64×64) purple. Never pure magenta at any level: that is the hole
+/// sentinel the tests look for. Levels above the table clamp to the last
+/// entry.
+pub const LOD_TINT_COLORS: [[f32; 3]; 7] = [
+    [1.0, 1.0, 1.0],   // LOD0: untinted
+    [1.0, 0.0, 0.0],   // L1 2x2 red
+    [1.0, 1.0, 0.0],   // L2 4x4 yellow
+    [0.0, 1.0, 0.0],   // L3 8x8 green
+    [0.0, 1.0, 1.0],   // L4 16x16 cyan
+    [0.0, 0.0, 1.0],   // L5 32x32 blue
+    [0.55, 0.15, 1.0], // L6 64x64 purple (magenta-free)
+];
+
+/// The tint color of `level` (clamped at the last entry).
+pub fn lod_tint_color(level: u8) -> [f32; 3] {
+    LOD_TINT_COLORS[(level as usize).min(LOD_TINT_COLORS.len() - 1)]
 }
 
 /// Fractions of the ring radii the far look (task 2.9) keys on, mirrored
@@ -169,15 +195,20 @@ pub const FOG_END_FRACTION: f32 = 0.98;
 pub const AO_SOFTEN: [f32; 4] = [1.0, 0.6, 0.45, 0.3];
 
 /// Default view distances for the far look (task 2.9), matching the
-/// `ServerConfig` defaults (`view_radius` 8, `lod_levels` 4,
-/// `lod_view_radius` 8): the LOD0 ring radius and the furthest (level-4)
-/// ring radius, in blocks.
+/// `ServerConfig` defaults (`view_radius` 8, `lod_levels` 6 since task
+/// 2.10, `lod_view_radius` 8): the LOD0 ring radius and the furthest
+/// (level-6) ring radius, in blocks.
 pub const DEFAULT_LOD0_RING_RADIUS: f32 = 8.0 * CUBE_SIZE as f32;
-pub const DEFAULT_FURTHEST_RING_RADIUS: f32 = 8.0 * CUBE_SIZE as f32 * 16.0;
+pub const DEFAULT_FURTHEST_RING_RADIUS: f32 = 8.0 * CUBE_SIZE as f32 * 64.0;
 
 /// The `far` words of [`TerrainUniforms`] from the radii and fog flag.
 fn far_uniform_words(far_radii: [f32; 2], fog: bool) -> [f32; 4] {
     [far_radii[0], far_radii[1], if fog { 1.0 } else { 0.0 }, 0.0]
+}
+
+/// The `tint` words of [`TerrainUniforms`] from the tint flag (task 2.10).
+fn tint_uniform_words(tint: bool) -> [f32; 4] {
+    [if tint { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0]
 }
 
 /// The cull shader's per-frame uniform (group 1, binding 0 of cull.wgsl).
@@ -901,6 +932,9 @@ pub struct TerrainPass {
     /// Whether distance fog is on (task 2.9); propagated from
     /// `Renderer::set_fog` every frame.
     fog: bool,
+    /// Whether the level tint is on (task 2.10); propagated from
+    /// `Renderer::set_lod_tint` every frame.
+    lod_tint: bool,
     pages: Vec<FacePage>,
     /// Faces per page (every page is the same size).
     page_faces: u32,
@@ -1378,6 +1412,7 @@ impl TerrainPass {
             averages_buffer: textures.averages_buffer().clone(),
             far_radii: [DEFAULT_LOD0_RING_RADIUS, DEFAULT_FURTHEST_RING_RADIUS],
             fog: true,
+            lod_tint: false,
             pages: Vec::new(),
             page_faces,
             book: MeshBookkeeping::default(),
@@ -1778,9 +1813,34 @@ impl TerrainPass {
         self.fog = enabled;
     }
 
-    /// The far-look fields of the per-frame terrain uniform (task 2.9).
-    fn far_uniform_words(&self) -> [f32; 4] {
-        far_uniform_words(self.far_radii, self.fog)
+    /// Enables or disables the level tint (task 2.10). The F4 /
+    /// `JBM_LOD_TINT=1` hook propagates here every frame through the
+    /// renderer; every draw path shares the one fragment shader, so the
+    /// tint is identical on all three.
+    pub fn set_lod_tint(&mut self, enabled: bool) {
+        self.lod_tint = enabled;
+    }
+
+    /// Whether the level tint is on (task 2.10).
+    pub fn lod_tint(&self) -> bool {
+        self.lod_tint
+    }
+
+    /// The per-frame terrain uniform for `camera` (the one object both
+    /// draw paths write; task 2.10 gathered it into one place).
+    fn terrain_uniforms_for(&self, camera: &Camera) -> TerrainUniforms {
+        let (camera_cube, camera_frac) = camera_split(camera.position);
+        TerrainUniforms {
+            camera_cube: [camera_cube.x, camera_cube.y, camera_cube.z, 0],
+            camera_frac: [
+                camera_frac.x,
+                camera_frac.y,
+                camera_frac.z,
+                CUBE_SIZE as f32,
+            ],
+            far: far_uniform_words(self.far_radii, self.fog),
+            tint: tint_uniform_words(self.lod_tint),
+        }
     }
 
     pub fn stats(&self) -> TerrainStats {
@@ -1995,16 +2055,7 @@ impl TerrainPass {
 
         // The shared origin uniform (also read by the vertex shader).
         let (camera_cube, camera_frac) = camera_split(camera.position);
-        let terrain_uniforms = TerrainUniforms {
-            camera_cube: [camera_cube.x, camera_cube.y, camera_cube.z, 0],
-            camera_frac: [
-                camera_frac.x,
-                camera_frac.y,
-                camera_frac.z,
-                CUBE_SIZE as f32,
-            ],
-            far: self.far_uniform_words(),
-        };
+        let terrain_uniforms = self.terrain_uniforms_for(camera);
         gpu.queue.write_buffer(
             &self.terrain_uniforms,
             0,
@@ -2238,19 +2289,11 @@ impl TerrainPass {
         uniforms: &wgpu::BindGroup,
     ) {
         let (camera_cube, camera_frac) = camera_split(camera.position);
+        let terrain_uniforms = self.terrain_uniforms_for(camera);
         gpu.queue.write_buffer(
             &self.terrain_uniforms,
             0,
-            bytemuck::bytes_of(&TerrainUniforms {
-                camera_cube: [camera_cube.x, camera_cube.y, camera_cube.z, 0],
-                camera_frac: [
-                    camera_frac.x,
-                    camera_frac.y,
-                    camera_frac.z,
-                    CUBE_SIZE as f32,
-                ],
-                far: self.far_uniform_words(),
-            }),
+            bytemuck::bytes_of(&terrain_uniforms),
         );
 
         let frustum = Frustum::from_view_proj(&camera.view_proj());
@@ -2637,16 +2680,55 @@ mod tests {
 
     #[test]
     fn terrain_uniforms_layout_matches_wgsl() {
-        // The WGSL mirror (terrain.wgsl) is vec4i + vec4f + vec4f =
-        // 48 bytes, every field 16-byte aligned (task 2.9 added `far`).
-        assert_eq!(std::mem::size_of::<TerrainUniforms>(), 48);
+        // The WGSL mirror (terrain.wgsl) is vec4i + vec4f + vec4f + vec4f =
+        // 64 bytes, every field 16-byte aligned (task 2.9 added `far`,
+        // task 2.10 added `tint`).
+        assert_eq!(std::mem::size_of::<TerrainUniforms>(), 64);
         assert_eq!(std::mem::offset_of!(TerrainUniforms, camera_cube), 0);
         assert_eq!(std::mem::offset_of!(TerrainUniforms, camera_frac), 16);
         assert_eq!(std::mem::offset_of!(TerrainUniforms, far), 32);
+        assert_eq!(std::mem::offset_of!(TerrainUniforms, tint), 48);
         assert!(
             std::mem::size_of::<TerrainUniforms>().is_multiple_of(16),
             "no tail padding"
         );
+    }
+
+    /// The level tint colors (task 2.10): LOD0 white, every level's
+    /// zero-channel pattern unique (so a pixel identifies its level),
+    /// no two adjacent levels sharing a channel that stays, and never
+    /// pure magenta (the hole sentinel) anywhere.
+    #[test]
+    fn lod_tint_colors_identify_levels_and_avoid_magenta() {
+        assert_eq!(lod_tint_color(0), [1.0, 1.0, 1.0], "LOD0 untinted");
+        for level in 1..=6u8 {
+            let color = lod_tint_color(level);
+            assert!(
+                color != [1.0, 0.0, 1.0],
+                "level {level} must never tint pure magenta (the hole sentinel)"
+            );
+        }
+        // The zero-channel signature of each color is unique: red
+        // (r only), yellow (r,g), green (g only), cyan (g,b), blue (b
+        // only), purple (r reduced, b full).
+        let signatures: Vec<[bool; 3]> = (1..=6u8)
+            .map(|level| lod_tint_color(level).map(|c| c > 0.25))
+            .collect();
+        for i in 0..signatures.len() {
+            for j in i + 1..signatures.len() {
+                assert_ne!(
+                    signatures[i],
+                    signatures[j],
+                    "levels {} and {} are indistinguishable",
+                    i + 1,
+                    j + 1
+                );
+            }
+        }
+        // Above the table clamps to purple, still magenta-free.
+        assert_eq!(lod_tint_color(7), lod_tint_color(6));
+        assert_eq!(tint_uniform_words(true), [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(tint_uniform_words(false), [0.0; 4]);
     }
 
     /// The far-look uniform words follow the radii and fog flag exactly
@@ -2666,12 +2748,12 @@ mod tests {
             [64.0, 1280.0, 0.0, 0.0]
         );
         // The defaults follow the ServerConfig defaults' shape at any cube
-        // size: 8 cubes for the LOD0 ring, and the level-4 disk (16x
-        // coarser) for the furthest.
+        // size: 8 cubes for the LOD0 ring, and the level-6 disk (64x
+        // coarser, task 2.10) for the furthest.
         assert_eq!(DEFAULT_LOD0_RING_RADIUS, 8.0 * CUBE_SIZE as f32);
         assert_eq!(
             DEFAULT_FURTHEST_RING_RADIUS,
-            DEFAULT_LOD0_RING_RADIUS * 16.0
+            DEFAULT_LOD0_RING_RADIUS * 64.0
         );
     }
 

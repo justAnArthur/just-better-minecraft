@@ -483,6 +483,40 @@ impl Generator {
         Some(grid)
     }
 
+    /// The minimum and maximum [`Generator::surface_height`] over cube
+    /// column `(cx, cz)`'s 32² block columns — the surface span task 2.10
+    /// streams by. Banded graphs (the shipped ones) read the cached
+    /// per-column heights, so a column already generated costs nothing and
+    /// a fresh one costs about one mixed cube's evaluation; unbanded
+    /// graphs evaluate their (typically tiny, test-made) columns directly.
+    pub fn column_surface_bounds(&self, cx: i32, cz: i32) -> (i64, i64) {
+        match self.column_data(cx, cz) {
+            ColumnData::Bits { heights, .. } => {
+                let mut min = i64::MAX;
+                let mut max = i64::MIN;
+                for &h in heights.iter() {
+                    min = min.min(h);
+                    max = max.max(h);
+                }
+                (min, max)
+            }
+            ColumnData::Live(_) => {
+                let base_x = i64::from(cx) * i64::from(CUBE_SIZE);
+                let base_z = i64::from(cz) * i64::from(CUBE_SIZE);
+                let mut min = i64::MAX;
+                let mut max = i64::MIN;
+                for z in 0..i64::from(CUBE_SIZE) {
+                    for x in 0..i64::from(CUBE_SIZE) {
+                        let h = self.surface_height(base_x + x, base_z + z);
+                        min = min.min(h);
+                        max = max.max(h);
+                    }
+                }
+                (min, max)
+            }
+        }
+    }
+
     /// The terrain cube at `pos`. Fast paths from the graph's interval
     /// bounds (seed-independent): a cube whose density maximum is below 0 is
     /// uniform air; one whose minimum — over the cube extended 4 cells up,

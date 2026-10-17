@@ -6,6 +6,7 @@ pub mod gen_pool;
 pub mod lod;
 pub mod run;
 pub mod server;
+pub(crate) mod spans;
 pub mod storage;
 mod streaming;
 pub mod terrain;

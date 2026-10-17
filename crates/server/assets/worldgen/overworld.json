@@ -1,144 +1,350 @@
 {
-  "version": 1,
-  "nodes": {
-    "warp_x": {
-      "type": "fbm2",
-      "salt": "0x8A5B7C3E9F1D2046",
-      "scale": 0.0011,
-      "octaves": 3
-    },
-    "warp_z": {
-      "type": "fbm2",
-      "salt": "0x3C6E9A1D5F7B8024",
-      "scale": 0.0011,
-      "octaves": 3
-    },
-    "warp_x_blocks": { "type": "mul", "a": { "ref": "warp_x" }, "b": 300 },
-    "warp_z_blocks": { "type": "mul", "a": { "ref": "warp_z" }, "b": 300 },
-
-    "cont": {
-      "type": "fbm2",
-      "salt": "0xB4C1D2E3F4A50617",
-      "scale": 0.00035,
-      "octaves": 4,
-      "x_offset": { "ref": "warp_x_blocks" },
-      "z_offset": { "ref": "warp_z_blocks" }
-    },
-    "base": {
-      "type": "spline",
-      "input": { "ref": "cont" },
-      "points": [
-        [-0.71, 28.0],
-        [-0.42, 30.0],
-        [-0.28, 38.0],
-        [-0.14, 52.0],
-        [-0.09, 63.0],
-        [0.0, 66.0],
-        [0.08, 69.0],
-        [0.2, 72.0],
-        [0.35, 76.0],
-        [0.5, 79.0]
-      ]
-    },
-
-    "ero": {
-      "type": "fbm2",
-      "salt": "0x7E8F90A1B2C3D4E5",
-      "scale": 0.0002,
-      "octaves": 2,
-      "x_offset": { "ref": "warp_x_blocks" },
-      "z_offset": { "ref": "warp_z_blocks" }
-    },
-    "rugged": {
-      "type": "spline",
-      "input": { "ref": "ero" },
-      "points": [
-        [-0.71, 0.0],
-        [-0.06, 0.0],
-        [0.16, 1.0],
-        [0.71, 1.0]
-      ]
-    },
-
-    "ridge": {
-      "type": "ridged2",
-      "salt": "0x51A6D2C384E5F607",
-      "scale": 0.0013,
-      "octaves": 5,
-      "gain": 2.0,
-      "x_offset": { "ref": "warp_x_blocks" },
-      "z_offset": { "ref": "warp_z_blocks" }
-    },
-    "ridge_sq": { "type": "mul", "a": { "ref": "ridge" }, "b": { "ref": "ridge" } },
-    "shape": {
-      "type": "spline",
-      "input": { "ref": "ridge_sq" },
-      "points": [
-        [0.0, 0.0],
-        [0.15, 0.05],
-        [0.3, 0.18],
-        [0.42, 0.32],
-        [0.5, 0.4],
-        [0.6, 0.55],
-        [0.75, 0.78],
-        [0.9, 0.93],
-        [1.0, 0.95]
-      ]
-    },
-
-    "valley": {
-      "type": "fbm2",
-      "salt": "0x2F4E6D8C1A3B5C7E",
-      "scale": 0.0007,
-      "octaves": 2,
-      "x_offset": { "ref": "warp_x_blocks" },
-      "z_offset": { "ref": "warp_z_blocks" }
-    },
-    "channel": {
-      "type": "clamp",
-      "input": { "type": "mul", "a": { "type": "abs", "a": { "ref": "valley" } }, "b": 12 },
-      "min": 0,
-      "max": 1
-    },
-    "keep": { "type": "add", "a": 0.35, "b": { "type": "mul", "a": 0.65, "b": { "ref": "channel" } } },
-
-    "land_gate": {
-      "type": "spline",
-      "input": { "ref": "cont" },
-      "points": [
-        [-0.71, 0.0],
-        [-0.12, 0.0],
-        [0.0, 1.0],
-        [0.71, 1.0]
-      ]
-    },
-    "scale_m": {
-      "type": "mul",
-      "a": { "type": "mul", "a": { "ref": "land_gate" }, "b": { "ref": "rugged" } },
-      "b": { "ref": "keep" }
-    },
-    "mountains": { "type": "mul", "a": { "type": "mul", "a": 340, "b": { "ref": "shape" } }, "b": { "ref": "scale_m" } },
-
-    "detail_n": {
-      "type": "fbm2",
-      "salt": "0x9C3B7D5FE1A28406",
-      "scale": 0.016,
-      "octaves": 3
-    },
-    "detail": {
-      "type": "mul",
-      "a": { "type": "add", "a": 2, "b": { "type": "mul", "a": 7, "b": { "ref": "rugged" } } },
-      "b": { "ref": "detail_n" }
-    },
-
-    "total": {
-      "type": "add",
-      "a": { "type": "add", "a": { "ref": "base" }, "b": { "ref": "mountains" } },
-      "b": { "ref": "detail" }
-    },
-    "surface": { "type": "floor", "a": { "type": "add", "a": { "ref": "total" }, "b": 0.5 } }
+ "version": 1,
+ "nodes": {
+  "warp_x": {
+   "type": "fbm2",
+   "salt": "0x8A5B7C3E9F1D2046",
+   "scale": 0.0011,
+   "octaves": 3
   },
-  "outputs": {
-    "final_density": { "type": "sub", "a": { "ref": "surface" }, "b": { "type": "y" } }
+  "warp_z": {
+   "type": "fbm2",
+   "salt": "0x3C6E9A1D5F7B8024",
+   "scale": 0.0011,
+   "octaves": 3
+  },
+  "warp_x_blocks": {
+   "type": "mul",
+   "a": {
+    "ref": "warp_x"
+   },
+   "b": 300
+  },
+  "warp_z_blocks": {
+   "type": "mul",
+   "a": {
+    "ref": "warp_z"
+   },
+   "b": 300
+  },
+  "cont": {
+   "type": "fbm2",
+   "salt": "0xB4C1D2E3F4A50617",
+   "scale": 0.00035,
+   "octaves": 4,
+   "x_offset": {
+    "ref": "warp_x_blocks"
+   },
+   "z_offset": {
+    "ref": "warp_z_blocks"
+   }
+  },
+  "base": {
+   "type": "spline",
+   "input": {
+    "ref": "cont"
+   },
+   "points": [
+    [
+     -0.71,
+     28.0
+    ],
+    [
+     -0.42,
+     30.0
+    ],
+    [
+     -0.28,
+     38.0
+    ],
+    [
+     -0.14,
+     52.0
+    ],
+    [
+     -0.07,
+     59.0
+    ],
+    [
+     -0.04,
+     62.5
+    ],
+    [
+     -0.01,
+     67.0
+    ],
+    [
+     0.03,
+     70.0
+    ],
+    [
+     0.08,
+     72.0
+    ],
+    [
+     0.2,
+     74.0
+    ],
+    [
+     0.35,
+     76.5
+    ],
+    [
+     0.5,
+     79.0
+    ]
+   ]
+  },
+  "ero": {
+   "type": "fbm2",
+   "salt": "0x7E8F90A1B2C3D4E5",
+   "scale": 0.0002,
+   "octaves": 2,
+   "x_offset": {
+    "ref": "warp_x_blocks"
+   },
+   "z_offset": {
+    "ref": "warp_z_blocks"
+   }
+  },
+  "rugged": {
+   "type": "spline",
+   "input": {
+    "ref": "ero"
+   },
+   "points": [
+    [
+     -0.71,
+     0.0
+    ],
+    [
+     -0.06,
+     0.0
+    ],
+    [
+     0.16,
+     1.0
+    ],
+    [
+     0.71,
+     1.0
+    ]
+   ]
+  },
+  "ridge": {
+   "type": "ridged2",
+   "salt": "0x51A6D2C384E5F607",
+   "scale": 0.0013,
+   "octaves": 5,
+   "gain": 2.0,
+   "x_offset": {
+    "ref": "warp_x_blocks"
+   },
+   "z_offset": {
+    "ref": "warp_z_blocks"
+   }
+  },
+  "ridge_sq": {
+   "type": "mul",
+   "a": {
+    "ref": "ridge"
+   },
+   "b": {
+    "ref": "ridge"
+   }
+  },
+  "shape": {
+   "type": "spline",
+   "input": {
+    "ref": "ridge_sq"
+   },
+   "points": [
+    [
+     0.0,
+     0.0
+    ],
+    [
+     0.15,
+     0.05
+    ],
+    [
+     0.3,
+     0.18
+    ],
+    [
+     0.42,
+     0.32
+    ],
+    [
+     0.5,
+     0.4
+    ],
+    [
+     0.6,
+     0.55
+    ],
+    [
+     0.75,
+     0.78
+    ],
+    [
+     0.9,
+     0.93
+    ],
+    [
+     1.0,
+     0.95
+    ]
+   ]
+  },
+  "valley": {
+   "type": "fbm2",
+   "salt": "0x2F4E6D8C1A3B5C7E",
+   "scale": 0.0007,
+   "octaves": 2,
+   "x_offset": {
+    "ref": "warp_x_blocks"
+   },
+   "z_offset": {
+    "ref": "warp_z_blocks"
+   }
+  },
+  "channel": {
+   "type": "clamp",
+   "input": {
+    "type": "mul",
+    "a": {
+     "type": "abs",
+     "a": {
+      "ref": "valley"
+     }
+    },
+    "b": 12
+   },
+   "min": 0,
+   "max": 1
+  },
+  "keep": {
+   "type": "add",
+   "a": 0.35,
+   "b": {
+    "type": "mul",
+    "a": 0.65,
+    "b": {
+     "ref": "channel"
+    }
+   }
+  },
+  "land_gate": {
+   "type": "spline",
+   "input": {
+    "ref": "cont"
+   },
+   "points": [
+    [
+     -0.71,
+     0.0
+    ],
+    [
+     -0.12,
+     0.0
+    ],
+    [
+     0.0,
+     1.0
+    ],
+    [
+     0.71,
+     1.0
+    ]
+   ]
+  },
+  "scale_m": {
+   "type": "mul",
+   "a": {
+    "type": "mul",
+    "a": {
+     "ref": "land_gate"
+    },
+    "b": {
+     "ref": "rugged"
+    }
+   },
+   "b": {
+    "ref": "keep"
+   }
+  },
+  "mountains": {
+   "type": "mul",
+   "a": {
+    "type": "mul",
+    "a": 340,
+    "b": {
+     "ref": "shape"
+    }
+   },
+   "b": {
+    "ref": "scale_m"
+   }
+  },
+  "detail_n": {
+   "type": "fbm2",
+   "salt": "0x9C3B7D5FE1A28406",
+   "scale": 0.016,
+   "octaves": 3
+  },
+  "detail": {
+   "type": "mul",
+   "a": {
+    "type": "add",
+    "a": 2,
+    "b": {
+     "type": "mul",
+     "a": 7,
+     "b": {
+      "ref": "rugged"
+     }
+    }
+   },
+   "b": {
+    "ref": "detail_n"
+   }
+  },
+  "total": {
+   "type": "add",
+   "a": {
+    "type": "add",
+    "a": {
+     "ref": "base"
+    },
+    "b": {
+     "ref": "mountains"
+    }
+   },
+   "b": {
+    "ref": "detail"
+   }
+  },
+  "surface": {
+   "type": "floor",
+   "a": {
+    "type": "add",
+    "a": {
+     "ref": "total"
+    },
+    "b": 0.5
+   }
   }
+ },
+ "outputs": {
+  "final_density": {
+   "type": "sub",
+   "a": {
+    "ref": "surface"
+   },
+   "b": {
+    "type": "y"
+   }
+  }
+ }
 }

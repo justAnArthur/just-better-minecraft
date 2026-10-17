@@ -25,6 +25,7 @@ fn config() -> ServerConfig {
         world_dir: None,
         save_interval: std::time::Duration::from_secs(5),
         lod_levels: 4,
+        max_column_cubes: 0,
         lod_view_radius: 8,
         lod_vertical_radius: 3,
         lod_send_budget_per_tick: 32,

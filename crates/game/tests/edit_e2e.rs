@@ -32,6 +32,7 @@ fn config() -> ServerConfig {
         lod_vertical_radius: 3,
         lod_send_budget_per_tick: 32,
         lod_max_in_flight: 256,
+        ..ServerConfig::default()
     }
 }
 

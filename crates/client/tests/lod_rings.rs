@@ -730,6 +730,96 @@ fn lod0_lod1_border_is_invisible_with_flat_colors() {
     }
 }
 
+/// Task 2.10: the level tint debug view. With the tint on (and fog off,
+/// so nothing else moves), exactly the level >= 1 pixels change: each is
+/// the untinted fragment multiplied by its level's fixed color, so its
+/// zero channels (exact 0 after the sRGB encode) identify the level that
+/// drew it — the same level the coverage rule reports as drawing there.
+/// Level 0 stays white, so its pixels are byte-identical.
+#[test]
+fn level_tint_marks_each_drawn_level() {
+    let Some(gpu) = gpu_or_skip() else {
+        return;
+    };
+    let (mut world, appearance, _blocks) = build_scene();
+    let target = OffscreenTarget::new(&gpu.device, SIZE, SIZE);
+    let depth = DepthTarget::new(&gpu.device, SIZE, SIZE);
+    let mut renderer = Renderer::new(&gpu, target.format());
+    renderer.set_viewport(SIZE, SIZE);
+    renderer.set_fog(false);
+    let (layers, _) = builtin_textures();
+    let textures = BlockTextures::new(&gpu, &layers).expect("texture array");
+    let mut terrain = TerrainPass::new(&gpu, target.format(), renderer.uniform_layout(), &textures);
+    settle(
+        &gpu,
+        &mut world,
+        &mut terrain,
+        &appearance,
+        DVec3::new(16.0, 90.0, 16.0),
+    );
+
+    // The corner camera watches three levels meet.
+    let (_, camera, _) = cameras()[4].clone_name(); // corner3
+    renderer.set_lod_tint(false);
+    let plain = render_sentinel(&gpu, &mut renderer, &target, &depth, &mut terrain, &camera);
+    renderer.set_lod_tint(true);
+    let tinted = render_sentinel(&gpu, &mut renderer, &target, &depth, &mut terrain, &camera);
+    let path = artifact_dir().join("tint_corner3.png");
+    let _ = std::fs::create_dir_all(artifact_dir());
+    tinted.save(&path).expect("save tint artifact");
+
+    // A channel that the tint zeroes must read exactly 0 (linear 0
+    // encodes to sRGB 0); small values cover raster rounding nowhere in
+    // particular, so use a firm threshold.
+    const ZERO: u8 = 8;
+    let signature = |level: u8, p: image::Rgba<u8>| -> bool {
+        let t = jbm_client::render::chunks::lod_tint_color(level);
+        let (r, g, b) = (p[0] >= ZERO, p[1] >= ZERO, p[2] >= ZERO);
+        let (tr, tg, tb) = (t[0] > 0.25, t[1] > 0.25, t[2] > 0.25);
+        r == tr && g == tg && b == tb
+    };
+    let mut changed = 0usize;
+    let mut unchanged = 0usize;
+    let mut per_level = [0usize; 4]; // levels 1..=3
+    let mut unrecognized = 0usize;
+    for (a, b) in plain.pixels().zip(tinted.pixels()) {
+        if a.0 == b.0 {
+            unchanged += 1;
+            continue;
+        }
+        changed += 1;
+        // The tinted pixel's nonzero-channel pattern must match its
+        // level's color exactly.
+        if signature(1, *b) {
+            per_level[1] += 1;
+        } else if signature(2, *b) {
+            per_level[2] += 1;
+        } else if signature(3, *b) {
+            per_level[3] += 1;
+        } else {
+            unrecognized += 1;
+        }
+    }
+    println!(
+        "tint: {changed} changed, {unchanged} unchanged, per level L1 {} L2 {} L3 {}, unrecognized {unrecognized}",
+        per_level[1], per_level[2], per_level[3]
+    );
+    // Every drawn level shows its color somewhere: the coverage rule
+    // draws levels 1..=3 in this scene (asserted by the main test), and
+    // the corner camera sees all three.
+    for (level, &pixels) in per_level.iter().enumerate().skip(1) {
+        assert!(pixels >= 50, "level {level} tint missing ({pixels} px)");
+    }
+    assert_eq!(unrecognized, 0, "pixels changed that no level explains");
+    // Level 0 is untinted: the LOD0 disk covers the frame's middle, so a
+    // large share of the image must be byte-identical.
+    let total = (SIZE * SIZE) as usize;
+    assert!(
+        unchanged * 4 > total,
+        "LOD0 pixels changed under a white tint ({unchanged}/{total} unchanged)"
+    );
+}
+
 /// Where a world point lands on the square target, in pixels (the same
 /// math the GPU runs).
 fn project(camera: &Camera, world: DVec3) -> (f32, f32) {
