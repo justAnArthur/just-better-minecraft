@@ -884,14 +884,26 @@ fn rings_scene_paths_render_pixel_identical() {
                     .zip(image.pixels())
                     .filter(|(a, b)| a.0 != b.0)
                     .count();
-                assert_eq!(
-                    differing, 0,
+                // Level >= 1 quads are expanded by 1/512 block to close
+                // T-junction hairlines, so a top face and a side face
+                // overlap along convex edges; a pixel center landing
+                // exactly on such an edge is a depth tie that the draw
+                // order (which differs between paths) resolves. Lavapipe
+                // hits one such pixel in this scene since the six-level
+                // rings; allow two, so any real path divergence (a
+                // missing cube, a wrong mask) still fails.
+                assert!(
+                    differing <= EDGE_TIE_PIXELS,
                     "{path:?} vs {reference_path:?}: {differing} pixels differ"
                 );
             }
         }
     }
 }
+
+/// Pixels the draw paths may disagree on: depth ties on the edges the
+/// sub-pixel quad expansion overlaps (see the path-identity test).
+const EDGE_TIE_PIXELS: usize = 2;
 
 /// A single LOD1 cube renders like its LOD0 pattern scaled x2, on every
 /// path. The pattern is 2-aligned so the downsampling rule reproduces it
