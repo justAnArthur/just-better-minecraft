@@ -6,7 +6,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use jbm_core::block::{BlockRegistry, BlockStateId, builtin::Blocks};
+use jbm_core::block::BlockStateId;
+use jbm_core::block::builtin::Blocks;
 use jbm_core::coords::{BlockPos, CUBE_SIZE, CubePos, LocalPos};
 use jbm_core::cube::Cube;
 use jbm_core::link::{ClientLink, in_process_pair};
@@ -17,29 +18,11 @@ use jbm_server::storage::Storage;
 use jbm_server::terrain::Generator;
 use jbm_server::worldgen::Preset;
 use jbm_server::{DEFAULT_SEED, Server, ServerConfig};
+use jbm_testkit::{XorShift64, builtin_blocks};
 
 /// The builtin block states, against a fresh registry.
 fn blocks() -> Blocks {
-    Blocks::register(&mut BlockRegistry::new())
-}
-
-/// Small local xorshift, so tests never need the `rand` crate.
-struct XorShift64(u64);
-
-impl XorShift64 {
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
-
-    /// A value in `0..n`.
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
+    builtin_blocks()
 }
 
 /// A small-radius inline-generation streaming server with the pyramid on.
@@ -2420,7 +2403,7 @@ fn lod0_generation_is_not_delayed_by_a_lod_backlog() {
 /// builtin blocks, open (creating) the database, declare the worldgen
 /// fingerprint so stored LOD records are usable.
 fn open_lod_storage(dir: &std::path::Path) -> Arc<Storage> {
-    let mut registry = BlockRegistry::new();
+    let mut registry = jbm_core::block::BlockRegistry::new();
     let _ = Blocks::register(&mut registry);
     let storage = Storage::open(dir, &registry, DEFAULT_SEED).unwrap();
     storage

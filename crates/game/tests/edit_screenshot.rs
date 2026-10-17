@@ -21,19 +21,13 @@ use jbm_core::protocol::{ClientMsg, ServerMsg};
 use jbm_server::terrain::Generator;
 use jbm_server::worldgen::Preset;
 use jbm_server::{DEFAULT_SEED, ServerConfig};
-use jbm_testkit::HeadlessServer;
+use jbm_testkit::{HeadlessServer, desired_cube_count};
 
-/// Cubes in the streaming shape for R = 3, V = 2: 29 columns of 5.
-const DESIRED_CUBES: usize = 29 * 5;
-
-#[test]
+/// The scene's server: R = 3, V = 2, inline generation (keeps the
+/// streamed set deterministic), no LOD rings.
 #[cfg(not(feature = "cube16"))] // streaming shape and golden are 32³-only
-fn edited_spawn_scene_matches_golden() {
-    let Some(gpu) = gpu_or_skip() else {
-        return;
-    };
-
-    let mut server = HeadlessServer::with_config(ServerConfig {
+fn server_config() -> ServerConfig {
+    ServerConfig {
         worldgen: Preset::Classic, // pin the pre-2.8 terrain: this golden predates it
         seed: DEFAULT_SEED,
         streaming: true,
@@ -51,7 +45,17 @@ fn edited_spawn_scene_matches_golden() {
         lod_send_budget_per_tick: 32,
         lod_max_in_flight: 256,
         ..ServerConfig::default()
-    });
+    }
+}
+
+#[test]
+#[cfg(not(feature = "cube16"))] // streaming shape and golden are 32³-only
+fn edited_spawn_scene_matches_golden() {
+    let Some(gpu) = gpu_or_skip() else {
+        return;
+    };
+
+    let mut server = HeadlessServer::with_config(server_config());
     let mut registry = BlockRegistry::new();
     let blocks = builtin::Blocks::register(&mut registry);
     let generator = Generator::with_preset(DEFAULT_SEED, blocks, Preset::Classic);
@@ -68,13 +72,13 @@ fn edited_spawn_scene_matches_golden() {
             }
             world.apply(&msg);
         }
-        if client.loaded().len() == DESIRED_CUBES {
+        if client.loaded().len() == desired_cube_count(&server_config()) {
             break;
         }
     }
     assert_eq!(
         client.loaded().len(),
-        DESIRED_CUBES,
+        desired_cube_count(&server_config()),
         "streaming did not settle"
     );
     let spawn = spawn.expect("no Welcome");

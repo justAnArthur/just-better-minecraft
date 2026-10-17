@@ -869,6 +869,7 @@ dependencies = [
  "image",
  "jbm-core",
  "jbm-server",
+ "jbm-testkit",
  "redb",
  "serde",
  "serde_json",

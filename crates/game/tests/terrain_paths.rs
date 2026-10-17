@@ -30,10 +30,7 @@ use jbm_core::protocol::{ClientMsg, ServerMsg};
 use jbm_server::terrain::Generator;
 use jbm_server::worldgen::Preset;
 use jbm_server::{DEFAULT_SEED, ServerConfig};
-use jbm_testkit::HeadlessServer;
-
-/// Cubes in the streaming shape for R = 3, V = 2: 29 columns of 5.
-const DESIRED_CUBES: usize = 29 * 5;
+use jbm_testkit::{HeadlessServer, desired_cube_count};
 
 fn server_config() -> ServerConfig {
     ServerConfig {
@@ -76,13 +73,13 @@ fn streamed_scene(
             }
             world.apply(&msg);
         }
-        if client.loaded().len() == DESIRED_CUBES {
+        if client.loaded().len() == desired_cube_count(&server_config()) {
             break;
         }
     }
     assert_eq!(
         client.loaded().len(),
-        DESIRED_CUBES,
+        desired_cube_count(&server_config()),
         "streaming did not settle"
     );
     let spawn = spawn.expect("no Welcome");

@@ -28,6 +28,10 @@ tempfile.workspace = true
 # Self dev-dependency so `tests/` and `benches/` can enable the
 # `reference` feature.
 jbm-server = { path = ".", features = ["reference"] }
+# Shared test fixtures (xorshift, builtin blocks) for the integration
+# tests. A dev-dependency cycle with jbm-testkit (which depends on this
+# crate) is fine — it never enters the shipping build.
+jbm-testkit.workspace = true
 # The worldgen preview example's PNG output; the workspace's pinned
 # version, already a dependency of the client and game crates.
 image.workspace = true

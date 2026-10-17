@@ -33,6 +33,20 @@ driven by a manual, deterministic time source, plus in-process
   `unload_count()` are totals for assertions (zero unloads is the
   hysteresis check).
 
+**Shared fixtures** (the copies several test suites had grown):
+
+- `XorShift64(seed)` — the small seeded xorshift (`next() -> u64`,
+  `below(n) -> u64` in `0..n`) integration tests use instead of the
+  `rand` crate. Unit-test copies inside `#[cfg(test)]` modules may stay.
+- `builtin_blocks() -> Blocks` — the builtin block states registered
+  against a fresh registry, the fixture every server-side scene starts
+  from.
+- `desired_cube_count(&ServerConfig) -> usize` — how many cubes a
+  settled player holds under the config's streaming shape (the
+  `view_radius` disk of columns × `2·vertical_radius + 1` tall; 29 × 5
+  at the tests' R = 3, V = 2). The tests that wait for streaming to
+  settle assert on exactly this.
+
 ## Writing a headless test
 
 Put integration tests in `tests/` (see `tests/headless.rs` for the clock,

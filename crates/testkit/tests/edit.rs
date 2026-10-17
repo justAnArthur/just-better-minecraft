@@ -8,7 +8,7 @@ use jbm_core::physics::MoveInput;
 use jbm_core::protocol::{ClientMsg, ServerMsg};
 use jbm_server::worldgen::Preset;
 use jbm_server::{DEFAULT_SEED, ServerConfig};
-use jbm_testkit::HeadlessServer;
+use jbm_testkit::{HeadlessServer, desired_cube_count};
 
 /// The streaming shape of the spec: R = 3, V = 2, inline generation.
 fn config() -> ServerConfig {
@@ -33,9 +33,6 @@ fn config() -> ServerConfig {
     }
 }
 
-/// Cubes in the desired set for R = 3, V = 2: 29 columns of 5.
-const DESIRED_CUBES: usize = 29 * 5;
-
 #[test]
 fn a_place_reaches_every_holder_within_one_tick_and_nobody_else() {
     let mut server = HeadlessServer::with_config(config());
@@ -53,16 +50,28 @@ fn a_place_reaches_every_holder_within_one_tick_and_nobody_else() {
         for client in [&mut a, &mut b, &mut far] {
             client.drain();
         }
-        if a.loaded().len() == DESIRED_CUBES
-            && b.loaded().len() == DESIRED_CUBES
-            && far.loaded().len() == DESIRED_CUBES
+        if a.loaded().len() == desired_cube_count(&config())
+            && b.loaded().len() == desired_cube_count(&config())
+            && far.loaded().len() == desired_cube_count(&config())
         {
             break;
         }
     }
-    assert_eq!(a.loaded().len(), DESIRED_CUBES, "alice never settled");
-    assert_eq!(b.loaded().len(), DESIRED_CUBES, "bob never settled");
-    assert_eq!(far.loaded().len(), DESIRED_CUBES, "carol never settled");
+    assert_eq!(
+        a.loaded().len(),
+        desired_cube_count(&config()),
+        "alice never settled"
+    );
+    assert_eq!(
+        b.loaded().len(),
+        desired_cube_count(&config()),
+        "bob never settled"
+    );
+    assert_eq!(
+        far.loaded().len(),
+        desired_cube_count(&config()),
+        "carol never settled"
+    );
 
     // Fly carol far away: well beyond the keep radius (R + 1 = 4 cubes =
     // 128 blocks), cruising high above the terrain.

@@ -4,12 +4,58 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use jbm_core::block::builtin::Blocks;
 use jbm_core::coords::CubePos;
 use jbm_core::link::{ClientLink, LinkClosed};
 use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION, PlayerId, ServerMsg};
 use jbm_server::Server;
 use jbm_server::server::ServerConfig;
 use jbm_server::tick::TICK_PERIOD;
+
+/// Small local xorshift, so tests never need the `rand` crate.
+pub struct XorShift64(pub u64);
+
+impl XorShift64 {
+    /// Not `Iterator::next`: a plain seeded rng step, not an iterator.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    /// A value in `0..n`.
+    pub fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+/// The builtin block states, registered against a fresh registry — the
+/// fixture every server-side scene starts from.
+pub fn builtin_blocks() -> Blocks {
+    let mut registry = jbm_core::block::BlockRegistry::new();
+    Blocks::register(&mut registry)
+}
+
+/// How many cubes a settled player holds under `config`'s streaming
+/// shape: the `view_radius` disk of columns, each `2·vertical_radius + 1`
+/// cubes tall (29 × 5 at the tests' R = 3, V = 2). Integration tests wait
+/// for exactly this many `CubeData` messages.
+pub fn desired_cube_count(config: &ServerConfig) -> usize {
+    let r = i64::from(config.view_radius);
+    let mut columns = 0usize;
+    for dx in -r..=r {
+        for dz in -r..=r {
+            if dx * dx + dz * dz <= r * r {
+                columns += 1;
+            }
+        }
+    }
+    columns * (2 * config.vertical_radius as usize + 1)
+}
 
 /// A headless server driven by a manual, deterministic time source.
 ///
