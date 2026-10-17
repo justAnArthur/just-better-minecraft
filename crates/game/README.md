@@ -118,6 +118,20 @@ speed for `<blocks>` blocks through the normal `PlayerInput` path
 printing a frame-time summary (count, mean, p50, p95, p99, max, frames
 over 33 ms and over 50 ms).
 
+**Surface-following windows (task 2.10).**
+`tests/surface_windows.rs` covers the 2.10 streaming fix on the real
+overworld: it deterministically finds a valley with a ≥90-block wall
+within 160 blocks (the play-test's geometry), streams a threaded server
+there and asserts (1) every surface cube of the LOD0 disk — sampled
+five blocks per cube column — was sent, and (2) with the client's level
+tint on, no pixel whose depth places it within 200 blocks of the camera
+is drawn by a LOD ring (per-pixel distance via `DepthTarget::read_depth`,
+reverse-Z `distance = NEAR / depth`); farther ring pixels are legitimate
+and only counted. The ignored `surface_window_measurements` test prints
+the task's before/after numbers (cubes sent per level, settle time,
+memory) at spawn and on a mountain with `max_column_cubes` 0 (the
+pre-2.10 fixed windows) and 16 (the default).
+
 **LOD fly test (task 2.6).** `tests/lod_fly.rs` (GPU, `#[ignore]`d —
 slow real-server flight; run with `cargo test -p jbm-game --test
 lod_fly -- --ignored`) flies a real client against a threaded real

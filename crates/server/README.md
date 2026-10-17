@@ -7,7 +7,9 @@ server side of the protocol.
 
 `Generator::new(seed, Blocks)` produces cubes by evaluating the compiled
 shipped overworld graph (below); `generate(CubePos) -> Cube` is a pure
-function of `(seed, pos)`, and `surface_height(x, z) -> i64` is public.
+function of `(seed, pos)`, and `surface_height(x, z) -> i64` is public
+(plus `column_surface_bounds(cx, cz)` — task 2.10's min/max surface over
+a cube column, reusing the per-column cache).
 `Generator::with_preset(seed, Blocks, worldgen::Preset)` picks the shipped
 graph (`Overworld`, the default, or `Classic`), and
 `Generator::from_graph(seed, Blocks, &CompiledGraph)` runs any graph instead
@@ -363,6 +365,7 @@ without physics; the next tick's streaming observes the new center.
 | `world_dir: Option<PathBuf>` | `None` | persistence; `None` = today's behavior |
 | `save_interval: Duration` | 5 s | snapshot cadence for the save thread |
 | `lod_levels: u8` | 4 | top LOD level kept; 0 disables the pyramid |
+| `max_column_cubes: usize` | 16 | task 2.10: most cubes desired per column beyond the camera window, nearest first; 0 reproduces the pre-2.10 fixed windows |
 
 `ServerConfig::protocol_only()` turns streaming off with no generation
 threads — what exact-message-sequence tests and benches use.
@@ -418,7 +421,11 @@ center — full disks, not annuli: the client needs the coarse cube under
 a finer one while the finer one loads, and to fill octants the finer
 level does not cover yet. That costs about a quarter more cubes per
 level than an annulus would (`disk(r) / (disk(r) - disk(r/2))`; at
-r = 8, v = 3: 1407 disk vs 1064 annulus cubes, +32%).
+r = 8, v = 3: 1407 disk vs 1064 annulus cubes, +32%). Since task 2.10
+the level-1 disk also unions each column's **surface span** (the same
+`max_column_cubes` cap as LOD0; coarser levels need none — see "Cube
+streaming"), so a flying camera's level-1 window miss does not leave the
+surface below to level 2+.
 
 - **Order.** One merged walk over `(level, offset)`, precomputed once
   from the config: sorted by the offset's squared distance in level
@@ -460,12 +467,43 @@ unsent (test/fly-test hook).
 For a player whose center cube is `c` (the cube containing their
 authoritative `PlayerState` position):
 
-- **Desired set:** every cube with `dx² + dz² ≤ R²` and `|dy| ≤ V`. The
-  offset list is precomputed once per config, sorted nearest-first by
-  `dx² + dy² + dz²` with ties broken by `(x, y, z)`.
-- **Keep set:** the same shape with `R + 1`, `V + 1`. A cube is unloaded
-  only when it leaves the keep set — the hysteresis band that stops a
-  player standing on a border from making cubes flap.
+- **Desired set:** every cube with `dx² + dz² ≤ R²` and `|dy| ≤ V`, plus
+  — since task 2.10 — the **surface span** of every column of the disk:
+  the cubes that contain the terrain surface over the column's footprint,
+  `[floor(min_h / 32) − 1, floor(max_h / 32)]` (widened one cube below so
+  the surface cube's −Y neighbour is there for meshing and skirts). On
+  the 2.8 mountains the fixed ±V window left cliff faces above or valley
+  floors below the camera to the coarse rings — the play-test's "flat
+  16-block wall in front of the player"; the span union puts LOD0 over
+  the whole near relief. Each column adds at most `max_column_cubes`
+  span cubes **beyond the camera window**, nearest the camera first, so
+  a cliff over a valley costs at most 16 cubes of that column (flat
+  terrain around the camera never adds any: its span sits inside the
+  window). The desired list (window ∪ spans) is rebuilt per player when
+  the center moves or a span lands, sorted nearest-first by
+  `dx² + dy² + dz²` with ties broken by `(x, y, z)` — the same order the
+  pre-2.10 list had.
+- **Surface spans** (`spans`): per LOD0 cube column, the exact min/max
+  surface height over its 32² block columns, read from the generator's
+  cached per-column heights (`Generator::column_surface_bounds`); per
+  **level-1** ring column, the min/max over an 8×8 sample grid of its
+  64×64-block footprint (exact min/max over a level-*n* footprint costs
+  `(32·2^n)²` height evaluations — 4k at level 1, 4.2M at level 6 — so
+  rings sample; the coarse levels ≥ 2 need no spans at all: their
+  default `lod_vertical_radius` 3 window spans `3·32·2^n ≥ 384` blocks,
+  which covers the whole shipped relief from any camera height, and only
+  level 1's ±192 can miss it). Spans are pure functions of `(seed,
+  preset)`, cached in bounded maps (cleared wholesale at their caps — a
+  clear only costs re-evaluation) and filled **incrementally on the tick
+  thread**: at most 12 LOD0 columns (~1 ms overworld) and 6 level-1
+  columns (~0.7 ms) per tick, nearest column first, so no tick ever
+  stalls on the ~150 ms a fresh view's 1225+361 columns would cost at
+  once. `Server::span_stats` reports the counters.
+- **Keep set:** the same shape with `R + 1`, `V + 1` — and the span
+  extras trimmed to `max_column_cubes + 1` (the same +1 hysteresis in
+  window and cap the radii get). A cube is unloaded only when it leaves
+  the keep set — the band that stops a player standing on a border from
+  making cubes flap.
 
 Each tick: collect finished generation results (inline mode generates up
 to `gen_budget_per_tick` first), then per player, in join order:

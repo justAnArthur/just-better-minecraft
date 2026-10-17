@@ -70,7 +70,9 @@ impl DepthTarget {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -96,6 +98,77 @@ impl DepthTarget {
 
     pub fn view(&self) -> &wgpu::TextureView {
         &self.view
+    }
+
+    /// The last frame's per-pixel depths, row-major, `width * height`
+    /// f32s (task 2.10's test hook; reverse-Z, so
+    /// distance = [`crate::camera::NEAR`] / depth). Blocking: encodes one
+    /// texture→buffer copy of the whole target and maps it.
+    pub fn read_depth(&self, gpu: &Gpu) -> Vec<f32> {
+        let bytes_per_pixel = 4;
+        let unaligned = bytes_per_pixel * self.width;
+        let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT.max(bytes_per_pixel);
+        let padded = unaligned.div_ceil(alignment) * alignment;
+
+        let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("jbm depth readback"),
+            size: u64::from(padded) * u64::from(self.height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("jbm depth readback"),
+            });
+        encoder.copy_texture_to_buffer(
+            self.texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        gpu.queue.submit([encoder.finish()]);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        buffer.map_async(wgpu::MapMode::Read, .., move |result| {
+            let _ = sender.send(result);
+        });
+        let poll = gpu.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        assert!(poll.is_ok(), "device poll failed: {poll:?}");
+        receiver
+            .recv()
+            .expect("map callback dropped without sending")
+            .expect("buffer mapping failed");
+        let data = buffer
+            .slice(..)
+            .get_mapped_range()
+            .expect("range was just mapped for reading");
+        let mut depths = Vec::with_capacity((self.width * self.height) as usize);
+        let row_bytes = unaligned as usize;
+        for y in 0..self.height as usize {
+            let row = &data[y * padded as usize..y * padded as usize + row_bytes];
+            depths.extend(
+                row.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+            );
+        }
+        drop(data);
+        buffer.unmap();
+        depths
     }
 
     pub fn size(&self) -> (u32, u32) {

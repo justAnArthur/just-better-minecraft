@@ -671,6 +671,25 @@ impl Server {
         self.pool.in_flight()
     }
 
+    /// LOD0 streaming completeness (task 2.10's test hook): how many of
+    /// the player's desired LOD0 cubes are not yet sent. Zero once the
+    /// whole surface-following desired set has streamed.
+    pub fn lod0_pending(&self, id: PlayerId) -> usize {
+        let Some(player) = self
+            .connections
+            .iter()
+            .filter_map(Connection::joined_player)
+            .find(|player| player.id == id)
+        else {
+            return 0;
+        };
+        player
+            .desired
+            .iter()
+            .filter(|offset| !player.sent.contains(&offset_pos(player.center, **offset)))
+            .count()
+    }
+
     /// LOD ring completeness for the fly test: how many of the player's
     /// desired ring cubes are not yet sent, summed over levels (a cube is
     /// only ever sent once ready, so this covers "not ready and sent").
@@ -711,6 +730,21 @@ impl Server {
             .filter_map(Connection::joined_player)
             .find(|player| player.id == id)
             .map_or(0, |player| player.sent.len())
+    }
+
+    /// Per-level LOD ring cubes sent to the player (index 0 = level 1),
+    /// plus the LOD0 sent count at the end — the task 2.10 measurement
+    /// hook (cubes desired per level).
+    pub fn sent_counts_per_level(&self, id: PlayerId) -> Vec<usize> {
+        self.connections
+            .iter()
+            .filter_map(Connection::joined_player)
+            .find(|player| player.id == id)
+            .map_or(Vec::new(), |player| {
+                let mut counts: Vec<usize> = player.lod.iter().map(|l| l.sent.len()).collect();
+                counts.push(player.sent.len());
+                counts
+            })
     }
 
     /// Cubes pinned by an accepted edit (never evicted). Without
