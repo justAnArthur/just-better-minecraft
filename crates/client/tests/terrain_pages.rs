@@ -9,11 +9,11 @@ use glam::DVec3;
 use jbm_client::camera::Camera;
 use jbm_client::mesh::appearance::{BlockAppearance, builtin_textures};
 use jbm_client::mesh::{self, MeshInput};
-use jbm_client::render::chunks::TerrainPass;
-use jbm_client::render::chunks::TerrainPath;
-use jbm_client::render::chunks::worst_case_faces;
 use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
+use jbm_client::render::terrain::TerrainPass;
+use jbm_client::render::terrain::TerrainPath;
+use jbm_client::render::terrain::worst_case_faces;
 use jbm_client::render::texture_array::BlockTextures;
 use jbm_client::testing::screenshot::gpu_or_skip;
 use jbm_core::block::{BlockRegistry, BlockStateId, builtin};
@@ -62,7 +62,7 @@ fn render_passes_identically(
     churned: &mut TerrainPass,
     fresh_meshes: &[(CubePos, mesh::MeshOutput)],
     camera: &Camera,
-    path: jbm_client::render::chunks::TerrainPath,
+    path: jbm_client::render::terrain::TerrainPath,
 ) {
     let target = OffscreenTarget::new(&gpu.device, 256, 256);
     let depth = DepthTarget::new(&gpu.device, 256, 256);

@@ -83,7 +83,7 @@ use jbm_client::mesh::appearance::BlockAppearance;
 #[cfg(not(feature = "cube16"))]
 use jbm_client::mesh::{self, MeshInput};
 #[cfg(not(feature = "cube16"))]
-use jbm_client::render::chunks::TerrainPass;
+use jbm_client::render::terrain::TerrainPass;
 #[cfg(not(feature = "cube16"))]
 use jbm_client::render::texture_array::BlockTextures;
 #[cfg(not(feature = "cube16"))]

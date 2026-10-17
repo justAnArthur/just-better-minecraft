@@ -29,9 +29,9 @@ use jbm_client::lod::Coverage;
 use jbm_client::lod::CubeKey;
 use jbm_client::mesh;
 use jbm_client::mesh::appearance::{BlockAppearance, builtin_textures};
-use jbm_client::render::chunks::{TerrainPass, TerrainPath};
 use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
+use jbm_client::render::terrain::{TerrainPass, TerrainPath};
 use jbm_client::render::texture_array::BlockTextures;
 use jbm_client::testing::holes::{
     PinholeRule, assert_only_pinholes_with, component_details, describe_holes, sentinel_components,
@@ -657,7 +657,7 @@ fn lod0_lod1_border_is_invisible_with_flat_colors() {
     // radius of 64 puts the fade window at 25.6..54.4 blocks, so LOD0 is
     // fully flat well before the border (~64+ blocks from the center).
     // Fog off isolates the border from the fog window.
-    terrain.set_view_distance(64.0, 1.0e9);
+    renderer.set_view_distance(64.0, 1.0e9);
     renderer.set_fog(false);
 
     let grid = HeightGrid::build();
@@ -773,7 +773,7 @@ fn level_tint_marks_each_drawn_level() {
     // particular, so use a firm threshold.
     const ZERO: u8 = 8;
     let signature = |level: u8, p: image::Rgba<u8>| -> bool {
-        let t = jbm_client::render::chunks::lod_tint_color(level);
+        let t = jbm_client::render::terrain::lod_tint_color(level);
         let (r, g, b) = (p[0] >= ZERO, p[1] >= ZERO, p[2] >= ZERO);
         let (tr, tg, tb) = (t[0] > 0.25, t[1] > 0.25, t[2] > 0.25);
         r == tr && g == tg && b == tb

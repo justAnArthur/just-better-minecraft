@@ -28,9 +28,10 @@ use crate::lod::Coverage;
 use crate::mesh::appearance::BlockAppearance;
 use crate::mesh::pool::MeshPool;
 use crate::predict::Predictor;
-use crate::render::chunks::TerrainPass;
 use crate::render::overlay::{FrameStats, OverlayText};
 use crate::render::renderer::{DepthTarget, FrameInputs, Renderer};
+use crate::render::settings::RenderSettings;
+use crate::render::terrain::TerrainPass;
 use crate::render::texture_array::BlockTextures;
 use crate::world::ClientWorld;
 
@@ -65,7 +66,7 @@ pub fn run(link: ClientLink) -> Result<(), Box<dyn Error>> {
 /// values the client cannot learn from the link itself. The LOD0 ring
 /// radius sets where LOD0's textures fade into the flat average colors;
 /// the furthest ring radius sets the distance-fog window (see
-/// `TerrainPass::set_view_distance`).
+/// `Renderer::set_view_distance`).
 #[derive(Debug, Clone, Copy)]
 pub struct ViewSetup {
     /// The LOD0 streaming disk radius, in blocks (`view_radius ·
@@ -79,8 +80,8 @@ pub struct ViewSetup {
 impl Default for ViewSetup {
     fn default() -> ViewSetup {
         ViewSetup {
-            lod0_ring_radius: crate::render::chunks::DEFAULT_LOD0_RING_RADIUS,
-            furthest_ring_radius: crate::render::chunks::DEFAULT_FURTHEST_RING_RADIUS,
+            lod0_ring_radius: crate::render::terrain::DEFAULT_LOD0_RING_RADIUS,
+            furthest_ring_radius: crate::render::terrain::DEFAULT_FURTHEST_RING_RADIUS,
         }
     }
 }
@@ -286,22 +287,29 @@ impl App {
         };
         surface.configure(&gpu.device, &config);
 
+        // The one environment read for rendering: fog, the level tint,
+        // the gpu-cull preference and the fallback force all come from
+        // here, and the view's ring radii ride along (the caller knows
+        // them; the client cannot learn them from the link).
+        let settings = RenderSettings {
+            far_radii: [self.view.lod0_ring_radius, self.view.furthest_ring_radius],
+            ..RenderSettings::from_env()
+        };
         let mut renderer = Renderer::new(&gpu, format);
-        // The level tint debug view (task 2.10) can start on from the
-        // environment; F4 toggles it afterwards.
-        if std::env::var_os("JBM_LOD_TINT").is_some_and(|v| v == "1") {
-            renderer.set_lod_tint(true);
-        }
+        renderer.set_settings(settings);
         let depth = DepthTarget::new(&gpu.device, config.width, config.height);
         renderer.set_viewport(config.width, config.height);
         self.camera.aspect = config.width as f32 / config.height as f32;
 
         let (layers, _) = crate::mesh::appearance::builtin_textures();
         let textures = BlockTextures::new(&gpu, &layers)?;
-        let mut terrain = TerrainPass::new(&gpu, format, renderer.uniform_layout(), &textures);
-        // The far look's fade and fog windows scale on the ring radii the
-        // caller knows (task 2.9).
-        terrain.set_view_distance(self.view.lod0_ring_radius, self.view.furthest_ring_radius);
+        let terrain = TerrainPass::with_settings(
+            &gpu,
+            format,
+            renderer.uniform_layout(),
+            &textures,
+            &settings,
+        );
 
         window.request_redraw();
         self.windowed = Some(Windowed {

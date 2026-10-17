@@ -45,11 +45,21 @@ coordinates and cfg-gated off under the crate's own `cube16` passthrough;
   code.
 - `render::renderer::DepthTarget` — `Depth32Float` attachment with resize;
   `TEXTURE_BINDING` usage so the Hi-Z pass can sample it.
-- `render::chunks::TerrainPass` — the terrain pass: paged face storage,
+- `render::terrain::TerrainPass` — the terrain pass: paged face storage,
   persistent meta slots, and three draw paths — GPU compute culling
   (frustum + Hi-Z occlusion, two-phase), CPU culling with
   `multi_draw_indirect`, or a direct-draw fallback (see "Terrain
-  rendering" below).
+  rendering" below). Split by concern under `render/terrain/`:
+  `mod.rs` (the public API), `layout.rs` (the GPU layout contract),
+  `space.rs` (camera/frustum math), `pages.rs` (CPU bookkeeping),
+  `stats.rs` (counters and the readback ring), `pipelines.rs`
+  (construction and bind groups), `cpu_cull.rs` / `gpu_cull.rs` (the draw
+  paths).
+- `render::settings::RenderSettings` — the frame-level settings (fog,
+  level tint, far-look radii, draw-path flags) the renderer owns and
+  passes to `TerrainPass::draw`; `from_env()` is the one read of the
+  `JBM_NO_FOG` / `JBM_LOD_TINT` / `JBM_GPU_CULL` / `JBM_NO_MDI`
+  variables, done by the app at startup.
 - `render::hiz::HizPyramid` — the hierarchical-Z depth pyramid the GPU
   cull tests occlusion against.
 - `render::suballoc::Suballocator` — the CPU-side free-list suballocator
@@ -355,16 +365,19 @@ invisible:
 - **Where the radii come from:** the client cannot learn them from the
   link, so the game derives a `ViewSetup` from its `ServerConfig`
   (`view_radius · CUBE_SIZE` and `lod_view_radius · CUBE_SIZE ·
-  2^lod_levels`) and `app::run_with_view` passes it to
-  `TerrainPass::set_view_distance`. Defaults match the `ServerConfig`
-  defaults (`DEFAULT_LOD0_RING_RADIUS`, `DEFAULT_FURTHEST_RING_RADIUS`).
-- **Test hooks:** `Renderer::set_fog(bool)` (also `JBM_NO_FOG=1` at
-  construction) switches the fog off entirely so screenshot tests can
-  isolate geometry from fog; the fade always stays. Fog paints terrain
-  fragments only — never the sky pass — so the sentinel hole tests keep
-  working with fog on: a hole still shows the sentinel sky.
+  2^lod_levels`) and `app::run_with_view` feeds it into its one
+  `RenderSettings::from_env()` read; the renderer-owned settings hand
+  them to the terrain pass every frame (`Renderer::set_view_distance`
+  changes them). Defaults match the `ServerConfig` defaults
+  (`DEFAULT_LOD0_RING_RADIUS`, `DEFAULT_FURTHEST_RING_RADIUS`).
+- **Test hooks:** `Renderer::set_fog(bool)` (also `JBM_NO_FOG=1`, read
+  once by the app through `RenderSettings::from_env`) switches the fog
+  off entirely so screenshot tests can isolate geometry from fog; the
+  fade always stays. Fog paints terrain fragments only — never the sky
+  pass — so the sentinel hole tests keep working with fog on: a hole
+  still shows the sentinel sky.
 - **Tuning:** every window is a fraction of a radius; the fractions are
-  the consts at the top of `render/chunks.rs` (`FADE_START_FRACTION`,
+  the consts in `render/terrain/layout.rs` (`FADE_START_FRACTION`,
   `FADE_END_FRACTION`, `FOG_START_FRACTION`, `FOG_END_FRACTION`,
   `AO_SOFTEN`) mirrored as WGSL consts in `terrain.wgsl` — keep the two
   in sync (tests compute expectations from the Rust ones).
@@ -379,7 +392,7 @@ path-equality tests cover it).
 fixed color per LOD level — one uniform flag (`TerrainUniforms.tint`),
 applied before shade and fog, identical on all three draw paths because
 they share the one fragment shader. LOD0 stays white; the others follow
-`LOD_TINT_COLORS` in `render/chunks.rs` (mirrored by `lod_tint` in
+`LOD_TINT_COLORS` in `render/terrain/layout.rs` (mirrored by `lod_tint` in
 `terrain.wgsl`): L1 (2×2×2 cells) red, L2 (4×4) yellow, L3 (8×8) green,
 L4 (16×16) cyan, L5 (32×32) blue, L6 (64×64) purple — never pure
 magenta, the hole-test sentinel. While it is on, the overlay shows the

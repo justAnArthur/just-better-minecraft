@@ -19,11 +19,11 @@ use jbm_client::mesh;
 use jbm_client::mesh::appearance::{
     BlockAppearance, LAYER_OAK_PLANKS, LAYER_STONE, builtin_textures,
 };
-use jbm_client::render::chunks::{
-    FADE_END_FRACTION, FADE_START_FRACTION, FOG_END_FRACTION, FOG_START_FRACTION, TerrainPass,
-};
 use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
+use jbm_client::render::terrain::{
+    FADE_END_FRACTION, FADE_START_FRACTION, FOG_END_FRACTION, FOG_START_FRACTION, TerrainPass,
+};
 use jbm_client::render::texture_array::BlockTextures;
 use jbm_client::testing::screenshot::gpu_or_skip;
 use jbm_core::block::{BlockRegistry, BlockStateId, builtin::Blocks};
@@ -301,12 +301,12 @@ fn lod0_grass_strip_fades_into_the_flat_average() {
     let camera = looking_at(eye, DVec3::new(16.0, surface_y, 60.0));
 
     // The textured reference: both fade and fog windows far out of range.
-    ctx.terrain.set_view_distance(1.0e6, 1.0e6);
+    ctx.renderer.set_view_distance(1.0e6, 1.0e6);
     let reference = ctx.render(&camera);
     // The faded render: an LOD0 radius of 138 blocks (fade 55.2..117.3),
     // fog off — the sheet's distances (44.6..291) span the whole window.
     let lod0_radius = 138.0_f32;
-    ctx.terrain.set_view_distance(lod0_radius, 1.0e6);
+    ctx.renderer.set_view_distance(lod0_radius, 1.0e6);
     let faded = ctx.render(&camera);
 
     let avg = ctx.textures.averages()[LAYER_OAK_PLANKS as usize];
@@ -431,7 +431,7 @@ fn fog_matches_the_sky_and_leaves_near_terrain_alone() {
 
     // A small furthest ring radius so the fog saturates inside the scene;
     // the LOD0 radius keeps the default fade scale.
-    ctx.terrain.set_view_distance(256.0, 600.0);
+    ctx.renderer.set_view_distance(256.0, 600.0);
     assert!(ctx.renderer.fog(), "fog is on by default");
     let fogged = ctx.render(&camera);
     let sky = ctx.render_sky(&camera);
