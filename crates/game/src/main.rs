@@ -10,6 +10,7 @@ use jbm_client::debug_ui::DebugHooks;
 use jbm_core::link::in_process_pair;
 use jbm_server::run::{self, ServerHandle};
 use jbm_server::server::{Server, ServerConfig, ServerStats};
+use jbm_server::worldgen::Preset;
 
 /// The far-look view distances (task 2.9) derived from the server config:
 /// the LOD0 streaming disk radius and the outermost LOD ring's radius, in
@@ -25,8 +26,13 @@ fn view_setup(lod0_ring_radius: f32, furthest_ring_radius: f32, debug: DebugHook
 }
 
 /// The world directory the game saves to, unless `JBM_WORLD_DIR` overrides
-/// it. `saves/default` under the current directory.
-fn world_dir() -> Option<PathBuf> {
+/// it. `saves/default` under the current directory. The playground never
+/// saves, whatever `JBM_NO_SAVE` says (task 2.12): it is a deterministic
+/// debug layout — a save directory would only cache it.
+fn world_dir(preset: Preset) -> Option<PathBuf> {
+    if preset == Preset::Playground {
+        return None;
+    }
     if std::env::var("JBM_NO_SAVE").is_ok_and(|v| v == "1") {
         return None;
     }
@@ -34,6 +40,21 @@ fn world_dir() -> Option<PathBuf> {
         Ok(dir) => PathBuf::from(dir),
         Err(_) => PathBuf::from("saves/default"),
     })
+}
+
+/// The world preset `JBM_WORLD` selects: `overworld` (the default),
+/// `classic` or `playground` (task 2.12's fixed debug layout). An unknown
+/// value is a one-line exit, not a panic.
+fn preset_from_env() -> Result<Preset, String> {
+    let value = std::env::var("JBM_WORLD").unwrap_or_default();
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "overworld" => Ok(Preset::Overworld),
+        "classic" => Ok(Preset::Classic),
+        "playground" => Ok(Preset::Playground),
+        other => Err(format!(
+            "jbm: unknown JBM_WORLD '{other}' (expected overworld, classic or playground)"
+        )),
+    }
 }
 
 /// The F3 panel's server bridge (task 2.12): plain closures over the
@@ -98,8 +119,16 @@ fn server_lines(stats_slot: &Mutex<Option<ServerStats>>) -> Vec<(String, String)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let preset = match preset_from_env() {
+        Ok(preset) => preset,
+        Err(line) => {
+            eprintln!("{line}");
+            std::process::exit(1);
+        }
+    };
     let config = ServerConfig {
-        world_dir: world_dir(),
+        world_dir: world_dir(preset),
+        worldgen: preset,
         ..ServerConfig::default()
     };
     // The far-look view distances, read off the config before it moves
