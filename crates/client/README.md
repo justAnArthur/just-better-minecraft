@@ -25,8 +25,16 @@ coordinates and cfg-gated off under the crate's own `cube16` passthrough;
 - `mesh::appearance` — the flat per-state appearance table plus the
   procedural builtin 16×16 placeholder textures (`builtin_textures`).
 - `mesh::face` — the 8-byte `PackedFace` format (see below).
-- `mesh::greedy` — the mesher (`mesh()`, `MeshInput`, `MeshOutput`) and
-  `build_padded()` (bench-only).
+- `mesh::greedy` — the mesher's public path: `mesh()`, `MeshInput`,
+  `MeshOutput`, `neighbor_index()` and `build_padded()` (bench-only),
+  re-exported from their home modules below.
+- `mesh::input` — the padded `(CUBE_SIZE + 2)^3` cell view: the
+  `MeshInput`/`MeshOutput` types, the `mesh()` entry point and
+  `build_padded()`.
+- `mesh::seams` — the level-seam crack hiders (skirts and lids, level
+  >= 1 only).
+- `mesh::oracle` (test-only) — the reference meshers the greedy output
+  is checked against.
 - `mesh::pool::MeshPool` — the mesh worker pool.
 - `world::ClientWorld` — cubes from the server plus dirty/version state.
 - `render::renderer::Renderer` — the frame renderer (sky + terrain +
