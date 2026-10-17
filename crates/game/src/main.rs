@@ -17,10 +17,11 @@ use jbm_server::worldgen::Preset;
 /// blocks. The client cannot learn these from the link, so the game —
 /// which built the config — passes them along. Task 2.12 adds the debug
 /// hooks (server stats and live radius steering) to the same bundle.
-fn view_setup(lod0_ring_radius: f32, furthest_ring_radius: f32, debug: DebugHooks) -> ViewSetup {
+fn view_setup(config: &ServerConfig, debug: DebugHooks) -> ViewSetup {
     ViewSetup {
-        lod0_ring_radius,
-        furthest_ring_radius,
+        view_radius: config.view_radius,
+        lod_view_radius: config.lod_view_radius,
+        lod_levels: config.lod_levels,
         debug: Some(debug),
     }
 }
@@ -132,8 +133,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..ServerConfig::default()
     };
     // The far-look view distances, read off the config before it moves
-    // into the server (task 2.9).
-    let (lod0_ring_radius, furthest_ring_radius) = config.ring_radii();
+    // into the server (task 2.9); the debug hooks attach after the spawn.
+    let view_config = config.clone();
     // A storage error (locked world, newer format, …) is a one-line exit,
     // not a panic.
     let server = match Server::try_with_config(config) {
@@ -144,7 +145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let handle = run::spawn(server);
-    let view = view_setup(lod0_ring_radius, furthest_ring_radius, debug_hooks(&handle));
+    let view = view_setup(&view_config, debug_hooks(&handle));
     let (client_end, server_end) = in_process_pair();
     handle.connect(server_end);
     let result = jbm_client::app::run_with_view(client_end, view);

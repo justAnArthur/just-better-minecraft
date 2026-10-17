@@ -15,6 +15,8 @@ use crate::render::terrain::LevelStats;
 pub(crate) struct WorldSetup {
     pub view_radius: u32,
     pub lod_view_radius: u32,
+    /// Fixed for the run: the ring radius scales by `2^lod_levels`.
+    pub lod_levels: u8,
 }
 
 /// Draws the Debug window. `hooks` is `None` when the game passed no
@@ -168,7 +170,6 @@ fn world_section(
     hooks: Option<&super::DebugHooks>,
     server_lines: &[(String, String)],
 ) {
-    const RING_LEVELS: f32 = 64.0; // the shipped 6 LOD levels
     egui::CollapsingHeader::new("World").show(ui, |ui| {
         let Some(hooks) = hooks else {
             ui.weak("no server bridge (plain client run)");
@@ -189,10 +190,12 @@ fn world_section(
         );
         if applied {
             (hooks.set_view_radius)(world.view_radius, world.lod_view_radius);
-            settings.far_radii = [
-                world.view_radius as f32 * jbm_core::coords::CUBE_SIZE as f32,
-                world.lod_view_radius as f32 * jbm_core::coords::CUBE_SIZE as f32 * RING_LEVELS,
-            ];
+            let (lod0, furthest) = jbm_core::lod::ring_radii(
+                world.view_radius,
+                world.lod_view_radius,
+                world.lod_levels,
+            );
+            settings.far_radii = [lod0, furthest];
         }
         for (label, value) in server_lines {
             ui.monospace(format!("{label}: {value}"));

@@ -71,25 +71,34 @@ pub fn run(link: ClientLink) -> Result<(), Box<dyn Error>> {
 /// server bridge the debug panel's World section uses; the client stays
 /// free of server types — the game fills the closures.
 pub struct ViewSetup {
-    /// The LOD0 streaming disk radius, in blocks (`view_radius ·
-    /// CUBE_SIZE`).
-    pub lod0_ring_radius: f32,
-    /// The furthest (outermost LOD level's) ring radius, in blocks
-    /// (`lod_view_radius · CUBE_SIZE · 2^lod_levels`).
-    pub furthest_ring_radius: f32,
+    /// The server's LOD0 streaming radius, in cubes (`view_radius`).
+    pub view_radius: u32,
+    /// The server's ring radius per LOD level, in cubes
+    /// (`lod_view_radius`).
+    pub lod_view_radius: u32,
+    /// The server's LOD level count (`lod_levels`).
+    pub lod_levels: u8,
     /// The debug panel's server hooks, when the caller has a server to
     /// talk to (the game's in-process one).
     pub debug: Option<DebugHooks>,
 }
 
 impl ViewSetup {
-    /// The documented defaults (`lod0_ring_radius` 8 cubes, 6 LOD levels).
+    /// The documented defaults, matching `ServerConfig`: `view_radius` 8,
+    /// `lod_view_radius` 8, 6 LOD levels.
     pub fn default_radii() -> ViewSetup {
         ViewSetup {
-            lod0_ring_radius: crate::render::terrain::DEFAULT_LOD0_RING_RADIUS,
-            furthest_ring_radius: crate::render::terrain::DEFAULT_FURTHEST_RING_RADIUS,
+            view_radius: 8,
+            lod_view_radius: 8,
+            lod_levels: 6,
             debug: None,
         }
+    }
+
+    /// The far-look radii in blocks, `(LOD0 disk, outermost ring)`, by
+    /// [`jbm_core::lod::ring_radii`].
+    pub fn ring_radii(&self) -> (f32, f32) {
+        jbm_core::lod::ring_radii(self.view_radius, self.lod_view_radius, self.lod_levels)
     }
 }
 
@@ -320,8 +329,9 @@ impl App {
         // the gpu-cull preference and the fallback force all come from
         // here, and the view's ring radii ride along (the caller knows
         // them; the client cannot learn them from the link).
+        let (lod0_ring_radius, furthest_ring_radius) = self.view.ring_radii();
         let settings = RenderSettings {
-            far_radii: [self.view.lod0_ring_radius, self.view.furthest_ring_radius],
+            far_radii: [lod0_ring_radius, furthest_ring_radius],
             ..RenderSettings::from_env()
         };
         let mut renderer = Renderer::new(&gpu, format);
@@ -341,18 +351,11 @@ impl App {
         );
         let egui = EguiPass::new(&gpu, &window, format)?;
         // The panel's World sliders start at the view distances the caller
-        // passed; the ring radius assumes the shipped 6 LOD levels.
-        let ring_levels = 64.0;
+        // passed.
         self.panel_world = Some(WorldSetup {
-            view_radius: ((self.view.lod0_ring_radius
-                / crate::render::terrain::DEFAULT_LOD0_RING_RADIUS
-                * 8.0)
-                .round()
-                .max(2.0)) as u32,
-            lod_view_radius: ((self.view.furthest_ring_radius
-                / (jbm_core::coords::CUBE_SIZE as f32 * ring_levels))
-                .round()
-                .max(2.0)) as u32,
+            view_radius: self.view.view_radius,
+            lod_view_radius: self.view.lod_view_radius,
+            lod_levels: self.view.lod_levels,
         });
         self.debug_hooks = debug;
 
