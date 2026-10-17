@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::reference;
+use super::noise;
 
 // ---------------------------------------------------------------------------
 // Graph format
@@ -92,7 +92,7 @@ pub enum Node {
         min: NodeValue,
         max: NodeValue,
     },
-    /// The reference 2D gradient noise ([`reference::noise2`]) sampled at
+    /// The 2D gradient noise ([`noise::noise2`]) sampled at
     /// `((x + x_offset) · x_scale, (z + z_offset) · z_scale)` with seed
     /// `world_seed ^ salt`. The offsets default to 0 and may reference other
     /// nodes (domain warp); whatever they are, the sample stays within the
@@ -104,7 +104,7 @@ pub enum Node {
         x_offset: Option<NodeValue>,
         z_offset: Option<NodeValue>,
     },
-    /// The reference fractal sum ([`reference::fbm`]) sampled at
+    /// The fractal sum ([`noise::fbm`]) sampled at
     /// `((x + x_offset) · scale, (z + z_offset) · scale)` with seed
     /// `world_seed ^ salt`. Offsets as [`Node::Noise2`].
     Fbm2 {
@@ -114,10 +114,10 @@ pub enum Node {
         x_offset: Option<NodeValue>,
         z_offset: Option<NodeValue>,
     },
-    /// The ridged multifractal ([`reference::ridged2`]) sampled at
+    /// The ridged multifractal ([`noise::ridged2`]) sampled at
     /// `((x + x_offset) · scale, (z + z_offset) · scale)` with seed
-    /// `world_seed ^ salt`; output exactly in `[0, 1]` (see the reference
-    /// docs for the formula and the bound argument). Offsets as
+    /// `world_seed ^ salt`; output exactly in `[0, 1]` (see [`noise::ridged2`]
+    /// for the formula and the bound argument). Offsets as
     /// [`Node::Noise2`].
     Ridged2 {
         salt: Salt,
@@ -1551,9 +1551,9 @@ fn eval_op(op: &Op, r: &[f64], x: f64, y: f64, z: f64, seed: u64) -> f64 {
             z_scale,
             warp,
         } => match warp {
-            None => reference::noise2(seed ^ salt, x * x_scale, z * z_scale),
+            None => noise::noise2(seed ^ salt, x * x_scale, z * z_scale),
             Some((xo, zo)) => {
-                reference::noise2(seed ^ salt, (x + v(*xo)) * x_scale, (z + v(*zo)) * z_scale)
+                noise::noise2(seed ^ salt, (x + v(*xo)) * x_scale, (z + v(*zo)) * z_scale)
             }
         },
         Op::Fbm2 {
@@ -1562,8 +1562,8 @@ fn eval_op(op: &Op, r: &[f64], x: f64, y: f64, z: f64, seed: u64) -> f64 {
             octaves,
             warp,
         } => match warp {
-            None => reference::fbm(seed ^ salt, x * scale, z * scale, *octaves),
-            Some((xo, zo)) => reference::fbm(
+            None => noise::fbm(seed ^ salt, x * scale, z * scale, *octaves),
+            Some((xo, zo)) => noise::fbm(
                 seed ^ salt,
                 (x + v(*xo)) * scale,
                 (z + v(*zo)) * scale,
@@ -1581,7 +1581,7 @@ fn eval_op(op: &Op, r: &[f64], x: f64, y: f64, z: f64, seed: u64) -> f64 {
                 None => (x, z),
                 Some((xo, zo)) => (x + v(*xo), z + v(*zo)),
             };
-            reference::ridged2(seed ^ salt, wx * scale, wz * scale, *octaves, *gain)
+            noise::ridged2(seed ^ salt, wx * scale, wz * scale, *octaves, *gain)
         }
         Op::Spline { input, points } => spline_eval(points, v(*input)),
     }
@@ -1666,7 +1666,7 @@ fn interval_op(op: &Op, r: &[Interval], x: Interval, y: Interval, z: Interval) -
         // Noise bounds hold wherever the noise is sampled, so a warp offset
         // never widens them (the offset shifts the sample point, not the
         // range). `ridged2` is a normalized sum of per-octave signals each
-        // in [0, 1] — see `reference::ridged2` — so [0, 1] is exact.
+        // in [0, 1] — see `noise::ridged2` — so [0, 1] is exact.
         Op::Noise2 { .. } | Op::Fbm2 { .. } => NOISE_RANGE,
         Op::Ridged2 { .. } => (0.0, 1.0),
         Op::Spline { input, points } => spline_interval(points, v(*input)),
@@ -1825,14 +1825,14 @@ mod tests {
             let x = ((next() % 200_001) as i64) - 100_000;
             let z = ((next() % 200_001) as i64) - 100_000;
             let seed = next();
-            let warp_x = reference::noise2(seed ^ 0x11, x as f64 * 0.01, z as f64 * 0.01);
+            let warp_x = noise::noise2(seed ^ 0x11, x as f64 * 0.01, z as f64 * 0.01);
             let off_x = warp_x * 350.0;
             let off_z = warp_x;
             let xf = x as f64;
             let zf = z as f64;
-            let noise = reference::noise2(seed ^ 0x22, (xf + off_x) * 0.002, (zf + off_z) * 0.003);
-            let fbm = reference::fbm(seed ^ 0x33, (xf + off_x) * 0.004, (zf + off_z) * 0.004, 4);
-            let ridged = reference::ridged2(
+            let noise = noise::noise2(seed ^ 0x22, (xf + off_x) * 0.002, (zf + off_z) * 0.003);
+            let fbm = noise::fbm(seed ^ 0x33, (xf + off_x) * 0.004, (zf + off_z) * 0.004, 4);
+            let ridged = noise::ridged2(
                 seed ^ 0x44,
                 (xf + off_x) * 0.005,
                 (zf + off_z) * 0.005,
