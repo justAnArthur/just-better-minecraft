@@ -51,7 +51,7 @@ struct CubeMeta {
     dirs: array<vec4u, 3>,  // six per-direction (offset, count) pairs
 };
 
-// Mirrored by `TerrainUniforms` in render/chunks.rs (48 bytes). Terrain
+// Mirrored by `TerrainUniforms` in render/chunks.rs (64 bytes). Terrain
 // only: sky, outline and overlay share just FrameUniforms.
 struct TerrainUniforms {
     camera_cube: vec4i, // xyz = floor(camera / CUBE_SIZE)
@@ -61,6 +61,9 @@ struct TerrainUniforms {
     // (sets the fog window); z = fog on (1.0) or off (0.0, the
     // Renderer::set_fog / JBM_NO_FOG hook); w spare.
     far: vec4f,
+    // Task 2.10 level tint. x = tint on (1.0) or off (0.0, the F4 /
+    // JBM_LOD_TINT hook); y, z, w spare.
+    tint: vec4f,
 };
 
 @group(0) @binding(0) var<uniform> u: FrameUniforms;
@@ -205,6 +208,23 @@ fn ao_soften(level: u32) -> f32 {
     return 0.3;
 }
 
+// The level tint (task 2.10), mirrored by LOD_TINT_COLORS in
+// render/chunks.rs — keep in sync. One fixed color per level so a debug
+// view shows which level draws where; level 0 stays white. The last entry
+// is purple, deliberately not pure magenta (the hole sentinel).
+fn lod_tint(level: u32) -> vec3f {
+    let colors = array<vec3f, 7>(
+        vec3f(1.0, 1.0, 1.0),   // LOD0: untinted
+        vec3f(1.0, 0.0, 0.0),   // L1 2x2 red
+        vec3f(1.0, 1.0, 0.0),   // L2 4x4 yellow
+        vec3f(0.0, 1.0, 0.0),   // L3 8x8 green
+        vec3f(0.0, 1.0, 1.0),   // L4 16x16 cyan
+        vec3f(0.0, 0.0, 1.0),   // L5 32x32 blue
+        vec3f(0.55, 0.15, 1.0), // L6 64x64 purple
+    );
+    return colors[min(level, 6u)];
+}
+
 struct VsOut {
     @builtin(position) pos: vec4f,
     // UV in whole-texture tiles: one tile per block.
@@ -344,7 +364,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     // far_color drops its value exactly (mix(x, y, 1.0) == y).
     let tex = textureSample(block_textures, block_sampler, in.uv, in.layer);
     let dist = length(in.rel);
-    let base = far_color(tex, in.layer, dist, in.level);
+    var base = far_color(tex, in.layer, dist, in.level);
+    // Level tint (task 2.10): the debug view that shows which level draws
+    // where, before shade and fog. One uniform flag, shared by every draw
+    // path (they share this fragment shader).
+    if (terrain.tint.x > 0.5) {
+        base = base * lod_tint(in.level);
+    }
     // Cutout: glass, leaves and holes in textures discard below 0.5 —
     // only while any texture still shows (level 0, not fully faded; a LOD
     // cell is solid by the downsampling rule). The alpha test leads so

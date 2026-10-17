@@ -143,6 +143,10 @@ pub struct Renderer {
     /// construction, later `set_fog`. Propagated to the terrain pass every
     /// frame — the flag rides in the terrain uniform.
     fog: bool,
+    /// Whether the level tint applies (task 2.10); set by the app's F4
+    /// toggle / `JBM_LOD_TINT=1` at startup, propagated to the terrain
+    /// pass every frame like the fog flag.
+    lod_tint: bool,
 }
 
 impl Renderer {
@@ -242,6 +246,7 @@ impl Renderer {
             viewport: (1, 1),
             sky_override: None,
             fog: !std::env::var_os("JBM_NO_FOG").is_some_and(|v| v == "1"),
+            lod_tint: false,
         }
     }
 
@@ -257,6 +262,19 @@ impl Renderer {
     /// Whether distance fog is on (task 2.9).
     pub fn fog(&self) -> bool {
         self.fog
+    }
+
+    /// Enables or disables the level tint (task 2.10), the debug view
+    /// that multiplies every fragment by a fixed color per LOD level.
+    /// The app's F4 key toggles it; `JBM_LOD_TINT=1` starts it on.
+    /// Propagates to the terrain pass every frame like the fog flag.
+    pub fn set_lod_tint(&mut self, enabled: bool) {
+        self.lod_tint = enabled;
+    }
+
+    /// Whether the level tint is on (task 2.10).
+    pub fn lod_tint(&self) -> bool {
+        self.lod_tint
     }
 
     /// Overrides the sky colors (horizon, zenith, ground haze; linear
@@ -350,8 +368,10 @@ impl Renderer {
 
         if let Some(terrain) = frame.terrain {
             // The fog on/off hook rides along each frame (task 2.9): the
-            // terrain pass bakes it into its per-frame uniform.
+            // terrain pass bakes it into its per-frame uniform. The level
+            // tint flag (task 2.10) rides the same way.
             terrain.set_fog(self.fog);
+            terrain.set_lod_tint(self.lod_tint);
             terrain.draw(
                 gpu,
                 &mut encoder,

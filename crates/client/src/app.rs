@@ -287,6 +287,11 @@ impl App {
         surface.configure(&gpu.device, &config);
 
         let mut renderer = Renderer::new(&gpu, format);
+        // The level tint debug view (task 2.10) can start on from the
+        // environment; F4 toggles it afterwards.
+        if std::env::var_os("JBM_LOD_TINT").is_some_and(|v| v == "1") {
+            renderer.set_lod_tint(true);
+        }
         let depth = DepthTarget::new(&gpu.device, config.width, config.height);
         renderer.set_viewport(config.width, config.height);
         self.camera.aspect = config.width as f32 / config.height as f32;
@@ -677,8 +682,15 @@ impl App {
             cull.occluded
         ));
         // Per LOD level: resident cubes, drawn cubes, masked octants —
-        // plus the LOD mesh queue length.
+        // plus the LOD mesh queue length. While the level tint is on
+        // (task 2.10), the legend names each level's color.
         overlay.push(self.lod_overlay_line(w));
+        if w.renderer.lod_tint() {
+            overlay.push(concat!(
+                "LOD TINT L1 2x2 red L2 4x4 yellow L3 8x8 green ",
+                "L4 16x16 cyan L5 32x32 blue L6 64x64 purple",
+            ));
+        }
 
         // The autopilot finishes once its distance is flown: print the
         // frame-time summary and end the loop after this frame.
@@ -876,6 +888,12 @@ impl ApplicationHandler for App {
                         // the next sim tick.
                         if pressed && matches!(key, Key::Character(c) if c.to_lowercase() == "f") {
                             self.input.press_fly_toggle();
+                        }
+                        // F4 toggles the level tint debug view (task 2.10):
+                        // every fragment multiplied by a fixed color per LOD
+                        // level, on every draw path.
+                        if pressed && matches!(key, Key::Named(NamedKey::F4)) {
+                            w.renderer.set_lod_tint(!w.renderer.lod_tint());
                         }
                         // Keys 1-9 select a hotbar slot (task 1.7).
                         if pressed
