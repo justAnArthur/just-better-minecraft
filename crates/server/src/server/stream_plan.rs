@@ -1,6 +1,6 @@
 //! Pure helpers for cube streaming: the desired offset list and the
 //! desired/keep set predicates. The tick-thread driving logic lives in
-//! [`crate::server`] phase 5; keeping the math here makes it directly
+//! [`crate::server::stream`]; keeping the math here makes it directly
 //! testable.
 
 use jbm_core::coords::CubePos;
@@ -61,43 +61,24 @@ pub(crate) fn in_keep(pos: CubePos, center: CubePos, r: u32, v: u32) -> bool {
     in_desired(pos, center, r + 1, v + 1)
 }
 
-/// One entry of the merged LOD ring walk (task 2.6): a level and the
-/// offset from that level's center cube.
+/// One entry of the merged LOD ring walk: a level and the offset from that
+/// level's center cube.
 pub(crate) type LodWalkEntry = (u8, Offset);
 
-/// The merged walk over `(level, offset)` for LOD ring streaming with
-/// plain vertical windows — the pre-2.10 shape, kept as the reference the
-/// surface-following walk (below) extends and the streaming tests pin.
-#[cfg(test)]
-pub(crate) fn lod_walk(lod_levels: u8, r: u32, v: u32) -> Vec<LodWalkEntry> {
-    let mut walk = Vec::new();
-    for level in 1..=lod_levels {
-        for offset in desired_offsets(r, v) {
-            walk.push((level, offset));
-        }
-    }
-    walk.sort_by_key(|&(level, (x, y, z))| {
-        let d =
-            i64::from(x) * i64::from(x) + i64::from(y) * i64::from(y) + i64::from(z) * i64::from(z);
-        (d, std::cmp::Reverse(level), x, y, z)
-    });
-    walk
-}
-
 /// The vertical cube indices a column's surface spans, from its surface
-/// height bounds (task 2.10): `[floor(min / side) - 1, floor(max / side)]`
-/// — widened by one cube below so the surface cube's −Y neighbour is
-/// there for meshing and skirts. `side` is the cube side in blocks at
-/// the level in question (`CUBE_SIZE · 2^level`).
+/// height bounds: `[floor(min / side) - 1, floor(max / side)]` — widened by
+/// one cube below so the surface cube's −Y neighbour is there for meshing
+/// and skirts. `side` is the cube side in blocks at the level in question
+/// (`CUBE_SIZE · 2^level`).
 pub(crate) fn span_cubes(span: (i64, i64), side: i64) -> (i64, i64) {
     (span.0.div_euclid(side) - 1, span.1.div_euclid(side))
 }
 
 /// The `dy` offsets a column adds to the desired set beyond the camera
-/// window (task 2.10): the span cubes outside `[center_y - v, center_y +
-/// v]`, at most `cap` of them, nearest to the camera's `dy` first (ties
-/// to the lower cube — deterministic). Returned in that nearest-first
-/// order. `None` means the column's span is not known yet: window only.
+/// window: the span cubes outside `[center_y - v, center_y + v]`, at most
+/// `cap` of them, nearest to the camera's `dy` first (ties to the lower
+/// cube — deterministic). Returned in that nearest-first order. `None`
+/// means the column's span is not known yet: window only.
 pub(crate) fn column_extra_dys(
     span: Option<(i64, i64)>,
     side: i64,
@@ -122,10 +103,10 @@ pub(crate) fn column_extra_dys(
     extras
 }
 
-/// Is `dy` one of the offsets [`column_extra_dys`] would keep (task
-/// 2.10)? The keep-set form of the question, for unload and eviction
-/// checks: window `v`, span extras trimmed to `cap`, both one looser
-/// than the desired form (the same +1 hysteresis the radii get).
+/// Is `dy` one of the offsets [`column_extra_dys`] would keep? The
+/// keep-set form of the question, for unload and eviction checks: window
+/// `v`, span extras trimmed to `cap`, both one looser than the desired
+/// form (the same +1 hysteresis the radii get).
 pub(crate) fn extra_dy_keeps(
     span: Option<(i64, i64)>,
     side: i64,
@@ -184,7 +165,7 @@ fn disk_columns(r: u32) -> Vec<(i32, i32)> {
     columns
 }
 
-/// The desired offsets with surface-following windows (task 2.10): every
+/// The desired offsets with surface-following windows: every
 /// camera-window offset of [`desired_offsets`] plus, per column of the
 /// disk, the surface-span extras `span_of` supplies (the column's surface
 /// height bounds, `None` while that column's span has not been computed
@@ -219,15 +200,15 @@ pub(crate) fn desired_offsets_surface(
     offsets
 }
 
-/// The merged LOD ring walk with surface-following windows (task 2.10).
-/// Level 1 unions its camera window with the column's surface span
-/// (`span1_of`, in level-1 cubes' columns; `None` while unknown).
-/// `center1_y` is the level-1 center cube's absolute y. Levels ≥ 2 keep
-/// the plain window: with the default `lod_vertical_radius` 3 a
-/// level-*n* window spans `3 · CUBE_SIZE · 2^n ≥ 384` blocks from the
-/// player's level cube, which covers the whole shipped relief
-/// (`MIN_HEIGHT..=MAX_HEIGHT`) from any camera height — only level 1's
-/// ±192 blocks can miss it. Sorted exactly like the window-only walk.
+/// The merged LOD ring walk with surface-following windows. Level 1
+/// unions its camera window with the column's surface span (`span1_of`,
+/// in level-1 cubes' columns; `None` while unknown). `center1_y` is the
+/// level-1 center cube's absolute y. Levels ≥ 2 keep the plain window:
+/// with the default `lod_vertical_radius` 3 a level-*n* window spans
+/// `3 · CUBE_SIZE · 2^n ≥ 384` blocks from the player's level cube, which
+/// covers the whole shipped relief (`MIN_HEIGHT..=MAX_HEIGHT`) from any
+/// camera height — only level 1's ±192 blocks can miss it. Sorted exactly
+/// like the window-only walk.
 pub(crate) fn lod_walk_surface(
     lod_levels: u8,
     r: u32,
@@ -275,12 +256,31 @@ pub(crate) fn level_center(lod0: CubePos, level: u8) -> CubePos {
 #[cfg(test)]
 mod tests {
     use super::{
-        column_extra_dys, desired_offsets, desired_offsets_surface, extra_dy_keeps, in_desired,
-        in_keep, lod_walk_surface, offset_pos, span_cubes,
+        LodWalkEntry, column_extra_dys, desired_offsets, desired_offsets_surface, extra_dy_keeps,
+        in_desired, in_keep, lod_walk_surface, offset_pos, span_cubes,
     };
     use jbm_core::coords::{CUBE_SIZE, CubePos};
 
     const CENTER: CubePos = CubePos { x: -5, y: 2, z: 9 };
+
+    /// The merged walk over `(level, offset)` for LOD ring streaming with
+    /// plain vertical windows — the reference shape the surface-following
+    /// walk above extends and these tests pin.
+    fn lod_walk(lod_levels: u8, r: u32, v: u32) -> Vec<LodWalkEntry> {
+        let mut walk = Vec::new();
+        for level in 1..=lod_levels {
+            for offset in desired_offsets(r, v) {
+                walk.push((level, offset));
+            }
+        }
+        walk.sort_by_key(|&(level, (x, y, z))| {
+            let d = i64::from(x) * i64::from(x)
+                + i64::from(y) * i64::from(y)
+                + i64::from(z) * i64::from(z);
+            (d, std::cmp::Reverse(level), x, y, z)
+        });
+        walk
+    }
 
     fn d2(o: (i32, i32, i32)) -> i64 {
         i64::from(o.0).pow(2) + i64::from(o.1).pow(2) + i64::from(o.2).pow(2)
@@ -324,9 +324,9 @@ mod tests {
 
     #[test]
     fn lod_walk_orders_by_distance_then_coarse_first() {
-        let walk = super::lod_walk(3, 4, 2);
+        let walk = lod_walk(3, 4, 2);
         // Full disks at every level.
-        let disk = super::desired_offsets(4, 2).len();
+        let disk = desired_offsets(4, 2).len();
         assert_eq!(walk.len(), 3 * disk);
         // Fully ordered by (distance, level descending, x, y, z).
         let mut prev: Option<(i64, u8, i32, i32, i32)> = None;
@@ -395,8 +395,8 @@ mod tests {
         assert!(!in_keep(offset_pos(CENTER, (-3, -2, -3)), CENTER, r, v)); // 9+9 > 16
     }
 
-    /// Task 2.10: a column's span cubes are the surface height bounds in
-    /// cube units, widened one cube below.
+    /// A column's span cubes are the surface height bounds in cube units,
+    /// widened one cube below.
     #[test]
     fn span_cubes_floor_and_widen_below() {
         let side = i64::from(CUBE_SIZE);
@@ -412,8 +412,8 @@ mod tests {
         assert!((-5i64).div_euclid(side) < 0);
     }
 
-    /// Task 2.10: extras are the span cubes outside the window, trimmed
-    /// to the cap, nearest the camera first; ties to the lower cube.
+    /// Extras are the span cubes outside the window, trimmed to the cap,
+    /// nearest the camera first; ties to the lower cube.
     #[test]
     fn column_extra_dys_trim_to_cap_nearest_first() {
         let side = i64::from(CUBE_SIZE);
@@ -441,8 +441,8 @@ mod tests {
         assert!(column_extra_dys(None, side, 1, 2, 16).is_empty());
     }
 
-    /// Task 2.10: the keep form of the extras question, one looser in
-    /// window and cap (the +1 hysteresis).
+    /// The keep form of the extras question, one looser in window and cap
+    /// (the +1 hysteresis).
     #[test]
     fn extra_dy_keeps_is_desired_loosened_by_one() {
         let side = i64::from(CUBE_SIZE);
@@ -463,9 +463,9 @@ mod tests {
         assert!(!extra_dy_keeps(None, side, 1, 1, 3, 2));
     }
 
-    /// Task 2.10: the surface-following desired list is the window list
-    /// plus per-column extras, still nearest-first with deterministic
-    /// ties, and a span inside the window changes nothing.
+    /// The surface-following desired list is the window list plus
+    /// per-column extras, still nearest-first with deterministic ties, and
+    /// a span inside the window changes nothing.
     #[test]
     fn desired_offsets_surface_adds_span_extras_sorted() {
         let (r, v, cap) = (2u32, 1u32, 16usize);
@@ -527,8 +527,8 @@ mod tests {
         assert_eq!(high.len(), plain.len() + 3 * 6);
     }
 
-    /// Task 2.10: level 1 gets span extras, coarser levels do not, and
-    /// the merged order stays (distance, coarse first, x, y, z).
+    /// Level 1 gets span extras, coarser levels do not, and the merged
+    /// order stays (distance, coarse first, x, y, z).
     #[test]
     fn lod_walk_surface_extends_level_1_only() {
         let (r, v, cap) = (2u32, 1u32, 16usize);
@@ -563,7 +563,7 @@ mod tests {
         // Levels 2 and 3 keep exactly their window disks.
         for level in [2u8, 3] {
             let count = walk.iter().filter(|&&(l, _)| l == level).count();
-            assert_eq!(count, super::desired_offsets(r, v).len());
+            assert_eq!(count, desired_offsets(r, v).len());
         }
     }
 }

@@ -356,13 +356,24 @@ saver mid-batch to make "edit during save" deterministic;
 
 ## Server (`server`)
 
+`server/` is split by concern: `mod.rs` (`Server`, the tick phases,
+connections and players), `config.rs` (`ServerConfig`), `edits.rs`
+(Break/Place validation and application), `persist.rs` (snapshot batches,
+acks, `flush`, the `jbm-save` thread), `stream.rs` (the phase-5 streaming
+pass), `stream_plan.rs` (the pure offset/keep math) and `stats.rs`
+(read-only views).
+
 `Server::new()` (default config), `Server::with_config(ServerConfig)`
 (panics if the world storage cannot open; `Server::try_with_config` returns
 the `StorageError` instead, and opens storage *first* so the stored seed
 feeds the generator), `add_connection(ServerLink)`, `tick()` runs exactly
-one tick, `update(elapsed) -> u32` feeds the clock and runs every due tick. Read access for tests:
-`tick_count()`, `dropped_ticks()`, `players()`, `world_cube_count()`,
-`in_flight()`, `sent_count(PlayerId)`. Bench and test hook:
+one tick, `update(elapsed) -> u32` feeds the clock and runs every due tick.
+`stats() -> ServerStats` is one snapshot of every counter (players, world
+and pool sizes, LOD, spans, saves, per-player streaming progress) — what a
+debug panel renders. The individual accessors (`tick_count()`,
+`players()`, `world_cube_count()`, `in_flight()`, `lod_*`,
+`span_stats()`, `sent_count(PlayerId)`, save counters, …) live in
+`stats.rs` and report the same numbers. Bench and test hook:
 `teleport_player(PlayerId, DVec3)` moves a player's authoritative state
 without physics; the next tick's streaming observes the new center.
 
@@ -380,8 +391,8 @@ without physics; the next tick's streaming observes the new center.
 | `max_in_flight: usize` | 512 | queued + generating + uncollected |
 | `world_dir: Option<PathBuf>` | `None` | persistence; `None` = today's behavior |
 | `save_interval: Duration` | 5 s | snapshot cadence for the save thread |
-| `lod_levels: u8` | 4 | top LOD level kept; 0 disables the pyramid |
-| `max_column_cubes: usize` | 16 | task 2.10: most cubes desired per column beyond the camera window, nearest first; 0 reproduces the pre-2.10 fixed windows |
+| `lod_levels: u8` | 6 | top LOD level kept; 0 disables the pyramid |
+| `max_column_cubes: usize` | 16 | most cubes desired per column beyond the camera window, nearest first; 0 reproduces the fixed camera-only windows |
 
 `ServerConfig::protocol_only()` turns streaming off with no generation
 threads — what exact-message-sequence tests and benches use.
