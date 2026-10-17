@@ -37,6 +37,19 @@ coordinates and cfg-gated off under the crate's own `cube16` passthrough;
   is checked against.
 - `mesh::pool::MeshPool` — the mesh worker pool.
 - `world::ClientWorld` — cubes from the server plus dirty/version state.
+- `terrain_sync::TerrainSync` — the world → mesh pool → coverage →
+  terrain-upload pipeline in one place: it owns the `ClientWorld`, the
+  `MeshPool`, the `Coverage` and the in-flight mesh-job count.
+  `apply(gpu, terrain, msg)` feeds one server message in (an unload also
+  drops the GPU mesh and coverage readiness), `pump(gpu, terrain,
+  camera, submit_budget, upload_budget)` submits dirty cubes and
+  uploads finished meshes within the caller's budgets (the app's and the
+  GPU tests' 16 submits / 32 uploads), `settle_sync(gpu, terrain,
+  appearance, camera)` meshes everything dirty inline (no pool round
+  trip) until the world is clean — for deterministic test scenes — and
+  `queue_clear()` reports an empty mesh queue. `in_flight_lod()` is the
+  level ≥ 1 share of the in-flight jobs (the overlay's LOD queue
+  length).
 - `render::renderer::Renderer` — the frame renderer (sky + terrain +
   outline + overlay dispatch), taking its per-frame inputs as one
   `render::renderer::FrameInputs` struct (target, depth, camera, terrain,
@@ -78,6 +91,11 @@ coordinates and cfg-gated off under the crate's own `cube16` passthrough;
 - `render::triangle` — the minimal test pipeline.
 - `predict::Predictor` — client-side prediction of the shared physics
   (see below).
+- `hud` — the debug overlay's text: `HudSnapshot` (one frame's stats:
+  fps, camera, target, player, terrain/cull/level counters, LOD queue,
+  tint flag) and `hud::lines(&snapshot) -> Vec<String>`. The app fills
+  the snapshot once per frame; the 2.12 egui debug panel reads the same
+  struct.
 - `app::run(link)` — opens the window and runs the frame loop against a
   server link, with the default view distances; `app::run_with_view`
   takes a `ViewSetup` (the ring radii the far look keys on — the game
@@ -91,6 +109,11 @@ coordinates and cfg-gated off under the crate's own `cube16` passthrough;
   an unattended gate run finishes even when its window is never shown.
 - `testing::screenshot` (only with `--features testing` or in unit tests)
   — golden-image comparison helpers, see below.
+- `testing::OffscreenRig` (same gate) — the offscreen render half for GPU
+  tests: renderer, terrain pass, color target and depth in one struct,
+  with `render_with_sky(gpu, camera, sky) -> RgbaImage` (sky-color
+  override for this frame only) and `read_depth(gpu)`. Tests keep only
+  their protocol state and drive a `TerrainSync` against `rig.terrain`.
 
 ## Invariants
 
@@ -625,9 +648,10 @@ applies mouse look, runs a fixed 20 Hz sim clock with an accumulator (at
 most 5 catch-up ticks per frame; the leftover accumulator is dropped so a
 stall never spirals), sets the camera position to
 `predictor.render_position(alpha)` where `alpha` is the accumulator
-fraction, drains the link into `ClientWorld` and the `Predictor`
-(`PlayerState` → `on_server_state`), submits dirty cubes, receives and
-uploads meshes within the budgets above. The overlay adds
+fraction, drains the link through a `TerrainSync` (cube messages via
+`apply`) and into the `Predictor` (`PlayerState` → `on_server_state`),
+then pumps the pipeline within the budgets above. The overlay comes from
+a `hud::HudSnapshot` filled once per frame:
 `CUBES <loaded> MESHED <n> PENDING <dirty + in flight>`,
 `FACES <drawn, after direction skipping> PAGES <p> CMDS <c> DRAWS <d>
 <path name>`, `CULL DRAWN <n> FRUSTUM <n> OCCLUDED <n>` (the GPU
@@ -727,7 +751,8 @@ Above the horizon the color rises from horizon pale to zenith blue with
 into an R8 atlas once, then draws each line as instanced screen-space
 quads (integer scale, 2× by default) with alpha blending: white text on a
 semi-transparent dark box per line. `FrameStats` averages FPS / frame ms
-over a sliding 0.5 s window (pure logic, unit-tested). The app fills the
+over a sliding 0.5 s window (pure logic, unit-tested). The app fills a
+`hud::HudSnapshot` once per frame and `hud::lines` formats it into the
 lines `FPS`, `XYZ` (2 decimals), `CUBE` (32-block cube coordinates),
 `YAW`/`PITCH` in degrees, `CUBES`/`MESHED`/`PENDING`,
 `FACES`/`PAGES`/`CMDS`/`DRAWS` (+ draw path), `TARGET` (block position
