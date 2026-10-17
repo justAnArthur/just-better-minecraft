@@ -397,9 +397,10 @@ without physics; the next tick's streaming observes the new center.
 `ServerConfig::protocol_only()` turns streaming off with no generation
 threads — what exact-message-sequence tests and benches use.
 `ServerConfig::ring_radii()` gives the far-look view distances in blocks
-(the LOD0 disk radius and the outermost LOD ring's radius); the client
-cannot learn them from the link, so the game passes them along at
-startup.
+(the LOD0 disk radius and the outermost LOD ring's radius) by
+`jbm_core::lod::ring_radii`, the rule the client shares; the client
+cannot learn them from the link, so the game passes the config's radii
+along at startup.
 
 A connection is pending until a valid `Hello` (matching `PROTOCOL_VERSION`),
 then joined with a fresh `PlayerId` starting at 1. `Welcome.spawn` is the
@@ -697,6 +698,31 @@ threads, and the `jbm-save` thread.)
 it only through links (or by `stop()` returning the `Server`). The tick
 loop itself is single-threaded; generation runs on the `GenPool` threads,
 never on the tick thread (inline test mode excepted).
+
+**The debug bridge (task 2.12):** the drive loop publishes a
+`ServerStats` snapshot into a shared slot every 10 ticks (0.5 s) —
+`ServerHandle::stats() -> Option<ServerStats>` clones it (`None` before
+the first tick) — and drains a control channel before each tick:
+`ServerHandle::set_view_radius(view_radius, lod_view_radius)` applies
+`Server::set_view_radius` live (clamped to LOD0 2..=32 cubes and rings
+2..=16), which updates the config and replays the border-crossing
+transitions — cubes that left the new keep sets unload (LOD0 and every
+ring level), the desired sets and merged LOD walks rebuild, and eviction
+re-runs. `ServerHandle::debug_bridge()` hands the game the stats slot
+and a control-sender clone so it can wire the client's F3 panel without
+the client ever depending on this crate.
+
+**The playground preset (task 2.12):** `Preset::Playground` is the
+deterministic debug world behind `JBM_WORLD=playground` — a fixed layout
+(noise-free, seed-independent) around spawn: a flat stone plane at y=64
+with grass top, a 1-block staircase to y=96, a 64-block cliff, a 1×1
+pillar 128 tall, a pit 32 deep and 8 wide, a water pool at sea level
+with a sand rim, a stone/glass checkerboard (greedy meshing's worst
+case), a 45° ridge and a hemisphere dome. A density graph cannot express
+it, so `terrain/playground.rs` is a small pure column model dispatched
+to by the `Generator`'s `generate` / `sample_lod` (the same min-corner
+sampling rule; level 1 exact by construction) / `surface_height` /
+`column_surface_bounds` / `spawn`.
 
 ## Benchmarks
 

@@ -25,8 +25,10 @@ the new `Overworld`, as the real-flight check.
 
 **Far-look wiring (task 2.9):** `main` derives a
 `jbm_client::app::ViewSetup` from its `ServerConfig` before the config
-moves into the server, via `ServerConfig::ring_radii()` (the LOD0 ring
-radius and the furthest ring radius, in blocks), and runs the client
+moves into the server (its `view_radius`, `lod_view_radius` and
+`lod_levels`; the client turns them into block radii with
+`jbm_core::lod::ring_radii`, the same rule as `ServerConfig::ring_radii()`),
+and runs the client
 with `app::run_with_view`. The
 client cannot learn these from the link; its terrain pass scales the
 texture→flat fade and the distance-fog windows on them (see the client
@@ -40,6 +42,21 @@ locked by another process, or was written by a newer format — prints one
 line to stderr and exits with status 1 instead of panicking. Quitting the
 window stops the server thread, which flushes every accepted edit to disk
 before the process exits; `/saves` is git-ignored.
+
+**World selection (task 2.12):** `JBM_WORLD` picks the server's preset —
+`overworld` (the default), `classic` (the pre-2.8 terrain) or
+`playground` (the fixed deterministic debug layout: plane, staircase,
+cliff, pillar, pit, pool, checkerboard, ridge, dome — see the server
+README). An unknown value prints one line and exits instead of
+panicking. The playground never saves, whatever `JBM_NO_SAVE` says: it is
+a deterministic debug layout, and a save directory would only cache it.
+
+**The F3 panel's server bridge (task 2.12):** the game builds the
+client's `DebugHooks` from `ServerHandle::debug_bridge()` — plain
+closures over the shared stats slot and the control sender — so the
+panel's Stats section shows the server's counters (tick, world cubes,
+generation, LOD, spans, saves, per-player pending) and its World sliders
+steer the server's view radii live, with no client → server dependency.
 
 **End-to-end screenshot:** `tests/terrain_screenshot.rs` is the one test
 that crosses both halves. A `HeadlessServer` (inline generation, R = 3,
