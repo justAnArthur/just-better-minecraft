@@ -33,6 +33,7 @@ use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
 use jbm_client::render::terrain::{TerrainPass, TerrainPath};
 use jbm_client::render::texture_array::BlockTextures;
+use jbm_client::terrain_sync::TerrainSync;
 use jbm_client::testing::holes::{
     PinholeRule, assert_only_pinholes_with, component_details, describe_holes, sentinel_components,
 };
@@ -312,32 +313,18 @@ fn build_scene() -> (ClientWorld, BlockAppearance, Blocks) {
 }
 
 /// Meshes and uploads everything dirty, feeding the coverage rule, until
-/// the world is clean. Returns the coverage for inspection.
+/// the world is clean: a [`TerrainSync`] around the scene's world, then
+/// `settle_sync` (the synchronous inline-mesh variant of the pipeline).
 fn settle(
     gpu: &jbm_client::gpu::Gpu,
-    world: &mut ClientWorld,
+    world: ClientWorld,
     terrain: &mut TerrainPass,
     appearance: &BlockAppearance,
     camera: DVec3,
-) -> Coverage {
-    let mut coverage = Coverage::default();
-    loop {
-        let dirty = world.take_dirty(usize::MAX, camera);
-        if dirty.is_empty() {
-            break;
-        }
-        for (key, _version, input) in dirty {
-            let output = mesh::mesh(&input, appearance);
-            terrain.upload(gpu, key, &output);
-            // An empty mesh counts as ready.
-            coverage.set_ready(key, true);
-        }
-        for (key, drawn, mask) in coverage.take_changed() {
-            terrain.set_draw_state(gpu, key, drawn, mask);
-        }
-    }
-    assert_eq!(world.dirty_count(), 0, "the scene never settled");
-    coverage
+) -> TerrainSync {
+    let mut sync = TerrainSync::with_world(world, std::sync::Arc::new(appearance.clone()), 0);
+    sync.settle_sync(gpu, terrain, appearance, camera);
+    sync
 }
 
 /// The screen row of a ray `angle` radians below the horizontal: for a
@@ -518,7 +505,7 @@ fn rings_scene_has_no_holes_below_the_horizon_margin() {
         return;
     };
 
-    let (mut world, appearance, _blocks) = build_scene();
+    let (world, appearance, _blocks) = build_scene();
     let target = OffscreenTarget::new(&gpu.device, SIZE, SIZE);
     let depth = DepthTarget::new(&gpu.device, SIZE, SIZE);
     let mut renderer = Renderer::new(&gpu, target.format());
@@ -530,7 +517,7 @@ fn rings_scene_has_no_holes_below_the_horizon_margin() {
     // Mesh from a central camera so distance ordering is realistic.
     settle(
         &gpu,
-        &mut world,
+        world,
         &mut terrain,
         &appearance,
         DVec3::new(16.0, 90.0, 16.0),
@@ -637,7 +624,7 @@ fn lod0_lod1_border_is_invisible_with_flat_colors() {
     let Some(gpu) = gpu_or_skip() else {
         return;
     };
-    let (mut world, appearance, _blocks) = build_scene();
+    let (world, appearance, _blocks) = build_scene();
     let target = OffscreenTarget::new(&gpu.device, SIZE, SIZE);
     let depth = DepthTarget::new(&gpu.device, SIZE, SIZE);
     let mut renderer = Renderer::new(&gpu, target.format());
@@ -647,7 +634,7 @@ fn lod0_lod1_border_is_invisible_with_flat_colors() {
     let mut terrain = TerrainPass::new(&gpu, target.format(), renderer.uniform_layout(), &textures);
     settle(
         &gpu,
-        &mut world,
+        world,
         &mut terrain,
         &appearance,
         DVec3::new(16.0, 90.0, 16.0),
@@ -741,7 +728,7 @@ fn level_tint_marks_each_drawn_level() {
     let Some(gpu) = gpu_or_skip() else {
         return;
     };
-    let (mut world, appearance, _blocks) = build_scene();
+    let (world, appearance, _blocks) = build_scene();
     let target = OffscreenTarget::new(&gpu.device, SIZE, SIZE);
     let depth = DepthTarget::new(&gpu.device, SIZE, SIZE);
     let mut renderer = Renderer::new(&gpu, target.format());
@@ -752,7 +739,7 @@ fn level_tint_marks_each_drawn_level() {
     let mut terrain = TerrainPass::new(&gpu, target.format(), renderer.uniform_layout(), &textures);
     settle(
         &gpu,
-        &mut world,
+        world,
         &mut terrain,
         &appearance,
         DVec3::new(16.0, 90.0, 16.0),
@@ -837,7 +824,7 @@ fn rings_scene_paths_render_pixel_identical() {
     let Some(gpu) = gpu_or_skip() else {
         return;
     };
-    let (mut world, appearance, _blocks) = build_scene();
+    let (world, appearance, _blocks) = build_scene();
     let target = OffscreenTarget::new(&gpu.device, SIZE, SIZE);
     let depth = DepthTarget::new(&gpu.device, SIZE, SIZE);
     let mut renderer = Renderer::new(&gpu, target.format());
@@ -847,7 +834,7 @@ fn rings_scene_paths_render_pixel_identical() {
     let mut terrain = TerrainPass::new(&gpu, target.format(), renderer.uniform_layout(), &textures);
     settle(
         &gpu,
-        &mut world,
+        world,
         &mut terrain,
         &appearance,
         DVec3::new(16.0, 90.0, 16.0),

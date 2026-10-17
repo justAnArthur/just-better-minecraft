@@ -1,7 +1,6 @@
 //! Window, surface and the frame loop: the client runtime. Drains the
-//! server link into a [`ClientWorld`], re-meshes dirty cubes on a
-//! [`MeshPool`], uploads finished meshes within a per-frame budget, and
-//! renders sky + terrain + debug overlay.
+//! server link through a [`TerrainSync`] (world, mesh pool, coverage,
+//! uploads), and renders sky + terrain + debug overlay.
 
 use std::error::Error;
 use std::sync::Arc;
@@ -9,7 +8,6 @@ use std::time::{Duration, Instant};
 
 use glam::DVec3;
 use jbm_core::block::{BlockRegistry, BlockStateId, builtin};
-use jbm_core::coords::CUBE_SIZE;
 use jbm_core::link::ClientLink;
 use jbm_core::physics::TICK_DT;
 use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION, ServerMsg};
@@ -23,17 +21,16 @@ use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 use crate::camera::Camera;
 use crate::edit::{Hotbar, Repeat, place_target};
 use crate::gpu::Gpu;
+use crate::hud::{HudPlayer, HudSnapshot, lines as hud_lines};
 use crate::input::{InputState, Key as MoveKey, apply_mouse_look, move_input};
-use crate::lod::Coverage;
 use crate::mesh::appearance::BlockAppearance;
-use crate::mesh::pool::MeshPool;
 use crate::predict::Predictor;
 use crate::render::overlay::{FrameStats, OverlayText};
 use crate::render::renderer::{DepthTarget, FrameInputs, Renderer};
 use crate::render::settings::RenderSettings;
 use crate::render::terrain::TerrainPass;
 use crate::render::texture_array::BlockTextures;
-use crate::world::ClientWorld;
+use crate::terrain_sync::TerrainSync;
 
 /// Frame dt is clamped so a pause (window drag, debugger) does not
 /// teleport the camera — and, with the catch-up cap below, never
@@ -125,10 +122,9 @@ struct App {
     predictor: Option<Predictor>,
     /// Server link; drained every frame without blocking.
     link: ClientLink,
-    world: ClientWorld,
-    pool: MeshPool,
-    /// Mesh jobs submitted but not yet received back.
-    in_flight: usize,
+    /// The terrain pipeline: world, mesh pool, coverage, in-flight jobs
+    /// (see [`crate::terrain_sync`]).
+    sync: TerrainSync,
     joined: bool,
     /// Set when the server refused, disconnected or the link closed; the
     /// loop exits cleanly after the current frame.
@@ -142,9 +138,6 @@ struct App {
     frame_time: f64,
     /// The registry, kept for state-name lookups in the overlay.
     registry: Arc<BlockRegistry>,
-    /// The coverage rule: which cube draws each volume (task 2.6). Fed by
-    /// mesh uploads and unloads; its verdicts rewrite renderer metadata.
-    coverage: Coverage,
     /// `JBM_AUTOFLY=<blocks>` autopilot (task 2.6 gate): fly straight for
     /// that many blocks after spawn, then exit with a frame-time summary.
     autofly: Option<Autofly>,
@@ -229,9 +222,7 @@ impl App {
             accumulator: Duration::ZERO,
             predictor: None,
             link,
-            world: ClientWorld::new(),
-            pool: MeshPool::new(appearance, 0),
-            in_flight: 0,
+            sync: TerrainSync::new(appearance, 0),
             joined: false,
             fatal: None,
             edit_break: Repeat::new(),
@@ -239,7 +230,6 @@ impl App {
             hotbar: Hotbar::new(),
             frame_time: 0.0,
             registry: Arc::new(registry),
-            coverage: Coverage::default(),
             autofly: Autofly::from_env(),
             view: ViewSetup::default(),
             frame_times: Vec::new(),
@@ -358,7 +348,7 @@ impl App {
                     }
                     ServerMsg::PlayerState { ack_seq, state } => {
                         if let Some(predictor) = &mut self.predictor {
-                            predictor.on_server_state(*ack_seq, *state, &self.world);
+                            predictor.on_server_state(*ack_seq, *state, self.sync.world());
                         }
                     }
                     ServerMsg::Rejected { reason } => {
@@ -376,10 +366,7 @@ impl App {
                     | ServerMsg::LodCubeData { .. }
                     | ServerMsg::UnloadLodCube { .. }
                     | ServerMsg::BlockChange { .. } => {
-                        if let crate::world::WorldChange::Unloaded(key) = self.world.apply(&msg) {
-                            w.terrain.remove(&w.gpu, key);
-                            self.coverage.set_ready(key, false);
-                        }
+                        self.sync.apply(&w.gpu, &mut w.terrain, &msg);
                     }
                     ServerMsg::Tick { .. } | ServerMsg::Pong { .. } => {}
                 },
@@ -405,7 +392,7 @@ impl App {
             predictor,
             input,
             camera,
-            world,
+            sync,
             link,
             fatal,
             autofly,
@@ -439,7 +426,7 @@ impl App {
             let delta = state.position - autofly.origin;
             autofly.flown = delta.x.hypot(delta.z);
         }
-        let mut message = predictor.tick(stepped, world);
+        let mut message = predictor.tick(stepped, sync.world());
         // Physics ignores pitch; the camera's goes along for the ride.
         if let ClientMsg::PlayerInput { pitch, .. } = &mut message {
             *pitch = camera.pitch;
@@ -459,10 +446,9 @@ impl App {
             return None;
         }
         let dir = DVec3::from(self.camera.forward());
+        let world = self.sync.world();
         raycast(self.camera.position, dir, REACH, |pos| {
-            self.world
-                .block(pos)
-                .map(|state| self.world.is_solid_state(state))
+            world.block(pos).map(|state| world.is_solid_state(state))
         })
     }
 
@@ -479,7 +465,9 @@ impl App {
             self.edit_place.fired(self.frame_time);
         }
         if break_due && let Some(hit) = target {
-            self.world.set_block(hit.block, BlockStateId::AIR);
+            self.sync
+                .world_mut()
+                .set_block(hit.block, BlockStateId::AIR);
             self.send_edit(ClientMsg::BreakBlock { pos: hit.block });
         }
         if place_due
@@ -487,8 +475,8 @@ impl App {
             && let Some(aabb) = self.predictor.as_ref().map(|p| p.state().aabb())
         {
             let state = self.hotbar.state();
-            if let Some(pos) = place_target(&hit, state, &self.world, &aabb) {
-                self.world.set_block(pos, state);
+            if let Some(pos) = place_target(&hit, state, self.sync.world(), &aabb) {
+                self.sync.world_mut().set_block(pos, state);
                 self.send_edit(ClientMsg::PlaceBlock { pos, state });
             }
         }
@@ -504,65 +492,15 @@ impl App {
 
     /// Submits dirty cubes (LOD0 and LOD, one budget) to the pool and
     /// receives finished meshes, uploading at most [`UPLOAD_BUDGET`] of
-    /// them. Stale results (the cube changed again) are dropped. Every
-    /// upload makes the cube coverage-ready, and the resulting draw-state
-    /// changes are applied to the renderer before the frame renders —
-    /// meta is rewritten per change, never per frame.
+    /// them; see [`TerrainSync::pump`].
     fn pump_meshing(&mut self, w: &mut Windowed) {
-        let inputs = self.world.take_dirty(SUBMIT_BUDGET, self.camera.position);
-        self.in_flight += inputs.len();
-        for (key, version, input) in inputs {
-            self.pool.submit(key, version, input);
-        }
-
-        let mut uploads = 0;
-        while uploads < UPLOAD_BUDGET {
-            let Some(result) = self.pool.try_recv() else {
-                break;
-            };
-            self.in_flight -= 1;
-            if self.world.version(result.key) != Some(result.version) {
-                continue; // stale: a newer version exists and is queued
-            }
-            w.terrain.upload(&w.gpu, result.key, &result.output);
-            // An empty mesh counts as ready (uniform air, fully buried);
-            // a re-mesh keeps the cube ready with its old mesh until this
-            // one lands.
-            self.coverage.set_ready(result.key, true);
-            uploads += 1;
-        }
-        for (key, drawn, mask) in self.coverage.take_changed() {
-            w.terrain.set_draw_state(&w.gpu, key, drawn, mask);
-        }
-    }
-
-    /// The per-level LOD overlay line: resident / drawn / masked-octants
-    /// per level plus the LOD mesh queue length.
-    fn lod_overlay_line(&self, w: &Windowed) -> String {
-        let mut line = String::from("LOD");
-        for stats in w.terrain.level_stats() {
-            if stats.level == 0 {
-                continue;
-            }
-            line.push_str(&format!(
-                " L{} {}/{} M{}",
-                stats.level, stats.resident, stats.drawn, stats.masked_octants
-            ));
-        }
-        line.push_str(&format!(
-            " Q {}",
-            self.world.lod_dirty_count() + self.in_flight_lod()
-        ));
-        line
-    }
-
-    /// Mesh jobs in flight for LOD cubes (level >= 1).
-    fn in_flight_lod(&self) -> usize {
-        // The pool does not break results down by level; the queue length
-        // the overlay reports is the LOD dirty set, which is exact, plus
-        // zero while nothing is in flight. Cheap and good enough for a
-        // debug line.
-        0
+        self.sync.pump(
+            &w.gpu,
+            &mut w.terrain,
+            &self.camera,
+            SUBMIT_BUDGET,
+            UPLOAD_BUDGET,
+        );
     }
 
     fn frame(&mut self, w: &mut Windowed) {
@@ -610,94 +548,46 @@ impl App {
         self.pump_edits(target);
         self.pump_meshing(w);
 
+        // One snapshot of everything the overlay prints; `hud::lines`
+        // formats it (the egui debug panel will read the same snapshot).
+        let snapshot = HudSnapshot {
+            fps: self.stats.fps(),
+            frame_ms: self.stats.frame_ms(),
+            position: self.camera.position,
+            yaw: self.camera.yaw,
+            pitch: self.camera.pitch,
+            target: target.and_then(|hit| {
+                self.sync
+                    .world()
+                    .block(hit.block)
+                    .map(|state| (hit.block, self.registry.info(state).name.clone()))
+            }),
+            hotbar: self.registry.info(self.hotbar.state()).name.clone(),
+            player: self.predictor.as_ref().map(|predictor| {
+                let state = predictor.state();
+                HudPlayer {
+                    flying: state.flying,
+                    on_ground: state.on_ground,
+                    velocity: state.velocity,
+                    pending: predictor.pending_len(),
+                    corrections: predictor.corrections(),
+                }
+            }),
+            cubes: self.sync.world().cube_count(),
+            meshed: w.terrain.meshed_count(),
+            pending: self.sync.world().dirty_count() + self.sync.in_flight(),
+            terrain: w.terrain.stats(),
+            path_name: w.terrain.path_name(),
+            cull: w.terrain.cull_stats(),
+            levels: w.terrain.level_stats(),
+            // The queue length is the LOD dirty set plus the level >= 1
+            // share of the in-flight mesh jobs (tracked by `TerrainSync`).
+            lod_queue: self.sync.world().lod_dirty_count() + self.sync.in_flight_lod(),
+            lod_tint: w.renderer.lod_tint(),
+        };
         let mut overlay = OverlayText::new();
-        let p = self.camera.position;
-        overlay.push(format!(
-            "FPS {:5.0}  {:6.2} ms",
-            self.stats.fps(),
-            self.stats.frame_ms()
-        ));
-        overlay.push(format!("XYZ {:.2} {:.2} {:.2}", p.x, p.y, p.z));
-        overlay.push(format!(
-            "CUBE {} {} {}",
-            (p.x / f64::from(CUBE_SIZE)).floor() as i64,
-            (p.y / f64::from(CUBE_SIZE)).floor() as i64,
-            (p.z / f64::from(CUBE_SIZE)).floor() as i64
-        ));
-        overlay.push(format!(
-            "YAW {:.1} PITCH {:.1}",
-            self.camera.yaw.to_degrees(),
-            self.camera.pitch.to_degrees()
-        ));
-        if let Some(hit) = target
-            && let Some(state) = self.world.block(hit.block)
-        {
-            overlay.push(format!(
-                "TARGET {} {} {} {}",
-                hit.block.x,
-                hit.block.y,
-                hit.block.z,
-                self.registry.info(state).name
-            ));
-        } else {
-            overlay.push("TARGET ---".to_string());
-        }
-        overlay.push(format!(
-            "HOTBAR {}",
-            self.registry.info(self.hotbar.state()).name
-        ));
-        if let Some(predictor) = &self.predictor {
-            let state = predictor.state();
-            overlay.push(format!(
-                "MODE {} GROUND {}",
-                if state.flying { "FLY" } else { "WALK" },
-                if state.on_ground { "YES" } else { "NO" }
-            ));
-            overlay.push(format!(
-                "VEL {:.2} {:.2} {:.2}",
-                state.velocity.x, state.velocity.y, state.velocity.z
-            ));
-            overlay.push(format!(
-                "PENDING {} CORRECTIONS {}",
-                predictor.pending_len(),
-                predictor.corrections()
-            ));
-        } else {
-            overlay.push("MODE --- (not joined)".to_string());
-        }
-        let terrain_stats = w.terrain.stats();
-        overlay.push(format!(
-            "CUBES {} MESHED {} PENDING {}",
-            self.world.cube_count(),
-            w.terrain.meshed_count(),
-            self.world.dirty_count() + self.in_flight
-        ));
-        overlay.push(format!(
-            "FACES {} PAGES {} CMDS {} DRAWS {} {}",
-            terrain_stats.faces,
-            terrain_stats.pages,
-            terrain_stats.commands,
-            terrain_stats.draw_calls,
-            w.terrain.path_name()
-        ));
-        // The cull counters are read back through a 3-deep ring, so this
-        // line is one or two frames late.
-        let cull = w.terrain.cull_stats();
-        overlay.push(format!(
-            "CULL DRAWN {} FRUSTUM {} OCCLUDED {}",
-            cull.drawn(),
-            cull.frustum_culled,
-            cull.occluded
-        ));
-        // Per LOD level: resident cubes, drawn cubes, masked octants —
-        // plus the LOD mesh queue length. While the level tint is on
-        // (task 2.10), the legend names each level's color.
-        overlay.push(self.lod_overlay_line(w));
-        if w.renderer.lod_tint() {
-            overlay.push(concat!(
-                "LOD TINT L1 2x2 red L2 4x4 yellow L3 8x8 green ",
-                "L4 16x16 cyan L5 32x32 blue L6 64x64 purple",
-            ));
+        for line in hud_lines(&snapshot) {
+            overlay.push(line);
         }
 
         // The autopilot finishes once its distance is flown: print the

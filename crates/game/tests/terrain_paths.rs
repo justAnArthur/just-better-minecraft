@@ -10,6 +10,7 @@
 #![cfg(not(feature = "cube16"))]
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use glam::DVec3;
 use image::RgbaImage;
@@ -20,6 +21,7 @@ use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
 use jbm_client::render::terrain::{Frustum, TerrainPass, TerrainPath};
 use jbm_client::render::texture_array::BlockTextures;
+use jbm_client::terrain_sync::TerrainSync;
 use jbm_client::testing::screenshot::{assert_matches_golden, gpu_or_skip};
 use jbm_client::world::ClientWorld;
 use jbm_core::block::{BlockRegistry, BlockStateId, builtin};
@@ -172,16 +174,20 @@ fn room_camera() -> (Camera, DVec3) {
     (camera, eye)
 }
 
-/// Re-meshes everything the world marked dirty and re-uploads it into the
-/// pass (the re-mesh path: meta slots rewritten in place).
-fn upload_dirty(gpu: &jbm_client::gpu::Gpu, world: &mut ClientWorld, terrain: &mut TerrainPass) {
+/// The builtin appearance table (for the pipeline's mesh pool and the
+/// synchronous re-mesh below).
+fn scene_appearance() -> Arc<BlockAppearance> {
     let mut registry = BlockRegistry::new();
     builtin::Blocks::register(&mut registry);
-    let appearance = BlockAppearance::new(&registry);
-    let dirty = world.take_dirty(usize::MAX, DVec3::ZERO);
-    for (pos, _, input) in dirty {
-        terrain.upload(gpu, pos, &mesh::mesh(&input, &appearance));
-    }
+    Arc::new(BlockAppearance::new(&registry))
+}
+
+/// Re-meshes everything the world marked dirty and re-uploads it into the
+/// pass (the re-mesh path: meta slots rewritten in place): the
+/// synchronous inline-mesh variant of the shared pipeline.
+fn upload_dirty(gpu: &jbm_client::gpu::Gpu, sync: &mut TerrainSync, terrain: &mut TerrainPass) {
+    let appearance = scene_appearance();
+    sync.settle_sync(gpu, terrain, &appearance, DVec3::ZERO);
 }
 
 /// Asserts two same-size images are exactly pixel-identical.
@@ -410,8 +416,9 @@ fn nothing_pops_in_across_a_moving_camera() {
         return;
     };
     let mut server = HeadlessServer::with_config(server_config());
-    let (mut world, meshes, spawn) = streamed_scene(&mut server, &[]);
-    carve_room(&mut world);
+    let (world, meshes, spawn) = streamed_scene(&mut server, &[]);
+    let mut sync = TerrainSync::with_world(world, scene_appearance(), 0);
+    carve_room(sync.world_mut());
 
     let target = OffscreenTarget::new(&gpu.device, 256, 256);
     let depth = DepthTarget::new(&gpu.device, 256, 256);
@@ -424,7 +431,7 @@ fn nothing_pops_in_across_a_moving_camera() {
     for (pos, mesh) in &meshes {
         terrain.upload(&gpu, *pos, mesh);
     }
-    upload_dirty(&gpu, &mut world, &mut terrain);
+    upload_dirty(&gpu, &mut sync, &mut terrain);
     if !terrain.gpu_cull_available() {
         println!("skipping: adapter lacks the gpu-cull path");
         return;
@@ -471,8 +478,9 @@ fn cave_culling_hides_the_buried_world() {
         return;
     };
     let mut server = HeadlessServer::with_config(server_config());
-    let (mut world, meshes, _) = streamed_scene(&mut server, &[]);
-    carve_room(&mut world);
+    let (world, meshes, _) = streamed_scene(&mut server, &[]);
+    let mut sync = TerrainSync::with_world(world, scene_appearance(), 0);
+    carve_room(sync.world_mut());
 
     let target = OffscreenTarget::new(&gpu.device, 256, 256);
     let depth = DepthTarget::new(&gpu.device, 256, 256);
@@ -484,7 +492,7 @@ fn cave_culling_hides_the_buried_world() {
     for (pos, mesh) in &meshes {
         terrain.upload(&gpu, *pos, mesh);
     }
-    upload_dirty(&gpu, &mut world, &mut terrain);
+    upload_dirty(&gpu, &mut sync, &mut terrain);
     if !terrain.gpu_cull_available() {
         println!("skipping: adapter lacks the gpu-cull path");
         return;

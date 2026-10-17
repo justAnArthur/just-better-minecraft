@@ -37,17 +37,11 @@ use std::time::{Duration, Instant};
 use glam::DVec3;
 use jbm_client::camera::Camera;
 use jbm_client::gpu::Gpu;
-use jbm_client::lod::Coverage;
-use jbm_client::mesh::appearance::{BlockAppearance, builtin_textures};
-use jbm_client::mesh::pool::MeshPool;
-use jbm_client::render::offscreen::OffscreenTarget;
-use jbm_client::render::renderer::{
-    DepthTarget, FrameInputs, HORIZON_COLOR, Renderer, ZENITH_COLOR,
-};
-use jbm_client::render::terrain::TerrainPass;
-use jbm_client::render::texture_array::BlockTextures;
+use jbm_client::mesh::appearance::BlockAppearance;
+use jbm_client::render::renderer::{HORIZON_COLOR, ZENITH_COLOR};
+use jbm_client::terrain_sync::TerrainSync;
+use jbm_client::testing::OffscreenRig;
 use jbm_client::testing::holes::{assert_only_pinholes, describe_holes, sentinel_components};
-use jbm_client::world::ClientWorld;
 use jbm_core::block::BlockRegistry;
 use jbm_core::block::builtin::Blocks;
 use jbm_core::link::ClientLink;
@@ -132,22 +126,18 @@ fn cruise_target(generator: &Generator, x: f64, z: f64, leg: Leg) -> f64 {
     (highest as f64) + clearance
 }
 
-/// The client half: world, mesh pool, coverage, renderer.
+/// The client half: the terrain pipeline and the offscreen rig, plus
+/// the protocol state the test drives (authoritative position, flying
+/// flag, ack seq).
 struct FlyClient {
-    world: ClientWorld,
-    pool: MeshPool,
-    coverage: Coverage,
-    in_flight: usize,
+    sync: TerrainSync,
     /// The authoritative player position, from the last `PlayerState`.
     server_pos: Option<DVec3>,
     /// The authoritative flying flag, and the last acknowledged input
     /// seq (`PlayerState::ack_seq`).
     server_flying: bool,
     server_ack: u64,
-    renderer: Renderer,
-    terrain: TerrainPass,
-    target: OffscreenTarget,
-    depth: DepthTarget,
+    rig: OffscreenRig,
 }
 
 impl FlyClient {
@@ -155,24 +145,12 @@ impl FlyClient {
         let mut registry = jbm_core::block::BlockRegistry::new();
         jbm_core::block::builtin::register(&mut registry);
         let appearance = Arc::new(BlockAppearance::new(&registry));
-        let target = OffscreenTarget::new(&gpu.device, WIDTH, HEIGHT);
-        let depth = DepthTarget::new(&gpu.device, WIDTH, HEIGHT);
-        let renderer = Renderer::new(gpu, target.format());
-        let (layers, _) = builtin_textures();
-        let textures = BlockTextures::new(gpu, &layers).expect("texture array");
-        let terrain = TerrainPass::new(gpu, target.format(), renderer.uniform_layout(), &textures);
         FlyClient {
-            world: ClientWorld::new(),
-            pool: MeshPool::new(appearance, 0),
-            coverage: Coverage::default(),
-            in_flight: 0,
+            sync: TerrainSync::new(appearance, 0),
             server_pos: None,
             server_flying: false,
             server_ack: 0,
-            renderer,
-            terrain,
-            target,
-            depth,
+            rig: OffscreenRig::new(gpu, WIDTH, HEIGHT),
         }
     }
 
@@ -187,9 +165,8 @@ impl FlyClient {
         !self.server_flying && self.server_ack >= toggle_seq
     }
 
-    /// Drains the link into the world, dropping GPU state for unloads
-    /// and capturing the `Welcome`'s spawn. Returns a fatal reason when
-    /// the link dies.
+    /// Drains the link into the terrain pipeline, capturing the
+    /// `Welcome`'s spawn. Returns a fatal reason when the link dies.
     fn pump_link(
         &mut self,
         gpu: &Gpu,
@@ -215,12 +192,7 @@ impl FlyClient {
                     | ServerMsg::LodCubeData { .. }
                     | ServerMsg::UnloadLodCube { .. }
                     | ServerMsg::BlockChange { .. } => {
-                        if let jbm_client::world::WorldChange::Unloaded(key) =
-                            self.world.apply(&msg)
-                        {
-                            self.terrain.remove(gpu, key);
-                            self.coverage.set_ready(key, false);
-                        }
+                        self.sync.apply(gpu, &mut self.rig.terrain, &msg);
                     }
                     _ => {}
                 },
@@ -230,29 +202,10 @@ impl FlyClient {
         }
     }
 
-    /// Submits and uploads meshes within the app budgets.
+    /// Submits and uploads meshes within the app budgets (16 submits,
+    /// 32 uploads per frame).
     fn pump_meshing(&mut self, gpu: &Gpu, camera: &Camera) {
-        let inputs = self.world.take_dirty(16, camera.position);
-        self.in_flight += inputs.len();
-        for (key, version, input) in inputs {
-            self.pool.submit(key, version, input);
-        }
-        let mut uploads = 0;
-        while uploads < 32 {
-            let Some(result) = self.pool.try_recv() else {
-                break;
-            };
-            self.in_flight -= 1;
-            if self.world.version(result.key) != Some(result.version) {
-                continue;
-            }
-            self.terrain.upload(gpu, result.key, &result.output);
-            self.coverage.set_ready(result.key, true);
-            uploads += 1;
-        }
-        for (key, drawn, mask) in self.coverage.take_changed() {
-            self.terrain.set_draw_state(gpu, key, drawn, mask);
-        }
+        self.sync.pump(gpu, &mut self.rig.terrain, camera, 16, 32);
     }
 
     /// One 50 ms server tick's worth of client frames: meshing pumped at
@@ -265,27 +218,13 @@ impl FlyClient {
     }
 
     fn queue_clear(&self) -> bool {
-        self.world.dirty_count() == 0 && self.in_flight == 0
+        self.sync.queue_clear()
     }
 
     /// Renders one frame with the sentinel sky and returns it.
     fn render(&mut self, gpu: &Gpu, camera: &Camera) -> image::RgbaImage {
-        self.renderer
-            .set_sky_colors(Some((HORIZON_COLOR, ZENITH_COLOR, SENTINEL)));
-        self.renderer.render(
-            gpu,
-            FrameInputs {
-                target: &self.target.create_view(),
-                depth: &self.depth,
-                camera,
-                terrain: Some(&mut self.terrain),
-                outline: None,
-                overlay: None,
-            },
-        );
-        let image = self.target.read_rgba(gpu);
-        self.renderer.set_sky_colors(None);
-        image
+        self.rig
+            .render_with_sky(gpu, camera, Some((HORIZON_COLOR, ZENITH_COLOR, SENTINEL)))
     }
 }
 
