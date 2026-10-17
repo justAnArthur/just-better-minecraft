@@ -1068,7 +1068,12 @@ impl ApplicationHandler for App {
                     key => {
                         // Game keys apply unless the open panel's egui
                         // wants the keyboard (a text box has focus).
+                        // Releases always apply, so a key held when egui
+                        // took the keyboard does not stay stuck down.
                         if !game_keys_enabled(self.panel_open, w.egui.wants_keyboard_input()) {
+                            if !pressed && let Some(mk) = map_key(key) {
+                                self.input.set_key(mk, false);
+                            }
                             return;
                         }
                         // F toggles flying: one edge per press, consumed by
