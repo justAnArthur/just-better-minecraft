@@ -11,7 +11,7 @@ use jbm_core::protocol::{ClientMsg, ServerMsg};
 use jbm_server::terrain::Generator;
 use jbm_server::worldgen::Preset;
 use jbm_server::{DEFAULT_SEED, ServerConfig};
-use jbm_testkit::HeadlessServer;
+use jbm_testkit::{HeadlessServer, desired_cube_count};
 
 /// The streaming shape of the spec: R = 3, V = 2, inline generation.
 fn config() -> ServerConfig {
@@ -36,9 +36,6 @@ fn config() -> ServerConfig {
     }
 }
 
-/// Cubes in the desired set for R = 3, V = 2: 29 columns of 5.
-const DESIRED_CUBES: usize = 29 * 5;
-
 /// Joins and waits for the whole desired set to stream in. Returns the
 /// world with the dirty queue drained.
 fn loaded_world(server: &mut HeadlessServer) -> (jbm_testkit::TestClient, ClientWorld) {
@@ -49,13 +46,13 @@ fn loaded_world(server: &mut HeadlessServer) -> (jbm_testkit::TestClient, Client
         for msg in client.drain() {
             world.apply(&msg);
         }
-        if client.loaded().len() == DESIRED_CUBES {
+        if client.loaded().len() == desired_cube_count(&config()) {
             break;
         }
     }
     assert_eq!(
         client.loaded().len(),
-        DESIRED_CUBES,
+        desired_cube_count(&config()),
         "streaming did not settle"
     );
     let _ = world.take_dirty(usize::MAX, DVec3::ZERO);

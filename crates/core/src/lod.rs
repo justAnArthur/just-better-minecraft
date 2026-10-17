@@ -50,11 +50,92 @@
 //! it with registry data, but it must stay local.
 
 use crate::block::BlockStateId;
-use crate::coords::{CUBE_SIZE, CubePos, LocalPos};
+use crate::coords::{BlockPos, CUBE_BITS, CUBE_SIZE, CubePos, LocalPos};
 use crate::cube::Cube;
 
 /// Children per parent cell.
 pub const CHILDREN: usize = 8;
+
+/// A cube at a LOD level. Level 0 is the streamed world itself ("LOD0");
+/// a level-*n* cube at `pos` covers blocks `pos * CUBE_SIZE * 2^n` onwards
+/// and each of its cells is `2^n` blocks per side. One key type names
+/// meshes, mesh jobs, GPU residency and coverage entries at every level,
+/// on both sides of the link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CubeKey {
+    pub level: u8,
+    pub pos: CubePos,
+}
+
+impl CubeKey {
+    /// The LOD0 cube at `pos`.
+    pub fn lod0(pos: CubePos) -> CubeKey {
+        CubeKey { level: 0, pos }
+    }
+
+    /// The parent cube one level up, and which octant of it this key fills
+    /// (`dx + 2·dz + 4·dy`, as in [`parent`]). Callers with a level cap
+    /// (the client's coverage tree stops at a fixed level) guard it
+    /// themselves; the math itself is total.
+    pub fn parent(&self) -> (CubeKey, u8) {
+        let (pos, octant) = parent(self.pos);
+        (
+            CubeKey {
+                level: self.level + 1,
+                pos,
+            },
+            octant,
+        )
+    }
+
+    /// The child cube filling `octant` of this one, one level down.
+    pub fn child(&self, octant: u8) -> CubeKey {
+        debug_assert!(self.level > 0, "level 0 has no children");
+        let [dx, dy, dz] = octant_offset(octant);
+        CubeKey {
+            level: self.level - 1,
+            pos: CubePos {
+                x: self.pos.x * 2 + dx as i32,
+                y: self.pos.y * 2 + dy as i32,
+                z: self.pos.z * 2 + dz as i32,
+            },
+        }
+    }
+
+    /// The world-space side length of one cube at this level, in blocks:
+    /// `CUBE_SIZE * 2^level`.
+    pub fn block_size(&self) -> u64 {
+        u64::from(CUBE_SIZE as u32) << self.level
+    }
+
+    /// The world-space corner block of this cube — its minimum block
+    /// coordinate on every axis.
+    pub fn min_block(&self) -> BlockPos {
+        debug_assert!(self.level < 32, "level shifts past any i64 coordinate");
+        let size = i64::from(CUBE_SIZE) << self.level;
+        BlockPos {
+            x: i64::from(self.pos.x) * size,
+            y: i64::from(self.pos.y) * size,
+            z: i64::from(self.pos.z) * size,
+        }
+    }
+
+    /// The level-`level` cube containing block `pos` — floor arithmetic,
+    /// so block -1 lands in cube -1 exactly as [`BlockPos::split`] at
+    /// level 0. The inverse of [`CubeKey::min_block`] on the cube's span.
+    pub fn containing(level: u8, pos: BlockPos) -> CubeKey {
+        debug_assert!(level < 32, "level shifts past any i64 coordinate");
+        let shift = CUBE_BITS + level as u32;
+        CubeKey {
+            level,
+            pos: CubePos {
+                x: (pos.x >> shift) as i32,
+                y: (pos.y >> shift) as i32,
+                z: (pos.z >> shift) as i32,
+            },
+        }
+    }
+}
 
 /// The downsampling rule for one cell: a pure function of the eight child
 /// states, indexed `c = dx + 2·dz + 4·dy`. See the module docs for the rule
@@ -349,6 +430,7 @@ pub fn copy_octant(src: &Cube, parent: &mut Cube, octant: u8) -> Option<CellBox>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     const AIR: BlockStateId = BlockStateId::AIR;
     const STONE: BlockStateId = BlockStateId(1);
@@ -572,6 +654,100 @@ mod tests {
 
     // ------------------------------------------------------------------
     // Octants and regions
+
+    fn key(level: u8, x: i32, y: i32, z: i32) -> CubeKey {
+        CubeKey {
+            level,
+            pos: CubePos { x, y, z },
+        }
+    }
+
+    #[test]
+    fn cube_key_parent_child_round_trip_at_negative_coordinates() {
+        for (level, x, y, z) in [
+            (1u8, -3i32, -2i32, -1i32),
+            (2, -1, 0, 1),
+            (3, 7, -8, 9),
+            (0, -5, 5, -6),
+        ] {
+            let k = key(level, x, y, z);
+            let (parent, octant) = k.parent();
+            assert_eq!(parent.child(octant), k);
+            assert_eq!(parent.level, level + 1);
+            assert_eq!(parent.pos.x, x.div_euclid(2));
+        }
+        // Level 0 children of a level-1 cube tile its volume exactly.
+        let parent = key(1, -2, 3, -4);
+        let mut seen = HashSet::new();
+        for octant in 0..8u8 {
+            let child = parent.child(octant);
+            assert_eq!(child.level, 0);
+            assert!(seen.insert(child), "octants overlap");
+            let (back, o) = child.parent();
+            assert_eq!((back, o), (parent, octant));
+        }
+    }
+
+    #[test]
+    fn cube_key_block_size_scales_with_level() {
+        assert_eq!(key(0, 0, 0, 0).block_size(), u64::from(CUBE_SIZE as u32));
+        assert_eq!(
+            key(1, 0, 0, 0).block_size(),
+            u64::from(CUBE_SIZE as u32) * 2
+        );
+        assert_eq!(
+            key(4, 0, 0, 0).block_size(),
+            u64::from(CUBE_SIZE as u32) * 16
+        );
+    }
+
+    /// `min_block` and `containing` are inverses over the cube's whole
+    /// block span, negative coordinates included, and `containing(0, p)`
+    /// agrees with `BlockPos::split`.
+    #[test]
+    fn cube_key_min_block_and_containing_round_trip() {
+        for (level, x, y, z) in [(0u8, 0i32, 0, 0), (1, -1, 2, -3), (3, 5, -6, 7)] {
+            let k = key(level, x, y, z);
+            let min = k.min_block();
+            let size = k.block_size() as i64;
+            assert_eq!(CubeKey::containing(level, min), k);
+            assert_eq!(
+                CubeKey::containing(
+                    level,
+                    BlockPos {
+                        x: min.x + size - 1,
+                        y: min.y + size - 1,
+                        z: min.z + size - 1,
+                    }
+                ),
+                k
+            );
+            // One block past the span on any axis belongs to a neighbour.
+            assert_ne!(
+                CubeKey::containing(
+                    level,
+                    BlockPos {
+                        x: min.x + size,
+                        y: min.y,
+                        z: min.z,
+                    }
+                ),
+                k
+            );
+        }
+        // Level 0 is exactly `BlockPos::split`.
+        for (x, y, z) in [(0i64, 1, -1), (-33, 32, 31), (64, -65, 96)] {
+            let pos = BlockPos { x, y, z };
+            let (split_pos, _) = pos.split();
+            assert_eq!(
+                CubeKey::containing(0, pos),
+                CubeKey {
+                    level: 0,
+                    pos: split_pos
+                }
+            );
+        }
+    }
 
     #[test]
     fn parent_and_octant_round_trip() {

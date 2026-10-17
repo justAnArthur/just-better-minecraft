@@ -17,7 +17,8 @@ coordinates and cfg-gated off under the crate's own `cube16` passthrough;
   for the window.
 - `camera::Camera` — f64 position, yaw/pitch (pitch clamped to ±89°),
   reverse-Z infinite-far projection, camera-relative `view_proj()` and
-  `relative()`.
+  `relative()`; `Camera::looking_at(eye, look_at, fov, aspect)` is the
+  fixed-camera constructor the tests and the playground share.
 - `input::InputState` — winit-independent key set, mouse delta
   accumulation and the F-key fly-toggle edge; `input::move_input` maps
   held keys onto the physics `MoveInput`, `input::apply_mouse_look`
@@ -79,8 +80,9 @@ coordinates and cfg-gated off under the crate's own `cube16` passthrough;
   behind the pages (pure logic, no wgpu).
 - `render::overlay` — debug overlay (`OverlayText`, `OverlayRenderer`,
   `FrameStats`).
-- `lod` — the client's LOD state (task 2.6): the `CubeKey` every level
-  shares and the coverage rule (`Coverage`).
+- `lod` — the client's LOD state (task 2.6): the coverage rule
+  (`Coverage`) and `core::lod::CubeKey` re-exported as
+  `jbm_client::lod::CubeKey`, the one path every call site uses.
 - `render::texture_array::BlockTextures` + `placeholder_layers(n)` —
   block texture array with CPU-generated mipmaps (repeat addressing so
   merged faces tile per block), plus each layer's average color (task
@@ -114,6 +116,14 @@ coordinates and cfg-gated off under the crate's own `cube16` passthrough;
   with `render_with_sky(gpu, camera, sky) -> RgbaImage` (sky-color
   override for this frame only) and `read_depth(gpu)`. Tests keep only
   their protocol state and drive a `TerrainSync` against `rig.terrain`.
+- `testing::heightfield` (same gate) — the heightfield-to-cube scene
+  fixtures shared by the rings test and the game's rings/cube-size
+  benches: `HeightGrid::build(xs, zs, step, height)` (a cached height
+  grid over a block span), `max_over_cell(x, z, level)` (the
+  solid-leaning coarse sample; a cell at `y` is filled iff
+  `y < max_over_cell`) and `layer_state(blocks, y, surface,
+  sand_level)` (grass/dirt/stone, sand below the sea level a caller
+  passes, `None` for no sand; air stays the caller's case).
 
 ## Invariants
 

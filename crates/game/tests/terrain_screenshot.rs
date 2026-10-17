@@ -18,31 +18,13 @@ use jbm_core::block::builtin::Blocks;
 use jbm_core::protocol::ServerMsg;
 use jbm_server::worldgen::Preset;
 use jbm_server::{DEFAULT_SEED, ServerConfig};
-use jbm_testkit::HeadlessServer;
+use jbm_testkit::{HeadlessServer, desired_cube_count};
 
-/// Cubes in the streaming shape for R = 3, V = 2: 29 columns of 5.
-const DESIRED_CUBES: usize = 29 * 5;
-
-/// A camera at `eye` looking at `look_at`.
-fn looking_at(eye: DVec3, look_at: DVec3) -> Camera {
-    let d = look_at - eye;
-    let yaw = f32::atan2(d.x as f32, -d.z as f32);
-    let pitch = f32::atan2(d.y as f32, d.x.hypot(d.z) as f32);
-    let mut camera = Camera::new(eye, 70.0_f32.to_radians(), 1.0);
-    camera.set_yaw(yaw);
-    camera.set_pitch(pitch);
-    camera
-}
-
-#[test]
+/// The scene's server: R = 3, V = 2, inline generation (keeps the
+/// streamed set deterministic), no LOD rings.
 #[cfg(not(feature = "cube16"))] // streaming shape and golden are 32³-only
-fn streamed_terrain_matches_golden() {
-    let Some(gpu) = gpu_or_skip() else {
-        return;
-    };
-
-    // Inline generation keeps the streamed set deterministic.
-    let mut server = HeadlessServer::with_config(ServerConfig {
+fn server_config() -> ServerConfig {
+    ServerConfig {
         worldgen: Preset::Classic, // pin the pre-2.8 terrain: this golden predates it
         seed: DEFAULT_SEED,
         streaming: true,
@@ -60,7 +42,17 @@ fn streamed_terrain_matches_golden() {
         lod_send_budget_per_tick: 32,
         lod_max_in_flight: 256,
         ..ServerConfig::default()
-    });
+    }
+}
+
+#[test]
+#[cfg(not(feature = "cube16"))] // streaming shape and golden are 32³-only
+fn streamed_terrain_matches_golden() {
+    let Some(gpu) = gpu_or_skip() else {
+        return;
+    };
+
+    let mut server = HeadlessServer::with_config(server_config());
     let mut client = server.connect("viewer");
     let mut world = ClientWorld::new();
     let mut spawn = None;
@@ -72,13 +64,13 @@ fn streamed_terrain_matches_golden() {
             }
             world.apply(&msg);
         }
-        if client.loaded().len() == DESIRED_CUBES {
+        if client.loaded().len() == desired_cube_count(&server_config()) {
             break;
         }
     }
     assert_eq!(
         client.loaded().len(),
-        DESIRED_CUBES,
+        desired_cube_count(&server_config()),
         "streaming did not settle"
     );
     let spawn = spawn.expect("no Welcome");
@@ -95,15 +87,17 @@ fn streamed_terrain_matches_golden() {
     Blocks::register(&mut registry);
     let appearance = BlockAppearance::new(&registry);
     let dirty = world.take_dirty(usize::MAX, spawn);
-    assert_eq!(dirty.len(), DESIRED_CUBES);
+    assert_eq!(dirty.len(), desired_cube_count(&server_config()));
     for (pos, _, input) in dirty {
         terrain.upload(&gpu, pos, &mesh::mesh(&input, &appearance));
     }
 
     // Above and behind spawn, looking down across it.
-    let camera = looking_at(
+    let camera = Camera::looking_at(
         spawn + DVec3::new(-24.0, 20.0, -24.0),
         spawn + DVec3::new(24.0, -8.0, 24.0),
+        70.0_f32.to_radians(),
+        1.0,
     );
     renderer.render(
         &gpu,

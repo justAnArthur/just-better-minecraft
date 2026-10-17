@@ -17,6 +17,7 @@ pub mod rings;
 
 use jbm_client::mesh::appearance::BlockAppearance;
 use jbm_client::mesh::{MeshInput, neighbor_index};
+use jbm_client::testing::heightfield::layer_state;
 use jbm_core::block::BlockRegistry;
 use jbm_core::block::BlockStateId;
 use jbm_core::block::builtin::Blocks;
@@ -30,22 +31,13 @@ const SAND_LEVEL: i64 = 61;
 
 /// The 1.5 block layering, mirrored from the server's `block_at`: grass at
 /// h, dirt from h-3 to h-1, stone below, sand where h <= 61, air above.
-/// Per-column: only `h` and `y` matter.
+/// Per-column: only `h` and `y` matter. The shared `layer_state` carries
+/// the solid layers; air is this caller's own case.
 fn state_at(blocks: &Blocks, h: i64, y: i64) -> BlockStateId {
     if y > h {
         BlockStateId::AIR
-    } else if h <= SAND_LEVEL {
-        if y >= h - 3 {
-            blocks.sand
-        } else {
-            blocks.stone
-        }
-    } else if y == h {
-        blocks.grass_block
-    } else if y >= h - 3 {
-        blocks.dirt
     } else {
-        blocks.stone
+        layer_state(blocks, y, h, Some(SAND_LEVEL))
     }
 }
 

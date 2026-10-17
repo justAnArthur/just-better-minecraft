@@ -34,6 +34,7 @@ use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
 use jbm_client::render::terrain::{TerrainPass, TerrainPath};
 use jbm_client::render::texture_array::BlockTextures;
 use jbm_client::terrain_sync::TerrainSync;
+use jbm_client::testing::heightfield::{HeightGrid, layer_state};
 use jbm_client::testing::holes::{
     PinholeRule, assert_only_pinholes_with, component_details, describe_holes, sentinel_components,
 };
@@ -81,67 +82,17 @@ fn block_span() -> (Range<i64>, Range<i64>) {
     (-reach..reach, -reach..reach)
 }
 
-/// Precomputed heights over the scene's block span.
-struct HeightGrid {
-    min_x: i64,
-    min_z: i64,
-    stride: usize,
-    heights: Vec<i16>,
+/// Precomputed heights over the scene's block span (the shared
+/// heightfield grid at per-block stride; this scene has no sand).
+fn height_grid() -> HeightGrid {
+    let (xs, zs) = block_span();
+    HeightGrid::build(xs, zs, 1, height_at)
 }
 
-impl HeightGrid {
-    fn build() -> HeightGrid {
-        let (xs, zs) = block_span();
-        let stride = (zs.end - zs.start) as usize;
-        let mut heights = Vec::with_capacity((xs.end - xs.start) as usize * stride);
-        for x in xs.clone() {
-            for z in zs.clone() {
-                heights.push(height_at(x, z) as i16);
-            }
-        }
-        HeightGrid {
-            min_x: xs.start,
-            min_z: zs.start,
-            stride,
-            heights,
-        }
-    }
-
-    fn at(&self, x: i64, z: i64) -> i64 {
-        let index = ((x - self.min_x) as usize) * self.stride + (z - self.min_z) as usize;
-        i64::from(self.heights[index])
-    }
-
-    /// The solid-leaning level-`level` sample of the heightfield for the
-    /// cell with block corner `(x, y, z)` (all multiples of the cell
-    /// size): filled when the terrain pokes above the cell's top
-    /// anywhere in its footprint. The max runs over the 3x3 grid at half
-    /// the cell step — the corner points of the four child-level cells —
-    /// so a coarser sample can never sit below the finer level's sample
-    /// it replaces (that ordering is what keeps level seams skirt- and
-    /// gap-free: the coarse surface hangs over or meets the fine one).
-    fn cell_filled(&self, x: i64, y: i64, z: i64, level: u8) -> bool {
-        let step = (1i64 << level).max(2);
-        let half = step / 2;
-        let mut max_height = i64::MIN;
-        for i in 0..3 {
-            for j in 0..3 {
-                max_height = max_height.max(self.at(x + i * half, z + j * half));
-            }
-        }
-        y < max_height
-    }
-}
-
-/// Layering for the scene: grass on top, dirt below, stone at depth.
+/// Layering for the scene: grass on top, dirt below, stone at depth (no
+/// sand in this synthetic scene).
 fn scene_state(blocks: &Blocks, y: i64, surface: i64) -> BlockStateId {
-    if y == surface {
-        blocks.grass_block
-    } else if y >= surface - 3 {
-        blocks.dirt
-    } else {
-        blocks.stone
-    }
+    layer_state(blocks, y, surface, None)
 }
 
 /// The exact level-0 cube at `pos`.
@@ -167,10 +118,10 @@ fn sampled_cube(grid: &HeightGrid, blocks: &Blocks, pos: CubePos, level: u8) -> 
         let x = base_x + i64::from(local.x) * cell_blocks;
         let y = base_y + i64::from(local.y) * cell_blocks;
         let z = base_z + i64::from(local.z) * cell_blocks;
-        if grid.cell_filled(x, y, z, level) {
+        if y < grid.max_over_cell(x, z, level) {
             // Material: grass at the topmost filled cell of the column,
             // sampled at the cell's corner.
-            let above_filled = grid.cell_filled(x, y + cell_blocks, z, level);
+            let above_filled = y + cell_blocks < grid.max_over_cell(x, z, level);
             if above_filled {
                 blocks.stone
             } else {
@@ -221,7 +172,7 @@ fn build_scene() -> (ClientWorld, BlockAppearance, Blocks) {
     let mut registry = BlockRegistry::new();
     let blocks = Blocks::register(&mut registry);
     let appearance = BlockAppearance::new(&registry);
-    let grid = HeightGrid::build();
+    let grid = height_grid();
 
     let mut world = ClientWorld::new();
 
@@ -375,9 +326,11 @@ fn cameras() -> Vec<(&'static str, Camera, bool)> {
     // 1. Close, slightly down, spanning a LOD0/LOD1 border ahead.
     let mut cams: Vec<(&'static str, Camera, bool)> = vec![(
         "close",
-        looking_at(
+        Camera::looking_at(
             center + DVec3::new(24.0, 26.0, 24.0),
             surface + DVec3::new(-30.0, -6.0, -30.0),
+            FOV,
+            1.0,
         ),
         true,
     )];
@@ -385,22 +338,35 @@ fn cameras() -> Vec<(&'static str, Camera, bool)> {
     // the level-0 disk ends near x = 64..80).
     cams.push((
         "zoom_border01",
-        looking_at(DVec3::new(-20.0, 96.0, 16.0), DVec3::new(70.0, 62.0, 16.0)).zoomed(0.45),
+        Camera::looking_at(
+            DVec3::new(-20.0, 96.0, 16.0),
+            DVec3::new(70.0, 62.0, 16.0),
+            FOV,
+            1.0,
+        )
+        .zoomed(0.45),
         false,
     ));
     // 3. Steep-down onto the LOD0/LOD1 border.
     cams.push((
         "down_border01",
-        looking_at(DVec3::new(16.0, 130.0, 110.0), DVec3::new(60.0, 60.0, 30.0)),
+        Camera::looking_at(
+            DVec3::new(16.0, 130.0, 110.0),
+            DVec3::new(60.0, 60.0, 30.0),
+            FOV,
+            1.0,
+        ),
         false,
     ));
     // 4. Straight at the LOD1/LOD2 border (level-1 disk ends near
     // x = 3*64 = 192..256 blocks).
     cams.push((
         "border12",
-        looking_at(
+        Camera::looking_at(
             DVec3::new(60.0, 110.0, 60.0),
             DVec3::new(240.0, 60.0, -40.0),
+            FOV,
+            1.0,
         ),
         true,
     ));
@@ -409,27 +375,33 @@ fn cameras() -> Vec<(&'static str, Camera, bool)> {
     // corner columns; look down the diagonal from high up.
     cams.push((
         "corner3",
-        looking_at(
+        Camera::looking_at(
             DVec3::new(-120.0, 200.0, -120.0),
             DVec3::new(280.0, 40.0, 280.0),
+            FOV,
+            1.0,
         ),
         true,
     ));
     // 6. Low toward the horizon across all rings.
     cams.push((
         "horizon",
-        looking_at(
+        Camera::looking_at(
             DVec3::new(16.0, 92.0, 16.0),
             DVec3::new(600.0, 60.0, -500.0),
+            FOV,
+            1.0,
         ),
         false,
     ));
     // 7. High above, looking across the whole ring stack.
     cams.push((
         "high",
-        looking_at(
+        Camera::looking_at(
             DVec3::new(-300.0, 420.0, -300.0),
             DVec3::new(80.0, 50.0, 80.0),
+            FOV,
+            1.0,
         ),
         false,
     ));
@@ -439,20 +411,16 @@ fn cameras() -> Vec<(&'static str, Camera, bool)> {
     // disk sees legitimate below-horizon sky everywhere near it.)
     cams.push((
         "outside_in",
-        looking_at(DVec3::new(700.0, 190.0, 700.0), DVec3::new(0.0, 60.0, 0.0)).zoomed(0.5),
+        Camera::looking_at(
+            DVec3::new(700.0, 190.0, 700.0),
+            DVec3::new(0.0, 60.0, 0.0),
+            FOV,
+            1.0,
+        )
+        .zoomed(0.5),
         false,
     ));
     cams
-}
-
-fn looking_at(eye: DVec3, look_at: DVec3) -> Camera {
-    let d = look_at - eye;
-    let yaw = f32::atan2(d.x as f32, -d.z as f32);
-    let pitch = f32::atan2(d.y as f32, d.x.hypot(d.z) as f32);
-    let mut camera = Camera::new(eye, FOV, 1.0);
-    camera.set_yaw(yaw);
-    camera.set_pitch(pitch);
-    camera
 }
 
 /// Renders one frame with the sentinel sky and returns the image.
@@ -647,7 +615,7 @@ fn lod0_lod1_border_is_invisible_with_flat_colors() {
     renderer.set_view_distance(64.0, 1.0e9);
     renderer.set_fog(false);
 
-    let grid = HeightGrid::build();
+    let grid = height_grid();
     for name in ["zoom_border01", "down_border01"] {
         let (_, camera, _) = cameras()
             .into_iter()
@@ -956,7 +924,12 @@ fn a_lod1_cube_renders_like_its_pattern_scaled() {
         // but covers the same blocks, so the coarse cube must land on
         // exactly the same pixels with the same per-block textures —
         // that is the x2 scale invariance under test.
-        let camera = looking_at(DVec3::new(48.0, 52.0, 48.0), DVec3::new(14.0, 8.0, 14.0));
+        let camera = Camera::looking_at(
+            DVec3::new(48.0, 52.0, 48.0),
+            DVec3::new(14.0, 8.0, 14.0),
+            FOV,
+            1.0,
+        );
         let _ = level;
         renderer.render(
             &gpu,
@@ -1016,7 +989,12 @@ fn a_lod1_cube_renders_like_its_pattern_scaled() {
     for (key, drawn, mask) in coverage.take_changed() {
         terrain.set_draw_state(&gpu, key, drawn, mask);
     }
-    let camera = looking_at(DVec3::new(96.0, 104.0, 96.0), DVec3::new(28.0, 16.0, 28.0));
+    let camera = Camera::looking_at(
+        DVec3::new(96.0, 104.0, 96.0),
+        DVec3::new(28.0, 16.0, 28.0),
+        FOV,
+        1.0,
+    );
     let mut reference: Option<RgbaImage> = None;
     for path in [
         TerrainPath::GpuCull,
@@ -1097,7 +1075,12 @@ fn masked_octants_hide_their_volume_and_full_masks_draw_nothing() {
     // its quarter of the table was. The camera looks at the cube's
     // corner between octants.
     terrain.set_draw_state(&gpu, key, true, 0x01);
-    let camera = looking_at(DVec3::new(96.0, 80.0, 96.0), DVec3::new(30.0, 30.0, 30.0));
+    let camera = Camera::looking_at(
+        DVec3::new(96.0, 80.0, 96.0),
+        DVec3::new(30.0, 30.0, 30.0),
+        FOV,
+        1.0,
+    );
     let image = render_sentinel(&gpu, &mut renderer, &target, &depth, &mut terrain, &camera);
     let components = sentinel_components(&image, below_margin_region(&camera, image.height()));
     assert!(

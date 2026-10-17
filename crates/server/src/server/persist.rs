@@ -8,6 +8,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use jbm_core::coords::CubePos;
+use jbm_core::lod::CubeKey;
 
 use super::Server;
 use crate::storage::{PlayerRecord, Storage};
@@ -25,7 +26,7 @@ const FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Default)]
 pub(super) struct SaveBatch {
     cubes: Vec<(CubePos, jbm_core::cube::Cube, u64)>,
-    lod: Vec<(u8, CubePos, jbm_core::cube::Cube, u8)>,
+    lod: Vec<(CubeKey, jbm_core::cube::Cube, u8)>,
     players: Vec<(String, PlayerRecord)>,
 }
 
@@ -41,11 +42,11 @@ pub(super) enum SaveAck {
     /// records are now on disk.
     Committed(
         Vec<(CubePos, u64)>,
-        Vec<(u8, CubePos)>,
+        Vec<CubeKey>,
         Vec<(String, PlayerRecord)>,
     ),
     /// The batch failed; these cubes stay dirty and retry next interval.
-    Failed(Vec<CubePos>, Vec<(u8, CubePos)>),
+    Failed(Vec<CubePos>, Vec<CubeKey>),
 }
 
 /// Per-cube edit bookkeeping (persistence only): the edit version, bumped by
@@ -93,14 +94,15 @@ impl Server {
     fn collect_lod_dirty(&mut self, batch: &mut SaveBatch) {
         let dirty = self.lod.take_store_dirty();
         for (level, pos) in dirty {
-            if self.lod_pending_save.contains(&(level, pos)) {
+            let key = CubeKey { level, pos };
+            if self.lod_pending_save.contains(&key) {
                 self.lod.mark_store_dirty(&[(level, pos)]);
                 continue;
             }
             if let Some(lc) = self.lod.get(level, pos)
                 && lc.ready()
             {
-                batch.lod.push((level, pos, lc.cube.clone(), lc.known));
+                batch.lod.push((key, lc.cube.clone(), lc.known));
             }
         }
     }
@@ -171,7 +173,11 @@ impl Server {
                 for key in &lod {
                     self.lod_pending_save.remove(key);
                 }
-                self.lod.mark_store_dirty(&lod);
+                let keys: Vec<(u8, CubePos)> = lod
+                    .iter()
+                    .map(|&CubeKey { level, pos }| (level, pos))
+                    .collect();
+                self.lod.mark_store_dirty(&keys);
             }
         }
     }
@@ -187,7 +193,7 @@ impl Server {
             self.pending_save.insert(*pos, *version);
         }
         self.lod_pending_save
-            .extend(batch.lod.iter().map(|&(level, pos, _, _)| (level, pos)));
+            .extend(batch.lod.iter().map(|&(key, _, _)| key));
         match &self.save_tx {
             Some(tx) if tx.send(batch).is_ok() => self.sent_batches += 1,
             _ => eprintln!("jbm: the save thread is gone; unsaved edits may be lost"),
@@ -250,16 +256,14 @@ pub(super) fn save_loop(
             .iter()
             .map(|(pos, cube, _)| (*pos, cube))
             .collect();
+        // The pyramid and storage APIs spell `(level, pos)`; the batch and
+        // the acks carry the key.
         let lod_refs: Vec<(u8, CubePos, &jbm_core::cube::Cube, u8)> = batch
             .lod
             .iter()
-            .map(|&(level, pos, ref cube, known)| (level, pos, cube, known))
+            .map(|&(CubeKey { level, pos }, ref cube, known)| (level, pos, cube, known))
             .collect();
-        let lod_keys: Vec<(u8, CubePos)> = batch
-            .lod
-            .iter()
-            .map(|&(level, pos, _, _)| (level, pos))
-            .collect();
+        let lod_keys: Vec<CubeKey> = batch.lod.iter().map(|&(key, _, _)| key).collect();
         let ack = match storage.save_lod_batch(&refs, &lod_refs, &batch.players) {
             Ok(()) => SaveAck::Committed(
                 batch

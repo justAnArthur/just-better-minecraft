@@ -4,7 +4,6 @@
 
 use std::collections::BTreeMap;
 
-use jbm_core::block::BlockRegistry;
 use jbm_core::block::BlockStateId;
 use jbm_core::block::builtin::Blocks;
 use jbm_core::coords::{CubePos, LocalPos};
@@ -12,10 +11,10 @@ use jbm_server::DEFAULT_SEED;
 use jbm_server::terrain::{Generator, MAX_HEIGHT, MIN_HEIGHT};
 use jbm_server::worldgen::reference::ReferenceGenerator;
 use jbm_server::worldgen::{GRID_SIDE, Graph, Node, NodeValue, Outputs, Preset, Salt, compile};
+use jbm_testkit::builtin_blocks;
 
 fn blocks() -> Blocks {
-    let mut registry = BlockRegistry::new();
-    Blocks::register(&mut registry)
+    builtin_blocks()
 }
 
 /// The graph side of every equivalence test here is the **classic** preset:

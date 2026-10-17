@@ -55,6 +55,19 @@ impl Camera {
         self.pitch = pitch.clamp(-MAX_PITCH, MAX_PITCH);
     }
 
+    /// A camera at `eye` looking toward `look_at`, with the given fov and
+    /// aspect — the fixed-camera constructor tests and the playground use.
+    /// Yaw 0 looks toward -Z; pitch is clamped like [`Camera::set_pitch`].
+    pub fn looking_at(eye: DVec3, look_at: DVec3, fov_y: f32, aspect: f32) -> Camera {
+        let d = look_at - eye;
+        let yaw = f32::atan2(d.x as f32, -d.z as f32);
+        let pitch = f32::atan2(d.y as f32, d.x.hypot(d.z) as f32);
+        let mut camera = Camera::new(eye, fov_y, aspect);
+        camera.set_yaw(yaw);
+        camera.set_pitch(pitch);
+        camera
+    }
+
     /// Unit look direction: yaw 0 pitch 0 is (0, 0, -1).
     pub fn forward(&self) -> Vec3 {
         let (sy, cy) = self.yaw.sin_cos();
@@ -183,5 +196,27 @@ mod tests {
         let rel = c.relative(DVec3::new(1.0e9 + 1.0e-3, 0.0, 0.0));
         assert!((rel.x - 1.0e-3).abs() < 1.0e-6, "rel.x: {}", rel.x);
         assert!(rel.y.abs() < 1e-9 && rel.z.abs() < 1e-9);
+    }
+
+    #[test]
+    fn looking_at_aims_forward_at_the_target() {
+        // Straight down -Z: yaw 0, pitch 0.
+        let c = Camera::looking_at(
+            DVec3::ZERO,
+            DVec3::new(0.0, 0.0, -10.0),
+            70.0_f32.to_radians(),
+            1.0,
+        );
+        assert!(c.forward().abs_diff_eq(Vec3::new(0.0, 0.0, -1.0), 1e-6));
+        // From +X toward the origin: the direction is -X (yaw -90°, so
+        // forward.x = sin(-90°) = -1), pitched down 45°.
+        let c = Camera::looking_at(
+            DVec3::new(10.0, 10.0, 0.0),
+            DVec3::ZERO,
+            70.0_f32.to_radians(),
+            1.0,
+        );
+        assert!((c.yaw - (-90.0_f32.to_radians())).abs() < 1e-5);
+        assert!((c.pitch - (-45.0_f32.to_radians())).abs() < 1e-5);
     }
 }

@@ -396,6 +396,10 @@ without physics; the next tick's streaming observes the new center.
 
 `ServerConfig::protocol_only()` turns streaming off with no generation
 threads — what exact-message-sequence tests and benches use.
+`ServerConfig::ring_radii()` gives the far-look view distances in blocks
+(the LOD0 disk radius and the outermost LOD ring's radius); the client
+cannot learn them from the link, so the game passes them along at
+startup.
 
 A connection is pending until a valid `Hello` (matching `PROTOCOL_VERSION`),
 then joined with a fresh `PlayerId` starting at 1. `Welcome.spawn` is the

@@ -3,33 +3,20 @@
 //! statistics hold at the 8 km scale, water fills the ocean at LOD0 and
 //! LOD1, and the spawn search lands on gentle land for every seed.
 
-use jbm_core::block::{BlockRegistry, BlockStateId, builtin::Blocks};
+use jbm_core::block::BlockStateId;
+use jbm_core::block::builtin::Blocks;
 use jbm_core::coords::{CubePos, LocalPos};
 use jbm_server::DEFAULT_SEED;
 use jbm_server::terrain::{Generator, MAX_HEIGHT, MIN_HEIGHT, SEA_LEVEL};
 use jbm_server::worldgen::{self, Preset};
+use jbm_testkit::builtin_blocks;
 
 fn blocks() -> Blocks {
-    let mut registry = BlockRegistry::new();
-    Blocks::register(&mut registry)
+    builtin_blocks()
 }
 
 fn overworld(seed: u64) -> Generator {
     Generator::with_preset(seed, blocks(), Preset::Overworld)
-}
-
-/// Small local xorshift, so tests never need the `rand` crate.
-struct XorShift64(u64);
-
-impl XorShift64 {
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
 }
 
 /// The block at world `(x, y, z)`, through the cube that contains it.
@@ -47,7 +34,7 @@ fn overworld_bounds_are_sound_over_100k_columns() {
     let compiled = worldgen::overworld();
     // 100,000 seeded single-block samples, |x|, |z| up to 2^30, each inside
     // its own one-block interval bound. y spans the band plus margin.
-    let mut rng = XorShift64(0x5EED_2028_0000_0003);
+    let mut rng = jbm_testkit::XorShift64(0x5EED_2028_0000_0003);
     let mut worst_lo = f64::INFINITY;
     let mut worst_hi = f64::NEG_INFINITY;
     for _ in 0..100_000 {
@@ -299,7 +286,7 @@ fn lod_surface_accuracy_per_level() {
     let blocks = blocks();
     let spawn = terrain.spawn();
     // A seeded sample of land columns within ±2 km of spawn.
-    let mut rng = XorShift64(0x00a1_1ce5_2a10);
+    let mut rng = jbm_testkit::XorShift64(0x00a1_1ce5_2a10);
     let mut columns = Vec::new();
     while columns.len() < 512 {
         let x = spawn[0] as i64 + (rng.next() % 4096) as i64 - 2048;

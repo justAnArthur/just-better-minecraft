@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use jbm_core::coords::CubePos;
 use jbm_core::link::ServerLink;
+use jbm_core::lod::CubeKey;
 use jbm_core::protocol::ServerMsg;
 
 use super::config::ServerConfig;
@@ -93,8 +94,10 @@ impl Server {
                     let Some(lvl) = player.lod.get(level as usize - 1) else {
                         continue;
                     };
-                    if lvl.sent.contains(&pos) && !player.lod_resend.contains(&(level, pos)) {
-                        player.lod_resend.push_back((level, pos));
+                    if lvl.sent.contains(&pos)
+                        && !player.lod_resend.contains(&CubeKey { level, pos })
+                    {
+                        player.lod_resend.push_back(CubeKey { level, pos });
                     }
                 }
             }
@@ -438,9 +441,10 @@ fn stream_player_lod(
     //    reaches the player within one tick whenever the budget allows.
     let mut budget = config.lod_send_budget_per_tick;
     while budget > 0 {
-        let Some(&(level, pos)) = player.lod_resend.front() else {
+        let Some(&key) = player.lod_resend.front() else {
             break;
         };
+        let CubeKey { level, pos } = key;
         let Some(level_state) = player.lod.get(level as usize - 1) else {
             player.lod_resend.pop_front();
             continue;

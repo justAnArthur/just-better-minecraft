@@ -20,26 +20,12 @@ use jbm_server::server::{Server, ServerConfig};
 use jbm_server::storage::Storage;
 use jbm_server::terrain::Generator;
 use jbm_server::worldgen::Preset;
-use jbm_testkit::HeadlessServer;
+use jbm_testkit::{HeadlessServer, XorShift64};
 
 /// Environment variable selecting which child role the test binary runs.
 const CHILD_VAR: &str = "JBM_KILL_SAVE_CHILD";
 /// Where the child puts its world.
 const DIR_VAR: &str = "JBM_KILL_WORLD_DIR";
-
-/// Small local xorshift so the kill timing is seeded, not wall-clock lucky.
-struct XorShift64(u64);
-
-impl XorShift64 {
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
-}
 
 fn builtin_registry() -> BlockRegistry {
     let mut registry = BlockRegistry::new();

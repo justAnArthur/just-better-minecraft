@@ -5,7 +5,6 @@
 use std::path::PathBuf;
 
 use jbm_client::app::ViewSetup;
-use jbm_core::coords::CUBE_SIZE;
 use jbm_core::link::in_process_pair;
 use jbm_server::run;
 use jbm_server::server::{Server, ServerConfig};
@@ -15,11 +14,10 @@ use jbm_server::server::{Server, ServerConfig};
 /// blocks. The client cannot learn these from the link, so the game —
 /// which built the config — passes them along.
 fn view_setup(config: &ServerConfig) -> ViewSetup {
+    let (lod0_ring_radius, furthest_ring_radius) = config.ring_radii();
     ViewSetup {
-        lod0_ring_radius: config.view_radius as f32 * CUBE_SIZE as f32,
-        furthest_ring_radius: config.lod_view_radius as f32
-            * CUBE_SIZE as f32
-            * (1u32 << config.lod_levels) as f32,
+        lod0_ring_radius,
+        furthest_ring_radius,
     }
 }
 

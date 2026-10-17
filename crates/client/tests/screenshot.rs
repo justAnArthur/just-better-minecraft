@@ -162,21 +162,6 @@ fn render_scene(golden_name: &str, scene: &[(CubePos, Cube)], camera: &Camera) {
     assert_matches_golden(golden_name, &image);
 }
 
-/// A camera at `eye` looking at `look_at`.
-#[cfg(not(feature = "cube16"))] // 32³-only golden
-fn looking_at(eye: (f64, f64, f64), look_at: (f64, f64, f64)) -> Camera {
-    let eye = DVec3::from(eye);
-    let look_at = DVec3::from(look_at);
-    let d = look_at - eye;
-    let yaw = f32::atan2(d.x as f32, -d.z as f32);
-    let horizontal = (d.x * d.x + d.z * d.z).sqrt();
-    let pitch = f32::atan2(d.y as f32, horizontal as f32);
-    let mut camera = Camera::new(eye, 70.0_f32.to_radians(), 1.0);
-    camera.set_yaw(yaw);
-    camera.set_pitch(pitch);
-    camera
-}
-
 /// The mesh_blocks scene: a 12x12 stone floor with one of each builtin
 /// block standing on it in a row. Returns the cube holding it.
 #[cfg(not(feature = "cube16"))] // 32³-only golden
@@ -209,7 +194,12 @@ fn mesh_blocks_matches_golden() {
     let (_, _, blocks) = test_setup();
     let cube = mesh_blocks_scene(&blocks);
     // Camera above a corner, ~30 degrees down: three faces of each block.
-    let camera = looking_at((12.5, 5.5, 14.5), (7.5, 1.5, 7.5));
+    let camera = Camera::looking_at(
+        DVec3::from((12.5, 5.5, 14.5)),
+        DVec3::from((7.5, 1.5, 7.5)),
+        70.0_f32.to_radians(),
+        1.0,
+    );
     render_scene(
         "mesh_blocks",
         &[(CubePos { x: 0, y: 0, z: 0 }, cube)],
@@ -243,7 +233,12 @@ fn mesh_ao_scene(blocks: &builtin::Blocks) -> Cube {
 fn mesh_ao_matches_golden() {
     let (_, _, blocks) = test_setup();
     let cube = mesh_ao_scene(&blocks);
-    let camera = looking_at((24.5, 11.0, 24.5), (16.0, 2.0, 16.0));
+    let camera = Camera::looking_at(
+        DVec3::from((24.5, 11.0, 24.5)),
+        DVec3::from((16.0, 2.0, 16.0)),
+        70.0_f32.to_radians(),
+        1.0,
+    );
     render_scene("mesh_ao", &[(CubePos { x: 0, y: 0, z: 0 }, cube)], &camera);
 }
 
@@ -269,7 +264,12 @@ fn mesh_cube_border_matches_golden() {
         (CubePos { x: 0, y: 0, z: 0 }, make(0)),
         (CubePos { x: 1, y: 0, z: 0 }, make(32)),
     ];
-    let camera = looking_at((36.0, 14.0, 31.0), (32.0, 3.0, 16.0));
+    let camera = Camera::looking_at(
+        DVec3::from((36.0, 14.0, 31.0)),
+        DVec3::from((32.0, 3.0, 16.0)),
+        70.0_f32.to_radians(),
+        1.0,
+    );
     render_scene("mesh_cube_border", &scene, &camera);
 }
 

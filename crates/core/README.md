@@ -118,7 +118,7 @@ so decode validates them and keeps them as the cube's data (re-packing via
 32³ including zstd (`storage/decode_surface_cube`); encode is ≈ 9 µs. Round trips are exact for uniform, two-state, full-palette and
 random cubes.
 
-### `lod` — the downsampling rule and octant helpers (task 2.4)
+### `lod` — the downsampling rule, octant helpers and `CubeKey`
 
 Pure logic: no I/O, no registry data. A level-*n+1* cell covers a 2×2×2
 group of level-*n* "children", indexed `c = dx + 2·dz + 4·dy` — the same
@@ -157,6 +157,15 @@ of its parent. `parent(pos) -> (CubePos, u8)` gives the parent position
 (`div_euclid(2)` per axis, so negative coordinates nest exactly) and the
 octant index (`dx + 2·dz + 4·dy` over `rem_euclid(2)` per axis);
 `octant_offset(octant) -> [u8; 3]` inverts the octant half.
+
+**`CubeKey`** (`{ level: u8, pos: CubePos }`): the shared name for a cube
+at a LOD level — meshes, mesh jobs, GPU residency and coverage entries on
+the client, LOD bookkeeping on the server. `lod0(pos)`, `parent() ->
+(CubeKey, octant)`, `child(octant)`, `block_size()` (`CUBE_SIZE ·
+2^level`), `min_block()` (the corner block) and `containing(level,
+BlockPos)` (floor arithmetic, level 0 being exactly `BlockPos::split`)
+are the level math in one place. The client re-exports it from
+`jbm_client::lod` so call sites keep one path.
 
 **Region API:** `CellBox { min, max: [u8; 3] }` (inclusive min, exclusive
 max) with `single(LocalPos)` and `union`. `downsample_region(child,

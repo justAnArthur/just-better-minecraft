@@ -28,6 +28,7 @@ use glam::DVec3;
 use jbm_core::block::BlockStateId;
 use jbm_core::coords::{BlockPos, CubePos};
 use jbm_core::link::{LinkClosed, ServerLink};
+use jbm_core::lod::CubeKey;
 use jbm_core::physics::{self, BlockShapes, MoveInput, PlayerState, SolidTable};
 use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION, PlayerId, ServerMsg};
 
@@ -141,7 +142,7 @@ struct Player {
     /// Queued re-sends: cubes the pyramid changed that this player
     /// already has. Drained ahead of the walk within the LOD budget, and
     /// persistent across ticks so nothing starves.
-    lod_resend: VecDeque<(u8, CubePos)>,
+    lod_resend: VecDeque<CubeKey>,
 }
 
 impl Player {
@@ -219,7 +220,7 @@ pub struct Server {
     pending_save: HashMap<CubePos, u64>,
     /// LOD cubes handed to the save thread and not yet acknowledged; a
     /// failed batch puts them back dirty for the next one.
-    lod_pending_save: HashSet<(u8, CubePos)>,
+    lod_pending_save: HashSet<CubeKey>,
     /// Open world database; `None` when persistence is off.
     storage: Option<Arc<Storage>>,
     /// Sends snapshot batches to the save thread.

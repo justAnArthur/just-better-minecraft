@@ -411,7 +411,7 @@ impl ClientWorld {
 /// (LOD distances are in blocks, so finer levels sort first at equal
 /// cube offsets).
 fn cube_center(key: CubeKey) -> DVec3 {
-    let size = f64::from(CUBE_SIZE) * f64::from(1u32 << key.level);
+    let size = key.block_size() as f64;
     DVec3::new(
         f64::from(key.pos.x) * size + size / 2.0,
         f64::from(key.pos.y) * size + size / 2.0,

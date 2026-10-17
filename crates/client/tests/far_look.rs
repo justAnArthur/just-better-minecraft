@@ -33,17 +33,6 @@ use jbm_core::cube::Cube;
 const SIZE: u32 = 256;
 const FOV: f32 = 70.0_f32.to_radians();
 
-/// A camera at `eye` looking at `look_at` (square aspect for the tests).
-fn looking_at(eye: DVec3, look_at: DVec3) -> Camera {
-    let d = look_at - eye;
-    let yaw = f32::atan2(d.x as f32, -d.z as f32);
-    let pitch = f32::atan2(d.y as f32, d.x.hypot(d.z) as f32);
-    let mut camera = Camera::new(eye, FOV, 1.0);
-    camera.set_yaw(yaw);
-    camera.set_pitch(pitch);
-    camera
-}
-
 /// Where a world point lands on the square target, in pixels (the same
 /// math the GPU runs: rotation-only view-projection of the
 /// camera-relative position).
@@ -190,7 +179,12 @@ fn lod1_cube_top_face_is_the_flat_average_color() {
 
     // Almost straight down onto the plateau: the sides are edge-on, so
     // the projected top face fills its bounding box.
-    let camera = looking_at(DVec3::new(32.0, 140.0, 32.05), DVec3::new(32.0, 16.0, 32.0));
+    let camera = Camera::looking_at(
+        DVec3::new(32.0, 140.0, 32.05),
+        DVec3::new(32.0, 16.0, 32.0),
+        FOV,
+        1.0,
+    );
     let image = ctx.render(&camera);
 
     // The plateau's top-face corners, projected; a box shrunk 15% stays
@@ -298,7 +292,7 @@ fn lod0_grass_strip_fades_into_the_flat_average() {
     // verified by the window's endpoints and the curve rows).
     let surface_y = 16.0_f64;
     let eye = DVec3::new(16.0, surface_y + 30.0, 290.0);
-    let camera = looking_at(eye, DVec3::new(16.0, surface_y, 60.0));
+    let camera = Camera::looking_at(eye, DVec3::new(16.0, surface_y, 60.0), FOV, 1.0);
 
     // The textured reference: both fade and fog windows far out of range.
     ctx.renderer.set_view_distance(1.0e6, 1.0e6);
@@ -427,7 +421,12 @@ fn fog_matches_the_sky_and_leaves_near_terrain_alone() {
         let output = mesh::mesh(&input, &appearance);
         ctx.terrain.upload(&ctx.gpu, key, &output);
     }
-    let camera = looking_at(DVec3::new(16.0, 24.0, 900.0), DVec3::new(16.0, 48.0, 400.0));
+    let camera = Camera::looking_at(
+        DVec3::new(16.0, 24.0, 900.0),
+        DVec3::new(16.0, 48.0, 400.0),
+        FOV,
+        1.0,
+    );
 
     // A small furthest ring radius so the fog saturates inside the scene;
     // the LOD0 radius keeps the default fade scale.
