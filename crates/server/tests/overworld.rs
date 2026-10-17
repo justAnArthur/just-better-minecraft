@@ -299,7 +299,7 @@ fn lod_surface_accuracy_per_level() {
     let blocks = blocks();
     let spawn = terrain.spawn();
     // A seeded sample of land columns within ±2 km of spawn.
-    let mut rng = XorShift64(0xa11c_e5_2a10);
+    let mut rng = XorShift64(0x00a1_1ce5_2a10);
     let mut columns = Vec::new();
     while columns.len() < 512 {
         let x = spawn[0] as i64 + (rng.next() % 4096) as i64 - 2048;
