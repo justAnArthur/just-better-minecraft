@@ -1,7 +1,11 @@
 //! The real-server LOD fly test (task 2.6). Spawn, fly 1.5 km straight
 //! and then 90 degrees for 300 m more, 40 blocks above the terrain at
 //! pitch -15 degrees, through the real client world, mesh pool and
-//! renderer against a threaded real server. Every 100 blocks it waits
+//! renderer against a threaded real server. On the 2.8 overworld the
+//! altitude follows the terrain: the target is the highest surface in a
+//! 512-block look-ahead plus 40, so the flight rides over the ridges
+//! (a fixed spawn-relative altitude would wedge into the first range).
+//! Every 100 blocks it waits
 //! (bounded) for the client mesh queue — no dirty cubes, no in-flight
 //! mesh jobs — to be clear, polled about once per 50 ms server tick;
 //! server ring readiness is never checked (whatever arrived and meshed
@@ -41,10 +45,15 @@ use jbm_client::render::renderer::{
 use jbm_client::render::texture_array::BlockTextures;
 use jbm_client::testing::holes::{assert_only_pinholes, describe_holes, sentinel_components};
 use jbm_client::world::ClientWorld;
+use jbm_core::block::BlockRegistry;
+use jbm_core::block::builtin::Blocks;
 use jbm_core::link::ClientLink;
 use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION, ServerMsg};
+use jbm_server::DEFAULT_SEED;
 use jbm_server::run::{self, ServerHandle};
 use jbm_server::server::{Server, ServerConfig};
+use jbm_server::terrain::Generator;
+use jbm_server::worldgen::Preset;
 
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 360;
@@ -58,6 +67,28 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(20);
 /// The fly course: 1500 blocks at yaw 0 (toward -Z), then 300 at yaw
 /// +90 degrees (toward +X), 40 above the surface, pitch -15 degrees.
 const COURSE: [(f32, f64); 2] = [(0.0, 1500.0), (std::f32::consts::FRAC_PI_2, 300.0)];
+
+/// How far ahead (blocks) the terrain-following altitude target looks:
+/// the flyer climbs at half its cruise speed, so a window of 512 blocks
+/// buys ~250 blocks of climb before a ridge arrives — the overworld's
+/// whole relief. Terrain is a heightmap (no overhangs, task 2.8), so a
+/// full-`up` climb always escapes a wall even if it starts late.
+const LOOKAHEAD: i64 = 512;
+
+/// The highest overworld surface within [`LOOKAHEAD`] blocks ahead of
+/// `(x, z)` along `yaw` (0 looks toward -Z, +90° toward +X). The
+/// altitude target is this + 40, so the flight rides over the ridges
+/// instead of wedging into them the way a fixed spawn-relative altitude
+/// would on the 2.8 terrain.
+fn ridge_ahead(generator: &Generator, x: f64, z: f64, yaw: f64) -> i64 {
+    let (fx, fz) = (yaw.sin(), -yaw.cos());
+    let mut highest = i64::MIN;
+    for d in (0..=LOOKAHEAD).step_by(32) {
+        let (sx, sz) = (x + fx * d as f64, z + fz * d as f64);
+        highest = highest.max(generator.surface_height(sx.round() as i64, sz.round() as i64));
+    }
+    highest
+}
 
 /// The client half: world, mesh pool, coverage, renderer.
 struct FlyClient {
@@ -322,10 +353,19 @@ fn fly_1p5km_over_real_rings_shows_no_holes() {
     );
     camera.set_pitch(-15.0_f32.to_radians());
 
-    // Climb to cruise altitude, 40 blocks over spawn. The toggle keeps
-    // being re-sent (one unacked in flight) until the server confirms
-    // flying, for the same lost-step race as above.
-    while fly.server_pos.is_none_or(|p| p.y < spawn_at.y + 40.0) {
+    // Climb to cruise altitude: 40 blocks over the highest ridge the
+    // first leg will meet (task 2.8's terrain-following target; the
+    // classic terrain needed only spawn + 40). The toggle keeps being
+    // re-sent (one unacked in flight) until the server confirms flying,
+    // for the same lost-step race as above.
+    let mut registry = BlockRegistry::new();
+    let blocks = Blocks::register(&mut registry);
+    let nav = Generator::with_preset(DEFAULT_SEED, blocks, Preset::Overworld);
+    let cruise = |x: f64, z: f64, yaw: f64| (ridge_ahead(&nav, x, z, yaw) + 40) as f64;
+    while fly
+        .server_pos
+        .is_none_or(|p| p.y < cruise(p.x, p.z, f64::from(COURSE[0].0)))
+    {
         seq += 1;
         let fly_toggle = fly.needs_fly_toggle(toggle_seq);
         if fly_toggle {
@@ -388,9 +428,15 @@ fn fly_1p5km_over_real_rings_shows_no_holes() {
         camera.set_yaw(yaw);
         while course_flown[leg_index] < leg {
             // 100 blocks at sprint-fly speed (22 blocks/s): about 5
-            // seconds of 20 Hz ticks.
+            // seconds of 20 Hz ticks. `up` holds the terrain-following
+            // target: full climb while below it, level above. The target
+            // only rises (a look-ahead max), so the flight never descends
+            // back into a ridge it just cleared.
             for _ in 0..100 {
                 seq += 1;
+                let up = fly
+                    .server_pos
+                    .map_or(0, |p| i8::from(p.y < cruise(p.x, p.z, f64::from(yaw))));
                 client
                     .send(ClientMsg::PlayerInput {
                         seq,
@@ -398,6 +444,7 @@ fn fly_1p5km_over_real_rings_shows_no_holes() {
                             forward: 1,
                             sprint: true,
                             yaw,
+                            up,
                             ..jbm_core::physics::MoveInput::IDLE
                         },
                         pitch: -15.0_f32.to_radians(),
