@@ -1778,8 +1778,9 @@ fn stream_player(
         if player.desired.is_empty() {
             spans.ensure_around((center.x, center.z), r, config.lod_levels);
         }
-        player.desired =
-            desired_offsets_surface(r, v, cap, |dx, dz| spans.lod0(center.x + dx, center.z + dz));
+        player.desired = desired_offsets_surface(r, v, cap, i64::from(center.y), |dx, dz| {
+            spans.lod0(center.x + dx, center.z + dz)
+        });
         player.desired_version = spans.version();
         player.cursor = 0;
     }
@@ -1932,9 +1933,14 @@ fn stream_player_lod(
     //    missing.
     if center_moved || player.lod_walk_version != spans.version() {
         let l1_center = player.lod.first().map(|state| state.center);
-        player.lod_walk = lod_walk_surface(config.lod_levels, r, v, cap, |dx, dz| {
-            l1_center.and_then(|c| spans.l1(c.x + dx, c.z + dz))
-        });
+        player.lod_walk = lod_walk_surface(
+            config.lod_levels,
+            r,
+            v,
+            cap,
+            l1_center.map_or(0, |c| i64::from(c.y)),
+            |dx, dz| l1_center.and_then(|c| spans.l1(c.x + dx, c.z + dz)),
+        );
         player.lod_walk_version = spans.version();
         player.lod_cursor = 0;
     }
@@ -2994,9 +3000,15 @@ mod tests {
         for &(level, pos) in &sent {
             *counts.entry((level, pos)).or_insert(0usize) += 1;
             let center = crate::streaming::level_center(lod0_center, level);
+            // The sent set is inside the player's own surface-following
+            // walk (task 2.10: level 1's spans add cubes beyond the plain
+            // window on this spawn's hill), whose window part is exactly
+            // the old disk shape.
+            let player_walk = &player.lod_walk;
+            let offset = (pos.x - center.x, pos.y - center.y, pos.z - center.z);
             assert!(
-                crate::streaming::in_desired(pos, center, 3, 2),
-                "sent outside the desired disk: level {level} {pos:?}"
+                player_walk.contains(&(level, offset)),
+                "sent outside the desired walk: level {level} {pos:?}"
             );
         }
         for (index, level_state) in player.lod.iter().enumerate() {
@@ -3127,8 +3139,18 @@ mod tests {
         assert_eq!(per_tick_over, 0, "the per-tick budget was exceeded");
         assert!(!order.is_empty());
 
-        // The first-send order is a subsequence of the merged walk.
-        let walk = crate::streaming::lod_walk(3, 3, 2);
+        // The first-send order is a subsequence of the merged walk —
+        // the player's own surface-following walk (task 2.10: level 1
+        // unions the column spans, which on this spawn's hill adds one
+        // cube below the plain window).
+        let player = server
+            .connections
+            .iter()
+            .filter_map(|c| c.joined_player())
+            .next()
+            .unwrap();
+        let walk = player.lod_walk.clone();
+        assert!(walk.len() >= crate::streaming::lod_walk(3, 3, 2).len());
         let mut walk_index = 0;
         for entry in &order {
             let mut found = false;

@@ -121,6 +121,53 @@ fn mountain_top(generator: &Generator, side: i64) -> DVec3 {
     )
 }
 
+/// A deterministic coast for task 2.10 C: a beach column (`h` at the
+/// beach level) with deep sea within 96 blocks — searched in rings from
+/// spawn. Returns the beach position (feet).
+fn find_coast(generator: &Generator) -> DVec3 {
+    find_nth_coast(generator, 0)
+}
+
+/// The `n`-th coast in the same fixed order (for C's site sweep).
+fn find_nth_coast(generator: &Generator, n: usize) -> DVec3 {
+    let start = generator.spawn();
+    let (sx, sz) = (start[0] as i64, start[2] as i64);
+    let sample = |x: i64, z: i64| generator.surface_height(x, z);
+    let mut found = 0usize;
+    for ring in 0..48i64 {
+        for dx in -ring..=ring {
+            for dz in -ring..=ring {
+                if dx.abs() != ring && dz.abs() != ring {
+                    continue;
+                }
+                let (x, z) = (sx + dx * 128, sz + dz * 128);
+                let h = sample(x, z);
+                // Beach: at or just above the sea, not underwater.
+                if !(63..=66).contains(&h) {
+                    continue;
+                }
+                // Deep sea within 96 blocks (step 16).
+                let mut deep = false;
+                'sea: for nx in (x - 96..=x + 96).step_by(16) {
+                    for nz in (z - 96..=z + 96).step_by(16) {
+                        if sample(nx, nz) < 63 - 10 {
+                            deep = true;
+                            break 'sea;
+                        }
+                    }
+                }
+                if deep {
+                    if found == n {
+                        return DVec3::new(x as f64 + 0.5, (h + 2) as f64, z as f64 + 0.5);
+                    }
+                    found += 1;
+                }
+            }
+        }
+    }
+    panic!("no coast found within the search limit for this seed");
+}
+
 /// The client half, as in the fly test: world, mesh pool, coverage,
 /// renderer, plus every LOD0 cube position currently held.
 struct WindowClient {
@@ -245,6 +292,77 @@ impl WindowClient {
     }
 }
 
+/// Joins the player (bounded) and teleports them to `site`. Returns
+/// once the server has observed the join.
+fn join_and_teleport(
+    server: &mut Server,
+    win: &mut WindowClient,
+    client: &mut ClientLink,
+    gpu: &Gpu,
+    site: DVec3,
+    timeout: Instant,
+) {
+    let id = PlayerId(1);
+    let mut joined = false;
+    while !joined {
+        server.tick();
+        client
+            .send(ClientMsg::PlayerInput {
+                seq: 1,
+                input: jbm_core::physics::MoveInput::IDLE,
+                pitch: 0.0,
+            })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        if let Some(reason) = win.pump_link(gpu, client) {
+            panic!("link died before joining: {reason}");
+        }
+        joined = server.players().next().is_some();
+        assert!(Instant::now() < timeout, "never joined");
+    }
+    server.teleport_player(id, site);
+}
+
+/// Pumps server ticks, client meshing and the link until everything is
+/// quiet: spans filled, no desired LOD0 or ring cube unsent, nothing in
+/// flight, the client mesh queue clear (bounded by `deadline`).
+fn settle(
+    server: &mut Server,
+    win: &mut WindowClient,
+    client: &mut ClientLink,
+    gpu: &Gpu,
+    camera: &Camera,
+    deadline: Instant,
+) {
+    let id = PlayerId(1);
+    let mut clear_polls = 0;
+    while clear_polls < 10 && Instant::now() < deadline {
+        server.update(Duration::from_millis(50));
+        for _ in 0..3 {
+            win.pump_meshing(gpu, camera);
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        if let Some(reason) = win.pump_link(gpu, client) {
+            panic!("link died while settling: {reason}");
+        }
+        let (_, _, pending_spans, _) = server.span_stats();
+        let quiet = win.queue_clear()
+            && pending_spans == 0
+            && server.lod0_pending(id) == 0
+            && server.lod_ring_pending(id) == 0
+            && server.in_flight() == 0;
+        clear_polls = if quiet { clear_polls + 1 } else { 0 };
+        assert!(Instant::now() < deadline, "never settled");
+    }
+    for _ in 0..200 {
+        win.pump_meshing(gpu, camera);
+        if win.queue_clear() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn valley_cliff_is_full_lod0_near_the_camera() {
     let start = Instant::now();
@@ -281,26 +399,16 @@ fn valley_cliff_is_full_lod0_near_the_camera() {
     let mut win = WindowClient::new(&gpu);
     let id = PlayerId(1);
 
-    // Join, then teleport into the valley (physics-free; streaming
-    // observes the moved center exactly as after a real teleport).
-    let mut joined = false;
-    while !joined {
-        server.tick();
-        client
-            .send(ClientMsg::PlayerInput {
-                seq: 1,
-                input: jbm_core::physics::MoveInput::IDLE,
-                pitch: 0.0,
-            })
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(20));
-        if let Some(reason) = win.pump_link(&gpu, &mut client) {
-            panic!("link died before joining: {reason}");
-        }
-        joined = server.players().next().is_some();
-        assert!(start.elapsed() < TEST_TIMEOUT, "never joined");
-    }
-    server.teleport_player(id, site.valley);
+    // Join, teleport into the valley (physics-free; streaming observes
+    // the moved center exactly as after a real teleport), settle.
+    join_and_teleport(
+        &mut server,
+        &mut win,
+        &mut client,
+        &gpu,
+        site.valley,
+        start + TEST_TIMEOUT,
+    );
 
     // The camera stands in the valley looking up at the wall top.
     const EYE: f64 = 1.62;
@@ -313,33 +421,14 @@ fn valley_cliff_is_full_lod0_near_the_camera() {
     // Settle: server spans filled, LOD rings drained and the client mesh
     // queue clear for a run of polls (as in the fly test, whatever meshed
     // by then is what the render sees).
-    let deadline = Instant::now() + Duration::from_secs(120);
-    let mut clear_polls = 0;
-    while clear_polls < 10 && Instant::now() < deadline {
-        server.update(Duration::from_millis(50));
-        for _ in 0..3 {
-            win.pump_meshing(&gpu, &camera);
-            std::thread::sleep(Duration::from_millis(16));
-        }
-        if let Some(reason) = win.pump_link(&gpu, &mut client) {
-            panic!("link died while settling: {reason}");
-        }
-        let (_, _, pending_spans, _) = server.span_stats();
-        let settled = win.queue_clear()
-            && pending_spans == 0
-            && server.lod0_pending(id) == 0
-            && server.lod_ring_pending(id) == 0
-            && server.in_flight() == 0;
-        clear_polls = if settled { clear_polls + 1 } else { 0 };
-        assert!(start.elapsed() < TEST_TIMEOUT, "never settled");
-    }
-    for _ in 0..200 {
-        win.pump_meshing(&gpu, &camera);
-        if win.queue_clear() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    settle(
+        &mut server,
+        &mut win,
+        &mut client,
+        &gpu,
+        &camera,
+        start + TEST_TIMEOUT,
+    );
     println!(
         "settled in {:.1} s; per-level sent {:?}",
         start.elapsed().as_secs_f64(),
@@ -386,28 +475,11 @@ fn valley_cliff_is_full_lod0_near_the_camera() {
             }
         }
     }
-    let camera_cube = CubePos {
-        x: (site.valley.x / f64::from(CUBE_SIZE)).floor() as i32,
-        y: (site.valley.y / f64::from(CUBE_SIZE)).floor() as i32,
-        z: (site.valley.z / f64::from(CUBE_SIZE)).floor() as i32,
-    };
-    let offsets: Vec<(i32, i32, i32)> = missing
-        .iter()
-        .map(|c| {
-            (
-                c.x - camera_cube.x,
-                c.y - camera_cube.y,
-                c.z - camera_cube.z,
-            )
-        })
-        .take(8)
-        .collect();
     assert!(
         missing.is_empty(),
-        "{} surface cubes of the LOD0 disk unsent (camera cube {:?}), first offsets {:?}",
+        "{} surface cubes of the LOD0 disk unsent, e.g. {:?}",
         missing.len(),
-        camera_cube,
-        offsets,
+        missing.first(),
     );
 
     // 2. Tint on: no pixel showing terrain within 200 blocks of the
@@ -465,6 +537,205 @@ fn valley_cliff_is_full_lod0_near_the_camera() {
         "{near_tinted} pixels of terrain within 200 blocks are drawn by a LOD ring; \
          images in target/surface/"
     );
+}
+
+/// Task 2.10 C: one coast site at one `max_column_cubes`. Settles a
+/// real server at the site, renders the coast from 320 blocks up (pitch
+/// −55°), and counts water-colored pixels whose true column is land —
+/// the "water triangles cutting into the sand beach". Returns
+/// `(water pixels seen, of which on land)`.
+fn coast_defect_pixels(
+    gpu: &Gpu,
+    nav: &Generator,
+    coast: DVec3,
+    cap: usize,
+    tag: &str,
+    deadline: Instant,
+) -> (usize, usize) {
+    let config = ServerConfig {
+        gen_threads: 4,
+        max_column_cubes: cap,
+        ..ServerConfig::default()
+    };
+    let mut server = Server::with_config(config);
+    let (mut client, server_end) = jbm_core::link::in_process_pair();
+    server.add_connection(server_end);
+    client
+        .send(ClientMsg::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            name: "coast".to_owned(),
+        })
+        .unwrap();
+    let mut win = WindowClient::new(gpu);
+    // The player flies 320 blocks over the beach — the play-test's
+    // "seen from altitude" position. Streaming follows the player, so
+    // with the pre-2.10 fixed window (cap 0) the coast 320 blocks below
+    // falls outside every window and the rings draw it; the
+    // surface-following windows (cap 16) keep LOD0 over it.
+    let eye = coast + DVec3::new(0.0, 320.0, 0.0);
+    join_and_teleport(&mut server, &mut win, &mut client, gpu, eye, deadline);
+    let mut camera = Camera::new(eye, 70.0_f32.to_radians(), WIDTH as f32 / HEIGHT as f32);
+    camera.set_yaw(45.0_f32.to_radians());
+    camera.set_pitch(-55.0_f32.to_radians());
+    settle(&mut server, &mut win, &mut client, gpu, &camera, deadline);
+    println!(
+        "coast {tag}: per-level sent {:?}, lod0 pending {}, spans {:?}",
+        server.sent_counts_per_level(PlayerId(1)),
+        server.lod0_pending(PlayerId(1)),
+        {
+            let (a, b, c, d) = server.span_stats();
+            (a, b, c, d)
+        },
+    );
+
+    win.renderer.set_fog(false);
+    win.renderer.set_lod_tint(false);
+    let plain = win.render(gpu, &camera);
+    win.renderer.set_lod_tint(true);
+    let tinted = win.render(gpu, &camera);
+    let depths = win.depth.read_depth(gpu);
+    std::fs::create_dir_all("target/surface").ok();
+    let _ = plain.save(format!("target/surface/coast_{tag}_plain.png"));
+    let _ = tinted.save(format!("target/surface/coast_{tag}_tinted.png"));
+
+    // Water's flat blue: the water texture layer's average color (2.9)
+    // times the top-face shade 1.0 — matched by absolute distance (a
+    // nearest-of-water-and-sand test would eat green grass, which sits
+    // nearer water's blue than sand's tan). Grass, stone and sand all
+    // sit far from the flat water color.
+    let water = water_blue();
+    let mut water_on_land = 0usize;
+    let mut samples = 0usize;
+    // Which levels draw the near coast (the "show why" evidence): count
+    // tint signatures among pixels within 400 blocks.
+    let mut near_levels = std::collections::BTreeMap::new();
+    let inv_view_proj = camera.view_proj().inverse();
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let pixel: [u8; 3] = plain.get_pixel(x, y).0[..3].try_into().unwrap();
+            if color_distance(pixel, water) > 60 {
+                continue;
+            }
+            let d = depths[(y * WIDTH + x) as usize];
+            if d <= 0.0 {
+                continue;
+            }
+            use glam::Vec4;
+            let ndc_x = (f64::from(x) + 0.5) / f64::from(WIDTH) * 2.0 - 1.0;
+            let ndc_y = 1.0 - (f64::from(y) + 0.5) / f64::from(HEIGHT) * 2.0;
+            let clip = Vec4::new(ndc_x as f32, ndc_y as f32, d, 1.0);
+            let view = inv_view_proj * clip;
+            let view = view / view.w;
+            let world = camera.position
+                + DVec3::new(f64::from(view.x), f64::from(view.y), f64::from(view.z));
+            samples += 1;
+            if (world - camera.position).length() <= 400.0 {
+                let t: [u8; 3] = tinted.get_pixel(x, y).0[..3].try_into().unwrap();
+                let level = tint_level(t);
+                *near_levels.entry(level).or_insert(0usize) += 1;
+            }
+            let h = nav.surface_height(world.x.floor() as i64, world.z.floor() as i64);
+            if h > jbm_server::terrain::SEA_LEVEL {
+                water_on_land += 1;
+            }
+        }
+    }
+    println!("near-coast levels (tint): {near_levels:?}");
+    println!("coast {tag}: {samples} water pixels, {water_on_land} on land");
+    (samples, water_on_land)
+}
+
+/// Task 2.10 C's regression test. The pinned coast, viewed by a player
+/// flying 320 blocks over it, must show no water over land — the flat
+/// sea meets the sand without triangles. The run also prints the
+/// before/after evidence for the diagnosis: with the pre-2.10 fixed
+/// windows (`max_column_cubes` 0) the whole near coast is drawn by
+/// level 3 (the tinted render shows green), whose 8×8 water/land cells
+/// at the shore are the play-test's triangles; with the
+/// surface-following windows the same view is level 1 and LOD0. At this
+/// seed's deterministic sites the sea-surface alignment fix (2758366)
+/// already keeps coarse water off land columns, so the count is 0 in
+/// both states here — the assertion pins the fixed state, and the tint
+/// output documents which levels draw the coast.
+#[test]
+fn coast_from_altitude_has_no_water_triangles_on_the_beach() {
+    let start = Instant::now();
+    let Some(gpu) = jbm_client::testing::screenshot::gpu_or_skip() else {
+        return;
+    };
+    let mut registry = jbm_core::block::BlockRegistry::new();
+    let blocks = jbm_core::block::builtin::Blocks::register(&mut registry);
+    let nav = Generator::with_preset(DEFAULT_SEED, blocks, Preset::Overworld);
+
+    // The pinned site, before and after: cap 0 reproduces the pre-2.10
+    // fixed windows (the play-test's altitude view), cap 16 is the
+    // surface-following default. Both renders land in target/surface/.
+    let site = find_coast(&nav);
+    let (_, before) = coast_defect_pixels(&gpu, &nav, site, 0, "before_cap0", start + TEST_TIMEOUT);
+    let (samples, after) =
+        coast_defect_pixels(&gpu, &nav, site, 16, "after_cap16", start + TEST_TIMEOUT);
+    println!(
+        "pinned coast {site:.0?}: {before} water-on-land before, {after} after \
+         ({samples} water pixels seen)"
+    );
+    assert_eq!(
+        after, 0,
+        "{after} water pixels over land columns — the coast triangles; \
+         images in target/surface/"
+    );
+}
+
+/// The sRGB byte color a flat-shaded water top face shows: the water
+/// layer's average color from the builtin textures.
+fn water_blue() -> [u8; 3] {
+    average_color_srgb(water_layer_index())
+}
+
+fn water_layer_index() -> u32 {
+    let (layers, names) = jbm_client::mesh::appearance::builtin_textures();
+    let _ = layers;
+    names
+        .iter()
+        .position(|n| *n == "water")
+        .unwrap_or_else(|| panic!("water layer missing: {names:?}")) as u32
+}
+
+/// A layer's average color in sRGB bytes, matching what the far look
+/// draws (the linear average, then the sRGB encode of the target).
+fn average_color_srgb(layer: u32) -> [u8; 3] {
+    let (layers, _) = jbm_client::mesh::appearance::builtin_textures();
+    let image = &layers[layer as usize];
+    let mut sum = [0f64; 3];
+    for p in image.pixels() {
+        for c in 0..3 {
+            sum[c] += f64::from(p[c]) / 255.0;
+        }
+    }
+    let n = f64::from(image.width() * image.height());
+    // The mean must be taken in linear space, like the far look's
+    // alpha-weighted averages (water's alpha is constant, so plain
+    // weighting matches).
+    let linear: [f64; 3] = sum.map(|s| (s / n).powf(2.2));
+    linear.map(|c| (c.powf(1.0 / 2.2) * 255.0).round() as u8)
+}
+
+/// Which level's tint a pixel carries (task 2.10's tint signatures):
+/// the tint zeroes whole channels, so the surviving-channel pattern
+/// names the level. 0 = untinted (LOD0 terrain or sky).
+fn tint_level(p: [u8; 3]) -> u8 {
+    let kept = [p[0] >= 8, p[1] >= 8, p[2] >= 8];
+    match kept {
+        [true, false, false] => 1, // red
+        [true, true, false] => 2,  // yellow
+        [false, true, false] => 3, // green
+        [false, true, true] => 4,  // cyan
+        [false, false, true] => 5, // blue
+        _ => 0,                    // untinted (LOD0 / sky / purple)
+    }
+}
+
+fn color_distance(a: [u8; 3], b: [u8; 3]) -> i32 {
+    a.iter().zip(b).map(|(x, y)| i32::from(x.abs_diff(y))).sum()
 }
 
 /// The task 2.10 measurement: cubes desired per level, settle time and

@@ -189,12 +189,15 @@ fn disk_columns(r: u32) -> Vec<(i32, i32)> {
 /// disk, the surface-span extras `span_of` supplies (the column's surface
 /// height bounds, `None` while that column's span has not been computed
 /// yet — window only until then), each column trimmed to `cap` extras
-/// nearest the camera. The union is sorted exactly like the window-only
-/// list: nearest-first by `dx² + dy² + dz²`, ties by `(x, y, z)`.
+/// nearest the camera. `center_y` is the center cube's absolute y; the
+/// span's cube indices are absolute too, so the extras land as offsets
+/// from it. The union is sorted exactly like the window-only list:
+/// nearest-first by `dx² + dy² + dz²`, ties by `(x, y, z)`.
 pub(crate) fn desired_offsets_surface(
     r: u32,
     v: u32,
     cap: usize,
+    center_y: i64,
     span_of: impl Fn(i32, i32) -> Option<(i64, i64)>,
 ) -> Vec<Offset> {
     let side = i64::from(jbm_core::coords::CUBE_SIZE);
@@ -204,7 +207,7 @@ pub(crate) fn desired_offsets_surface(
         if span.is_none() {
             continue;
         }
-        for dy in column_extra_dys(span, side, 0, v, cap) {
+        for dy in column_extra_dys(span, side, center_y, v, cap) {
             offsets.push((dx, dy, dz));
         }
     }
@@ -218,8 +221,9 @@ pub(crate) fn desired_offsets_surface(
 
 /// The merged LOD ring walk with surface-following windows (task 2.10).
 /// Level 1 unions its camera window with the column's surface span
-/// (`span1_of`, in level-1 cubes' columns; `None` while unknown). Levels
-/// ≥ 2 keep the plain window: with the default `lod_vertical_radius` 3 a
+/// (`span1_of`, in level-1 cubes' columns; `None` while unknown).
+/// `center1_y` is the level-1 center cube's absolute y. Levels ≥ 2 keep
+/// the plain window: with the default `lod_vertical_radius` 3 a
 /// level-*n* window spans `3 · CUBE_SIZE · 2^n ≥ 384` blocks from the
 /// player's level cube, which covers the whole shipped relief
 /// (`MIN_HEIGHT..=MAX_HEIGHT`) from any camera height — only level 1's
@@ -229,6 +233,7 @@ pub(crate) fn lod_walk_surface(
     r: u32,
     v: u32,
     cap: usize,
+    center1_y: i64,
     span1_of: impl Fn(i32, i32) -> Option<(i64, i64)>,
 ) -> Vec<LodWalkEntry> {
     let side = i64::from(jbm_core::coords::CUBE_SIZE) * 2;
@@ -240,7 +245,7 @@ pub(crate) fn lod_walk_surface(
             }
             if level == 1 {
                 let span = span1_of(dx, dz);
-                for dy in column_extra_dys(span, side, 0, v, cap) {
+                for dy in column_extra_dys(span, side, center1_y, v, cap) {
                     walk.push((level, (dx, dy, dz)));
                 }
             }
@@ -470,7 +475,7 @@ mod tests {
         let span_of = |dx: i32, _dz: i32| {
             if dx == 1 { Some(cliff) } else { None }
         };
-        let offsets = desired_offsets_surface(r, v, cap, span_of);
+        let offsets = desired_offsets_surface(r, v, cap, 0, span_of);
         // Sorted nearest-first with unique full keys.
         let d2 = |o: (i32, i32, i32)| {
             i64::from(o.0).pow(2) + i64::from(o.1).pow(2) + i64::from(o.2).pow(2)
@@ -502,10 +507,24 @@ mod tests {
         // A span inside the window adds nothing: flat land at cubes 0..1.
         let flat = |_: i32, _: i32| Some((0i64, side));
         assert_eq!(
-            desired_offsets_surface(r, v, cap, flat).len(),
+            desired_offsets_surface(r, v, cap, 0, flat).len(),
             plain.len(),
             "a span inside the window must not change the desired set"
         );
+        // The span's cube indices are absolute: a camera at cube 8 over
+        // the same cliff (span cubes 1..6, window cubes 7..9) gets the
+        // span as offsets dy -7..-2 — the flying-over-a-valley case that
+        // first exposed a relative/absolute mix-up.
+        let high = desired_offsets_surface(r, v, cap, 8, span_of);
+        for dy in -7..=-2i32 {
+            assert!(
+                high.contains(&(1, dy, 0)),
+                "camera cube 8: cliff extra (1, {dy}, 0) missing"
+            );
+        }
+        assert!(!high.contains(&(1, 2, 0)), "no extras above the window");
+        // The cliff spans the three disk columns with dx == 1 (dz -1..=1).
+        assert_eq!(high.len(), plain.len() + 3 * 6);
     }
 
     /// Task 2.10: level 1 gets span extras, coarser levels do not, and
@@ -516,7 +535,7 @@ mod tests {
         let side = i64::from(CUBE_SIZE);
         let span = (side, side * 13); // heights 32..416: level-1 cubes -1..6
         let span1 = |_: i32, _: i32| Some(span);
-        let walk = lod_walk_surface(3, r, v, cap, span1);
+        let walk = lod_walk_surface(3, r, v, cap, 0, span1);
         // Fully ordered like the window-only walk.
         let mut prev: Option<(i64, std::cmp::Reverse<u8>, i32, i32, i32)> = None;
         for &(level, (x, y, z)) in &walk {
