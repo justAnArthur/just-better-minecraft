@@ -9,6 +9,11 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Compiles `worldgen::reference`, the hand-written heightmap terrain kept
+# as the equivalence-test and bench baseline. Test-only.
+reference = []
+
 [dependencies]
 jbm-core.workspace = true
 glam.workspace = true
@@ -20,6 +25,9 @@ zstd.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 tempfile.workspace = true
+# Self dev-dependency so `tests/` and `benches/` can enable the
+# `reference` feature.
+jbm-server = { path = ".", features = ["reference"] }
 # The worldgen preview example's PNG output; the workspace's pinned
 # version, already a dependency of the client and game crates.
 image.workspace = true

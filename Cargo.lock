@@ -868,6 +868,7 @@ dependencies = [
  "glam",
  "image",
  "jbm-core",
+ "jbm-server",
  "redb",
  "serde",
  "serde_json",

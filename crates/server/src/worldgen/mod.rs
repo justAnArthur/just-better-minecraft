@@ -25,7 +25,12 @@
 use std::sync::{Arc, OnceLock};
 
 mod graph;
-#[doc(hidden)]
+mod noise;
+/// The hand-written heightmap terrain the graph generator is tested and
+/// benchmarked against. Test-only: enabled by the crate's `reference`
+/// cargo feature, which the crate's own tests and benches turn on through
+/// a self dev-dependency (the pattern `jbm-client` uses for `testing`).
+#[cfg(feature = "reference")]
 pub mod reference;
 
 pub use graph::{
