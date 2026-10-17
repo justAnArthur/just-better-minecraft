@@ -1,11 +1,11 @@
-//! The greedy mesher: pure logic, no GPU. Builds a padded
-//! `(CUBE_SIZE + 2)^3` cell view from a cube and its same-level neighbors,
-//! then merges coplanar faces into maximal rectangles per direction. Rules
-//! are documented in crates/client/README.md.
+//! The greedy sweep over the padded cell view built in `super::input`:
+//! merges coplanar faces with identical (layer, AO, light) into maximal
+//! rectangles per direction. Rules are documented in
+//! crates/client/README.md.
 //!
-//! The same mesher serves every LOD level (task 2.6): cells are cells
-//! whatever their world size, so the face format is unchanged. Two rules
-//! switch on for level >= 1 (LOD0 output is bit-for-bit what it was):
+//! The same sweep serves every LOD level: cells are cells whatever their
+//! world size, so the face format is unchanged. One rule switches on for
+//! level >= 1 (LOD0 output is bit-for-bit what it was):
 //!
 //! - **Octant-split merging.** Greedy rectangles never cross the cell
 //!   planes x, y or z = `CUBE_SIZE / 2`, so every face lies in exactly one
@@ -13,281 +13,33 @@
 //!   mask space the halves stay `[0, half)` and `[half, size)` however the
 //!   u/v strides are signed, because the mask-to-world map is affine with
 //!   slope +-1 per axis.)
-//! - **Skirts** (side directions +-X/+-Z only), the crack hider at level
-//!   seams. See `SKIRT_NOTE` below.
-//! - **Lids** (+Y only), the same crack hider for horizontal seams. See
-//!   [`lid`].
-
-use std::ops::Range;
-use std::sync::Arc;
+//!
+//! Two more level >= 1 rules — skirts and lids, the crack hiders at
+//! level seams — live in `super::seams`.
 
 use jbm_core::block::BlockStateId;
 use jbm_core::coords::CUBE_SIZE;
-use jbm_core::cube::Cube;
 
 use crate::mesh::appearance::BlockAppearance;
-use crate::mesh::face::{DIRECTIONS, Direction, FaceFields, PackedFace, pack};
+use crate::mesh::face::{DIRECTIONS, Direction, FaceFields, pack};
+use crate::mesh::input::{
+    F_AIR, F_OPAQUE_AO, F_OPAQUE_CULL, FLAGS_SHIFT, ORIGIN, PAD, PAD_Y, PAD_Z,
+};
+use crate::mesh::seams::{LID_KEY_BIT, SKIRT_KEY_BIT, lid, skirt};
 
-/// Side length of the padded array: the cube plus a one-block shell.
-pub const PAD: usize = CUBE_SIZE as usize + 2;
-/// Padded index stride of the y axis.
-const PAD_Y: usize = PAD * PAD;
-/// Padded index stride of the z axis.
-const PAD_Z: usize = PAD;
-/// Padded index of block (0, 0, 0).
-const ORIGIN: usize = PAD_Y + PAD_Z + 1;
-/// Cells in the padded array.
-pub const PAD_VOLUME: usize = PAD * PAD * PAD;
-
-// Flag bits stored in the high half of each padded cell.
-const F_AIR: u32 = 1;
-/// Occludes for face culling. Missing neighbor cubes have this set, so no
-/// walls face unloaded space.
-const F_OPAQUE_CULL: u32 = 2;
-/// Occludes for ambient occlusion. Missing neighbor cubes do NOT have
-/// this: unloaded space reads as open for AO.
-const F_OPAQUE_AO: u32 = 4;
-const F_CUTOUT: u32 = 8;
-const FLAGS_SHIFT: u32 = 16;
-/// The padded cell for "no cube here": culling-opaque, AO-transparent.
-const MISSING_CELL: u32 = F_OPAQUE_CULL << FLAGS_SHIFT;
-
-/// Index of the neighbor at offset `(dx, dy, dz)`, each in -1..=1, not all
-/// zero, into [`MeshInput::neighbors`]. Order: y outer, then z, then x,
-/// with the center (13) removed.
-pub fn neighbor_index(dx: i32, dy: i32, dz: i32) -> usize {
-    debug_assert!((-1..=1).contains(&dx) && (-1..=1).contains(&dy) && (-1..=1).contains(&dz));
-    debug_assert!((dx, dy, dz) != (0, 0, 0));
-    let raw = ((dy + 1) * 3 + (dz + 1)) * 3 + (dx + 1);
-    if raw > 13 {
-        (raw - 1) as usize
-    } else {
-        raw as usize
-    }
-}
-
-/// Everything the mesher needs for one cube: its storage and its 26
-/// neighbors. Built by [`crate::world::ClientWorld`]; shared `Arc`s so
-/// worker threads never copy cube data.
-pub struct MeshInput {
-    pub center: Arc<Cube>,
-    pub neighbors: [Option<Arc<Cube>>; 26],
-    /// The LOD level being meshed: 0 for streamed world cubes, >= 1 for
-    /// ring cubes (cells are 2^level blocks per side).
-    pub level: u8,
-}
-
-impl MeshInput {
-    /// A mesh input with no neighbors loaded (everything around is
-    /// "missing": culling-opaque, AO-open) at level 0.
-    pub fn isolated(center: Arc<Cube>) -> MeshInput {
-        MeshInput {
-            center,
-            neighbors: std::array::from_fn(|_| None),
-            level: 0,
-        }
-    }
-
-    /// [`MeshInput::isolated`] at `level`.
-    pub fn isolated_at_level(center: Arc<Cube>, level: u8) -> MeshInput {
-        MeshInput {
-            level,
-            ..MeshInput::isolated(center)
-        }
-    }
-
-    pub fn neighbor(&self, dx: i32, dy: i32, dz: i32) -> Option<&Arc<Cube>> {
-        self.neighbors[neighbor_index(dx, dy, dz)].as_ref()
-    }
-}
-
-/// The mesher output: faces grouped by direction so the renderer can skip
-/// back-facing directions (task 2.2). `ranges[d]` indexes `faces`.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct MeshOutput {
-    pub faces: Vec<PackedFace>,
-    pub ranges: [Range<u32>; 6],
-    /// Faces emitted under the skirt rule (level >= 1 side directions):
-    /// the skirt overhead. They carry the skirt bit in their merge key, so
-    /// a counted face never merged with a non-skirt one.
-    pub skirts: u32,
-    /// Faces emitted under the lid rule (level >= 1, +Y at an octant plane
-    /// or the cube's top row). Like skirts they carry their own merge-key
-    /// bit, so a counted face never merged with an ordinary one.
-    pub lids: u32,
-}
-
-impl MeshOutput {
-    pub fn face_count(&self) -> usize {
-        self.faces.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.faces.is_empty()
-    }
-}
-
-/// Meshes one cube. See the README for the face rule and AO rule.
-pub fn mesh(input: &MeshInput, appearance: &BlockAppearance) -> MeshOutput {
-    if let Some(state) = input.center.uniform() {
-        let app = appearance.get(state);
-        if app.air {
-            // Uniform air owns no faces, whatever the neighbors are.
-            return MeshOutput::default();
-        }
-        if app.opaque && enclosed_by_opaque(input, appearance) {
-            // Fully surrounded by uniform opaque face neighbors: nothing
-            // of this cube is visible.
-            return MeshOutput::default();
-        }
-    }
-    let padded = build_padded(input, appearance);
-    mesh_padded(&padded, appearance, input.level)
-}
-
-/// Whether all six face neighbors are present, uniform and opaque.
-fn enclosed_by_opaque(input: &MeshInput, appearance: &BlockAppearance) -> bool {
-    const FACE_OFFSETS: [(i32, i32, i32); 6] = [
-        (1, 0, 0),
-        (-1, 0, 0),
-        (0, 1, 0),
-        (0, -1, 0),
-        (0, 0, 1),
-        (0, 0, -1),
-    ];
-    FACE_OFFSETS.iter().all(|&(dx, dy, dz)| {
-        input
-            .neighbor(dx, dy, dz)
-            .and_then(|cube| cube.uniform())
-            .is_some_and(|state| appearance.get(state).opaque)
-    })
-}
-
-/// Builds the padded 34^3 cell array from the center cube and its
-/// neighbors. Each cell packs `(flags << 16) | kind`, where kind is the
-/// state id + 1 (0 means "missing cube"). Exposed for the
-/// `mesh/padded_build` bench.
-pub fn build_padded(input: &MeshInput, appearance: &BlockAppearance) -> Vec<u32> {
-    // state id -> cell encoding, built once per mesh. State ids are dense.
-    let mut table = vec![MISSING_CELL; appearance.len()];
-    for (state, cell) in table.iter_mut().enumerate() {
-        let app = appearance.get(BlockStateId(state as u32));
-        let mut flags = 0;
-        if app.air {
-            flags |= F_AIR;
-        }
-        if app.opaque {
-            flags |= F_OPAQUE_CULL | F_OPAQUE_AO;
-        }
-        if app.cutout {
-            flags |= F_CUTOUT;
-        }
-        *cell = (flags << FLAGS_SHIFT) | (state as u32 + 1);
-    }
-    let cell_of =
-        |state: BlockStateId| table.get(state.0 as usize).copied().unwrap_or(MISSING_CELL);
-
-    let mut cells = vec![MISSING_CELL; PAD_VOLUME];
-
-    // Center: one 32-cell row per (y, z). Uniform centers fill; others
-    // stream Cube::iter(), which is ~3x faster than per-block get.
-    if let Some(state) = input.center.uniform() {
-        let cell = cell_of(state);
-        for y in 0..CUBE_SIZE as usize {
-            for z in 0..CUBE_SIZE as usize {
-                let base = ORIGIN + PAD_Y * y + PAD_Z * z;
-                cells[base..base + CUBE_SIZE as usize].fill(cell);
-            }
-        }
-    } else {
-        let mut states = input.center.iter();
-        for y in 0..CUBE_SIZE as usize {
-            for z in 0..CUBE_SIZE as usize {
-                let base = ORIGIN + PAD_Y * y + PAD_Z * z;
-                for x in 0..CUBE_SIZE as usize {
-                    let state = states.next().expect("cube covers CUBE_VOLUME cells");
-                    cells[base + x] = cell_of(state);
-                }
-            }
-        }
-    }
-
-    // Neighbor shells. A cube at offset o contributes the padded cells on
-    // the matching face; its local coordinate is p - 32 * o per axis, so
-    // the same formula covers face, edge and corner neighbors. Cells no
-    // present neighbor covers stay MISSING.
-    for dy in -1..=1 {
-        for dz in -1..=1 {
-            for dx in -1..=1 {
-                if (dx, dy, dz) == (0, 0, 0) {
-                    continue;
-                }
-                let Some(cube) = input.neighbor(dx, dy, dz) else {
-                    continue;
-                };
-                let uniform_cell = cube.uniform().map(cell_of);
-                let (ys, ye) = axis_span(dy);
-                let (zs, ze) = axis_span(dz);
-                let (xs, _xe) = axis_span(dx);
-                // Padded x is fixed at -1 or CUBE_SIZE for side neighbors;
-                // the matching local x in the neighbor cube is
-                // CUBE_SIZE - 1 or 0.
-                let px = (xs + 1) as usize; // padded column within the row
-                let lx = (xs - CUBE_SIZE * dx) as usize; // local x in the neighbor
-                for py in ys..=ye {
-                    let y_base = PAD_Y * ((py + 1) as usize);
-                    let ly = py - CUBE_SIZE * dy;
-                    for pz in zs..=ze {
-                        let z_base = y_base + PAD_Z * ((pz + 1) as usize);
-                        let lz = pz - CUBE_SIZE * dz;
-                        if let Some(cell) = uniform_cell {
-                            if xs == 0 {
-                                cells[z_base + 1..z_base + 1 + CUBE_SIZE as usize].fill(cell);
-                            } else {
-                                cells[z_base + px] = cell;
-                            }
-                            continue;
-                        }
-                        let row = ((ly * CUBE_SIZE + lz) * CUBE_SIZE) as usize;
-                        if xs == 0 {
-                            for x in 0..CUBE_SIZE as usize {
-                                let state = cube.get_index(row + x);
-                                cells[z_base + 1 + x] = cell_of(state);
-                            }
-                        } else {
-                            let state = cube.get_index(row + lx);
-                            cells[z_base + px] = cell_of(state);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    cells
-}
-
-/// Padded-coordinate span for one axis of a neighbor offset: a fixed shell
-/// coordinate (−1 or `CUBE_SIZE`) for nonzero offsets, the full
-/// `0..=CUBE_SIZE - 1` for zero.
-fn axis_span(offset: i32) -> (i32, i32) {
-    match offset {
-        -1 => (-1, -1),
-        1 => (CUBE_SIZE, CUBE_SIZE),
-        _ => (0, CUBE_SIZE - 1),
-    }
-}
+use crate::mesh::input::MeshOutput;
 
 /// Padded-index stride of an axis vector like (0, 0, -1).
 #[inline]
-fn stride(axis: [i32; 3]) -> isize {
+pub(crate) fn stride(axis: [i32; 3]) -> isize {
     axis[0] as isize + PAD_Y as isize * axis[1] as isize + PAD_Z as isize * axis[2] as isize
 }
 
 /// Sweeps the six directions and greedily merges coplanar faces with
 /// identical (layer, AO, light) into maximal rectangles. At level >= 1,
 /// rectangles never cross an octant plane (see the module docs) and faces
-/// covered by the skirt rule are emitted with [`SKIRT_KEY_BIT`] set.
-fn mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u8) -> MeshOutput {
+/// covered by the skirt or lid rules are emitted with their key bit set.
+pub(crate) fn mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u8) -> MeshOutput {
     let mut output = MeshOutput {
         faces: Vec::new(),
         ranges: std::array::from_fn(|_| 0u32..0),
@@ -436,117 +188,21 @@ fn mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u8) -> MeshOutp
     output
 }
 
-/// Marks a face key emitted under the skirt rule (bit 30; bit 31 is the
-/// non-zero flag).
-const SKIRT_KEY_BIT: u32 = 1 << 30;
-
 /// The texture layer field of a face key: bits 15..30, below
-/// [`SKIRT_KEY_BIT`].
+/// SKIRT_KEY_BIT in `super::seams`.
 const LAYER_KEY_MASK: u32 = 0x7FFF;
 
-/// The skirt rule (task 2.6), applied at level >= 1 in the side directions
-/// +-X/+-Z. A skirt stands in for a coarse cell's side wall at a level
-/// seam, hiding the crack where the neighboring volume is drawn by finer
-/// cubes whose surface sits lower (the downsampling rule leans solid, so a
-/// coarse surface can be up to 2^n - 1 blocks above the fine one):
-///
-/// ```text
-///      fine side (level n-1)      coarse side (level n, this cube)
-///                   air
-///        ..........______..........______
-///        grass    grass    ||  grass(grass)   <- top faces
-///        dirt     dirt     ||  dirt          <- coarse cell c, filled
-///        dirt     dirt     ||  dirt             the cell across the plane
-///        stone    stone    ||  stone            is filled (or its cube is
-///                                                 missing) -> normal rule
-///                                                 would cull c's side face
-/// ```
-///
-/// Emit c's face in direction d even though the cell across d is filled,
-/// when ALL of these hold:
-///
-/// - c is filled;
-/// - the cell across d lies in a different octant or a different cube (c
-///   sits at the octant plane or the cube border along d);
-/// - that cell is filled, or is in a missing neighbor cube;
-/// - c is one of the top two filled cells of its column run: the cell
-///   above c is air, or the cell two above is. At the cube's top row the
-///   two-above cell is outside the padded array and counts as filled.
-///
-/// The face hangs down 2 cells worth of cover, enough for the 2^n - 1 the
-/// rule leans solid. When the octant across is drawn by the same coarse
-/// cube (no finer level arrived there), the skirt sits inside terrain and
-/// is hidden by the neighbor's top face. Skirt faces are ordinary faces:
-/// same AO, same texture, greedy-merged within the octant rule.
-fn skirt(pad: &[u32], a_index: usize, direction: Direction) -> bool {
-    let size = CUBE_SIZE as usize;
-    let half = size / 2;
-    let x = (a_index % PAD) as i32 - 1;
-    let z = ((a_index / PAD_Z) % PAD) as i32 - 1;
-    let y = (a_index / PAD_Y) as i32 - 1;
-    // The cell across d lies in a different octant or a different cube.
-    let boundary = match direction {
-        Direction::PosX => x == half as i32 - 1 || x == size as i32 - 1,
-        Direction::NegX => x == 0 || x == half as i32,
-        Direction::PosZ => z == half as i32 - 1 || z == size as i32 - 1,
-        Direction::NegZ => z == 0 || z == half as i32,
-        Direction::PosY | Direction::NegY => false, // sides only
-    };
-    if !boundary {
-        return false;
-    }
-    // One of the top two filled cells of the column run: air directly
-    // above, or air two above (the top row's two-above cell is outside the
-    // padded array and counts as filled).
-    let air = |index: usize| pad[index] & (F_AIR << FLAGS_SHIFT) != 0;
-    let above = a_index + PAD_Y;
-    if air(above) {
-        return true;
-    }
-    let two_above = a_index + 2 * PAD_Y;
-    (y as usize) < size - 1 && air(two_above)
-}
-
-/// Marks a face key emitted under the lid rule (bit 6: above the 4 light
-/// bits, below the AO byte at bit 7, so no packed field reads it).
-const LID_KEY_BIT: u32 = 1 << 6;
-
-/// The lid rule (wave D), applied at level >= 1 in direction +Y: the
-/// skirt rule's counterpart for horizontal seams. A cube whose upper
-/// octants (or the cube above) are drawn by finer cubes would otherwise
-/// cull its top faces at the seam against its OWN coarse cells across it,
-/// though the finer cubes drawn there may be air at that height. Looking
-/// down a slope that crosses the seam, the ray then meets no face at all:
-/// a line of holes along the contour at the seam height (found by the
-/// lod_fly test over the 2.8 mountains; the flat classic terrain never
-/// crossed a seam).
-///
-/// Emit c's +Y face even though the cell above is filled, when c is
-/// filled, the cell above is filled (or in a missing neighbor cube), and c
-/// sits at y = CUBE_SIZE / 2 - 1 (the octant plane) or y = CUBE_SIZE - 1
-/// (the cube border). There is no column restriction (unlike skirts): on
-/// a cliff a finer column can be air at the seam however high the coarse
-/// column above it reaches. Where the volume above is solid at the seam
-/// (the same coarse cube's unmasked octant, or a finer cube that is
-/// solid there) the lid lies inside terrain and is hidden; greedy merging
-/// folds a buried lid plane into a few quads per octant.
-fn lid(a_index: usize) -> bool {
-    let size = CUBE_SIZE as usize;
-    let y = a_index / PAD_Y - 1;
-    y == size / 2 - 1 || y == size - 1
-}
-
-/// Light is always 15 until lighting exists (task 2.x).
-const LIGHT: u32 = 15;
+/// Light is always 15 until lighting exists.
+pub(crate) const LIGHT: u32 = 15;
 
 /// Cells in one u/v slice mask (`CUBE_SIZE²`).
-const MASK_LEN: usize = (CUBE_SIZE as usize) * (CUBE_SIZE as usize);
+pub(crate) const MASK_LEN: usize = (CUBE_SIZE as usize) * (CUBE_SIZE as usize);
 
 /// AO of one unit face whose front block sits at padded index `front`,
 /// with face strides `u` and `v`. Returns the four corner values packed
 /// 2 bits each, c0..c3 in (u, v) corner order: 0 dark ..= 3 open.
 #[inline]
-fn corner_ao(pad: &[u32], front: isize, u: isize, v: isize) -> u32 {
+pub(crate) fn corner_ao(pad: &[u32], front: isize, u: isize, v: isize) -> u32 {
     let occludes = |i: isize| pad[i as usize] & (F_OPAQUE_AO << FLAGS_SHIFT) != 0;
     let side_u_neg = occludes(front - u);
     let side_u_pos = occludes(front + u);
@@ -573,9 +229,14 @@ fn corner_ao(pad: &[u32], front: isize, u: isize, v: isize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
     use crate::mesh::face::{Direction, unpack};
+    use crate::mesh::oracle::{legacy_mesh_padded, naive_unit_faces};
+    use crate::mesh::{MeshInput, build_padded, mesh, neighbor_index};
     use jbm_core::block::builtin;
     use jbm_core::coords::CUBE_VOLUME;
+    use jbm_core::cube::Cube;
 
     fn setup() -> (
         jbm_core::block::BlockRegistry,
@@ -841,94 +502,6 @@ mod tests {
         assert_eq!(output.face_count(), 0);
     }
 
-    /// A deliberately independent reference mesher: one face per block,
-    /// reading cubes directly instead of any padded array.
-    fn naive_unit_faces(
-        input: &MeshInput,
-        appearance: &BlockAppearance,
-    ) -> Vec<(u32, u32, u32, u8, u16, [u32; 4])> {
-        let mut out = Vec::new();
-        let state_at = |x: i32, y: i32, z: i32| -> Option<BlockStateId> {
-            let clamp = |c: i32| {
-                if c < 0 {
-                    -1
-                } else if c >= CUBE_SIZE {
-                    1
-                } else {
-                    0
-                }
-            };
-            let (dx, dy, dz) = (clamp(x), clamp(y), clamp(z));
-            let cube: &Cube = if (dx, dy, dz) == (0, 0, 0) {
-                &input.center
-            } else {
-                input.neighbor(dx, dy, dz)?.as_ref()
-            };
-            Some(cube.get(jbm_core::coords::LocalPos {
-                x: (x - dx * CUBE_SIZE) as u8,
-                y: (y - dy * CUBE_SIZE) as u8,
-                z: (z - dz * CUBE_SIZE) as u8,
-            }))
-        };
-        for y in 0..CUBE_SIZE {
-            for z in 0..CUBE_SIZE {
-                for x in 0..CUBE_SIZE {
-                    let a = state_at(x, y, z).expect("center covers its local range");
-                    let app_a = appearance.get(a);
-                    if app_a.air {
-                        continue;
-                    }
-                    for (di, direction) in DIRECTIONS.iter().enumerate() {
-                        let n = direction.normal();
-                        let (bx, by, bz) = (x + n[0], y + n[1], z + n[2]);
-                        let b_opaque = match state_at(bx, by, bz) {
-                            Some(state) => appearance.get(state).opaque,
-                            // Missing cube: opaque for culling.
-                            None => true,
-                        };
-                        if b_opaque {
-                            continue;
-                        }
-                        if let Some(b) = state_at(bx, by, bz)
-                            && b == a
-                            && app_a.cutout
-                        {
-                            continue;
-                        }
-                        // AO, written independently of corner_ao: explicit
-                        // sign arithmetic per corner.
-                        let ua = direction.u_axis();
-                        let va = direction.v_axis();
-                        let offset_cell = |su: i32, sv: i32| -> bool {
-                            let ox = bx + su * ua[0] + sv * va[0];
-                            let oy = by + su * ua[1] + sv * va[1];
-                            let oz = bz + su * ua[2] + sv * va[2];
-                            match state_at(ox, oy, oz) {
-                                Some(state) => appearance.get(state).opaque,
-                                None => false,
-                            }
-                        };
-                        let mut ao = [0u32; 4];
-                        for (corner, (su, sv)) in
-                            [(-1, -1), (1, -1), (1, 1), (-1, 1)].into_iter().enumerate()
-                        {
-                            let side1 = offset_cell(su, 0);
-                            let side2 = offset_cell(0, sv);
-                            let corner_cell = offset_cell(su, sv);
-                            ao[corner] = if side1 && side2 {
-                                0
-                            } else {
-                                3 - (u32::from(side1) + u32::from(side2) + u32::from(corner_cell))
-                            };
-                        }
-                        out.push((x as u32, y as u32, z as u32, di as u8, app_a.layers[di], ao));
-                    }
-                }
-            }
-        }
-        out
-    }
-
     /// Local xorshift, so tests never need the `rand` crate.
     struct XorShift64(u64);
 
@@ -944,7 +517,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // LOD levels (task 2.6)
+    // LOD levels
 
     /// A mesh input at `level` with air above and beside, a missing cube
     /// below (like a real terrain cube whose -Y neighbor never shows).
@@ -1008,105 +581,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    /// The pre-2.6 greedy sweep, copied verbatim (modulo the skirts
-    /// counter): level 0 output must match it byte for byte.
-    fn legacy_mesh_padded(pad: &[u32], appearance: &BlockAppearance) -> MeshOutput {
-        let mut output = MeshOutput {
-            faces: Vec::new(),
-            ranges: std::array::from_fn(|_| 0u32..0),
-            skirts: 0,
-            lids: 0,
-        };
-        let size = CUBE_SIZE as usize;
-        let mut mask = [0u32; MASK_LEN];
-        for (dir_index, &direction) in DIRECTIONS.iter().enumerate() {
-            let n = stride(direction.normal());
-            let u = stride(direction.u_axis());
-            let v = stride(direction.v_axis());
-            let n_axis = n.abs();
-            let last = CUBE_SIZE as isize - 1;
-            let u_shift = if u < 0 { -last * u } else { 0 };
-            let v_shift = if v < 0 { -last * v } else { 0 };
-            let corner = ORIGIN as isize + u_shift + v_shift;
-            let mut layer_of_kind = vec![0u16; appearance.len() + 1];
-            for state in 0..appearance.len() {
-                layer_of_kind[state + 1] =
-                    appearance.get(BlockStateId(state as u32)).layers[dir_index];
-            }
-            let start = output.faces.len() as u32;
-            for k in 0..CUBE_SIZE as isize {
-                let a_row = corner + k * n_axis;
-                let b_row = a_row + n;
-                for vi in 0..CUBE_SIZE as isize {
-                    for ui in 0..CUBE_SIZE as isize {
-                        let a = pad[(a_row + ui * u + vi * v) as usize];
-                        let b = pad[(b_row + ui * u + vi * v) as usize];
-                        // Same-state culling for non-opaque blocks (wave D)
-                        // updated here too: the reference pins everything
-                        // else about the pre-2.6 sweep.
-                        let culled = a & (F_AIR << FLAGS_SHIFT) != 0
-                            || b & (F_OPAQUE_CULL << FLAGS_SHIFT) != 0
-                            || a == b;
-                        let key = if culled {
-                            0
-                        } else {
-                            let layer = u32::from(layer_of_kind[(a & 0xFFFF) as usize]);
-                            let ao = corner_ao(pad, b_row + ui * u + vi * v, u, v);
-                            (1 << 31) | (layer << 15) | (ao << 7) | LIGHT
-                        };
-                        mask[(vi * CUBE_SIZE as isize + ui) as usize] = key;
-                    }
-                }
-                for v0 in 0..size {
-                    for u0 in 0..size {
-                        let key = mask[v0 * size + u0];
-                        if key == 0 {
-                            continue;
-                        }
-                        let mut w = 1usize;
-                        while u0 + w < size && mask[v0 * size + u0 + w] == key {
-                            w += 1;
-                        }
-                        let mut h = 1usize;
-                        'extend: while v0 + h < size {
-                            let row = (v0 + h) * size;
-                            for ui in u0..u0 + w {
-                                if mask[row + ui] != key {
-                                    break 'extend;
-                                }
-                            }
-                            h += 1;
-                        }
-                        for vv in v0..v0 + h {
-                            for uu in u0..u0 + w {
-                                mask[vv * size + uu] = 0;
-                            }
-                        }
-                        let owner = (a_row + u0 as isize * u + v0 as isize * v) as usize;
-                        let x = (owner % PAD) as u32 - 1;
-                        let z = ((owner / PAD_Z) % PAD) as u32 - 1;
-                        let y = (owner / PAD_Y) as u32 - 1;
-                        let ao8 = (key >> 7) & 0xFF;
-                        output.faces.push(pack(&FaceFields {
-                            x,
-                            y,
-                            z,
-                            width: w as u32,
-                            height: h as u32,
-                            direction,
-                            layer: (key >> 15) & 0xFFFF,
-                            ao: [ao8 & 3, (ao8 >> 2) & 3, (ao8 >> 4) & 3, (ao8 >> 6) & 3],
-                            light: key & 0xF,
-                        }));
-                    }
-                }
-            }
-            output.ranges[dir_index] = start..output.faces.len() as u32;
-        }
-        output.skirts = 0;
-        output
     }
 
     #[test]
@@ -1316,7 +790,7 @@ mod tests {
         // Buried lid planes merge: a few quads per octant (AO at the
         // slope's foot splits some), not one per cell (2 x 32 x 32).
         assert!(output.lids <= 32, "lids {} did not merge", output.lids);
-        // Level 0 has no lids: LOD0 output stays the pre-2.6 mesher's.
+        // Level 0 has no lids: LOD0 output stays the original mesher's.
         let input = MeshInput::isolated_at_level(Arc::new(make()), 0);
         let output = mesh(&input, &appearance);
         assert_eq!(output.lids, 0);

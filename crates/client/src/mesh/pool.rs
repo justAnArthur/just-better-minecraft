@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use crate::lod::CubeKey;
 use crate::mesh::appearance::BlockAppearance;
-use crate::mesh::greedy::{self, MeshInput, MeshOutput};
+use crate::mesh::{self, MeshInput, MeshOutput};
 
 /// How long a worker blocks on the job queue before re-checking for
 /// shutdown. Bounded so dropping the pool joins every thread promptly even
@@ -187,7 +187,7 @@ fn worker_loop(
 fn run_job(job: Job, appearance: &BlockAppearance) -> Outcome {
     match job {
         Job::Mesh(job) => {
-            let output = greedy::mesh(&job.input, appearance);
+            let output = mesh::mesh(&job.input, appearance);
             Outcome::Done(MeshResult {
                 key: job.key,
                 version: job.version,
@@ -262,7 +262,7 @@ mod tests {
             }
         }
         for (p, cube) in &cubes {
-            let expected = greedy::mesh(&MeshInput::isolated(Arc::clone(cube)), &appearance);
+            let expected = mesh::mesh(&MeshInput::isolated(Arc::clone(cube)), &appearance);
             assert_eq!(&results[p], &expected, "pool output differs at {p:?}");
         }
     }

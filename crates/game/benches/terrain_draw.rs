@@ -22,7 +22,7 @@ use glam::DVec3;
 use jbm_client::camera::Camera;
 use jbm_client::gpu::Gpu;
 use jbm_client::lod::Coverage;
-use jbm_client::mesh::greedy;
+use jbm_client::mesh;
 use jbm_client::render::chunks::{TerrainPass, TerrainPath};
 use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
@@ -39,7 +39,7 @@ const WARMUP_FRAMES: usize = 3;
 
 /// One uploadable scene: meshes plus its camera.
 struct Scene {
-    meshes: Vec<(CubePos, greedy::MeshOutput)>,
+    meshes: Vec<(CubePos, mesh::MeshOutput)>,
     camera: Camera,
 }
 
@@ -75,13 +75,13 @@ fn cave_scene(region: &mut common::Region) -> Scene {
     Scene { meshes, camera }
 }
 
-fn region_meshes(region: &common::Region) -> Vec<(CubePos, greedy::MeshOutput)> {
+fn region_meshes(region: &common::Region) -> Vec<(CubePos, mesh::MeshOutput)> {
     region
         .region_positions
         .iter()
         .map(|&pos| {
             let input = region.mesh_input(pos);
-            (pos, greedy::mesh(&input, &region.appearance))
+            (pos, mesh::mesh(&input, &region.appearance))
         })
         .collect()
 }
@@ -178,7 +178,7 @@ fn bench(c: &mut Criterion) {
     // The layout clone is a ref-count bump and outlives the closure.
     let uniform_layout = renderer.uniform_layout().clone();
     let format = target.format();
-    let make_pass = |gpu: &jbm_client::gpu::Gpu, meshes: &[(CubePos, greedy::MeshOutput)]| {
+    let make_pass = |gpu: &jbm_client::gpu::Gpu, meshes: &[(CubePos, mesh::MeshOutput)]| {
         let mut pass = TerrainPass::new(gpu, format, &uniform_layout, &textures);
         for (pos, mesh) in meshes {
             pass.upload(gpu, jbm_client::lod::CubeKey::lod0(*pos), mesh);
@@ -253,7 +253,7 @@ fn bench(c: &mut Criterion) {
         );
     }
     let make_rings_pass =
-        |gpu: &jbm_client::gpu::Gpu, meshes: &[(jbm_client::lod::CubeKey, greedy::MeshOutput)]| {
+        |gpu: &jbm_client::gpu::Gpu, meshes: &[(jbm_client::lod::CubeKey, mesh::MeshOutput)]| {
             let mut pass = TerrainPass::new(gpu, format, &uniform_layout, &textures);
             let mut coverage = Coverage::default();
             for (key, mesh) in meshes {

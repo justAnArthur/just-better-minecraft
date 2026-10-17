@@ -16,7 +16,7 @@ mod common;
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use jbm_client::mesh::greedy;
+use jbm_client::mesh;
 use jbm_server::DEFAULT_SEED;
 
 fn bench(c: &mut Criterion) {
@@ -32,12 +32,12 @@ fn bench(c: &mut Criterion) {
     group.bench_function("mesh_region", |b| {
         b.iter(|| {
             for input in &inputs {
-                black_box(greedy::mesh(input, &region.appearance));
+                black_box(mesh::mesh(input, &region.appearance));
             }
         })
     });
     group.bench_function("remesh_edit", |b| {
-        b.iter(|| black_box(greedy::mesh(black_box(&edit), &region.appearance)))
+        b.iter(|| black_box(mesh::mesh(black_box(&edit), &region.appearance)))
     });
     group.bench_function("build_region", |b| {
         b.iter(|| {

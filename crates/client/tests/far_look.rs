@@ -15,10 +15,10 @@ use glam::{DVec3, Vec4};
 use image::RgbaImage;
 use jbm_client::camera::Camera;
 use jbm_client::lod::CubeKey;
+use jbm_client::mesh;
 use jbm_client::mesh::appearance::{
     BlockAppearance, LAYER_OAK_PLANKS, LAYER_STONE, builtin_textures,
 };
-use jbm_client::mesh::greedy;
 use jbm_client::render::chunks::{
     FADE_END_FRACTION, FADE_START_FRACTION, FOG_END_FRACTION, FOG_START_FRACTION, TerrainPass,
 };
@@ -164,8 +164,8 @@ fn upload_isolated(
         level,
         pos: CubePos { x: 0, y: 0, z: 0 },
     };
-    let input = greedy::MeshInput::isolated_at_level(Arc::new(cube), level);
-    let output = greedy::mesh(&input, appearance);
+    let input = mesh::MeshInput::isolated_at_level(Arc::new(cube), level);
+    let output = mesh::mesh(&input, appearance);
     ctx.terrain.upload(&ctx.gpu, key, &output);
 }
 
@@ -283,8 +283,8 @@ fn lod0_grass_strip_fades_into_the_flat_average() {
                 }
             });
             let key = CubeKey::lod0(CubePos { x, y: 0, z });
-            let input = greedy::MeshInput::isolated_at_level(Arc::new(cube), 0);
-            let output = greedy::mesh(&input, &appearance);
+            let input = mesh::MeshInput::isolated_at_level(Arc::new(cube), 0);
+            let output = mesh::mesh(&input, &appearance);
             ctx.terrain.upload(&ctx.gpu, key, &output);
         }
     }
@@ -423,8 +423,8 @@ fn fog_matches_the_sky_and_leaves_near_terrain_alone() {
             }
         });
         let key = CubeKey::lod0(CubePos { x: 0, y: 1, z: k });
-        let input = greedy::MeshInput::isolated_at_level(Arc::new(cube), 0);
-        let output = greedy::mesh(&input, &appearance);
+        let input = mesh::MeshInput::isolated_at_level(Arc::new(cube), 0);
+        let output = mesh::mesh(&input, &appearance);
         ctx.terrain.upload(&ctx.gpu, key, &output);
     }
     let camera = looking_at(DVec3::new(16.0, 24.0, 900.0), DVec3::new(16.0, 48.0, 400.0));

@@ -23,8 +23,8 @@ use std::time::Instant;
 use glam::DVec3;
 use jbm_client::camera::Camera;
 use jbm_client::gpu::Gpu;
+use jbm_client::mesh;
 use jbm_client::mesh::face::PackedFace;
-use jbm_client::mesh::greedy;
 use jbm_client::render::chunks::{TerrainPass, TerrainPath};
 use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
@@ -160,12 +160,12 @@ fn main() {
     let mut region = common::Region::new(DEFAULT_SEED);
     let blocks = region.blocks();
 
-    let meshes: Vec<(CubePos, greedy::MeshOutput)> = region
+    let meshes: Vec<(CubePos, mesh::MeshOutput)> = region
         .region_positions
         .iter()
         .map(|&pos| {
             let input = region.mesh_input(pos);
-            (pos, greedy::mesh(&input, &region.appearance))
+            (pos, mesh::mesh(&input, &region.appearance))
         })
         .collect();
 
@@ -178,7 +178,7 @@ fn main() {
             )
         })
         .count();
-    let non_empty: Vec<&greedy::MeshOutput> = meshes
+    let non_empty: Vec<&mesh::MeshOutput> = meshes
         .iter()
         .map(|(_, m)| m)
         .filter(|m| !m.is_empty())
@@ -269,12 +269,12 @@ fn main() {
     // surface, camera standing in the room (carve_cave asserts the room is
     // closed and the camera sits in air).
     region.carve_cave();
-    let cave_meshes: Vec<(CubePos, greedy::MeshOutput)> = region
+    let cave_meshes: Vec<(CubePos, mesh::MeshOutput)> = region
         .region_positions
         .iter()
         .map(|&pos| {
             let input = region.mesh_input(pos);
-            (pos, greedy::mesh(&input, &region.appearance))
+            (pos, mesh::mesh(&input, &region.appearance))
         })
         .collect();
     let (_, ys, _) = region.cave_room();

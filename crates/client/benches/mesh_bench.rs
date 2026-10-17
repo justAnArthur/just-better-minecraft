@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use jbm_client::mesh::appearance::BlockAppearance;
-use jbm_client::mesh::greedy::{self, MeshInput, neighbor_index};
+use jbm_client::mesh::{self, MeshInput, neighbor_index};
 use jbm_client::render::suballoc;
 use jbm_core::block::{BlockRegistry, BlockStateId, builtin};
 use jbm_core::cube::Cube;
@@ -106,7 +106,7 @@ fn bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("mesh");
     group.bench_function("terrain_like", |b| {
         b.iter(|| {
-            black_box(greedy::mesh(
+            black_box(mesh::mesh(
                 black_box(&terrain_input),
                 black_box(&appearance),
             ))
@@ -114,7 +114,7 @@ fn bench(c: &mut Criterion) {
     });
     group.bench_function("checkerboard", |b| {
         b.iter(|| {
-            black_box(greedy::mesh(
+            black_box(mesh::mesh(
                 black_box(&checker_input),
                 black_box(&appearance),
             ))
@@ -122,7 +122,7 @@ fn bench(c: &mut Criterion) {
     });
     group.bench_function("uniform_stone_air_neighbors", |b| {
         b.iter(|| {
-            black_box(greedy::mesh(
+            black_box(mesh::mesh(
                 black_box(&uniform_input),
                 black_box(&appearance),
             ))
@@ -130,7 +130,7 @@ fn bench(c: &mut Criterion) {
     });
     group.bench_function("padded_build", |b| {
         b.iter(|| {
-            black_box(greedy::build_padded(
+            black_box(mesh::build_padded(
                 black_box(&padded_input),
                 black_box(&appearance),
             ))
