@@ -26,17 +26,6 @@ use jbm_testkit::HeadlessServer;
 /// Cubes in the streaming shape for R = 3, V = 2: 29 columns of 5.
 const DESIRED_CUBES: usize = 29 * 5;
 
-/// A camera at `eye` looking at `look_at`.
-fn looking_at(eye: DVec3, look_at: DVec3) -> Camera {
-    let d = look_at - eye;
-    let yaw = f32::atan2(d.x as f32, -d.z as f32);
-    let pitch = f32::atan2(d.y as f32, d.x.hypot(d.z) as f32);
-    let mut camera = Camera::new(eye, 70.0_f32.to_radians(), 1.0);
-    camera.set_yaw(yaw);
-    camera.set_pitch(pitch);
-    camera
-}
-
 #[test]
 #[cfg(not(feature = "cube16"))] // streaming shape and golden are 32³-only
 fn edited_spawn_scene_matches_golden() {
@@ -189,9 +178,11 @@ fn edited_spawn_scene_matches_golden() {
     // so the floor, walls and corner AO all show;
     // the outline marks one pit floor block, and the empty overlay turns
     // the crosshair on without text.
-    let camera = looking_at(
+    let camera = Camera::looking_at(
         DVec3::new(6.0, base as f64 + 5.5, -1.0),
         DVec3::new(1.5, base as f64 - 2.0, -2.0),
+        70.0_f32.to_radians(),
+        1.0,
     );
     // The pit floor block under the pit's center column: solid, so the
     // outline marks what a player aiming there would target.

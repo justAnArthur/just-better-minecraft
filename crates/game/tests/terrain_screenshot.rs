@@ -23,17 +23,6 @@ use jbm_testkit::HeadlessServer;
 /// Cubes in the streaming shape for R = 3, V = 2: 29 columns of 5.
 const DESIRED_CUBES: usize = 29 * 5;
 
-/// A camera at `eye` looking at `look_at`.
-fn looking_at(eye: DVec3, look_at: DVec3) -> Camera {
-    let d = look_at - eye;
-    let yaw = f32::atan2(d.x as f32, -d.z as f32);
-    let pitch = f32::atan2(d.y as f32, d.x.hypot(d.z) as f32);
-    let mut camera = Camera::new(eye, 70.0_f32.to_radians(), 1.0);
-    camera.set_yaw(yaw);
-    camera.set_pitch(pitch);
-    camera
-}
-
 #[test]
 #[cfg(not(feature = "cube16"))] // streaming shape and golden are 32³-only
 fn streamed_terrain_matches_golden() {
@@ -101,9 +90,11 @@ fn streamed_terrain_matches_golden() {
     }
 
     // Above and behind spawn, looking down across it.
-    let camera = looking_at(
+    let camera = Camera::looking_at(
         spawn + DVec3::new(-24.0, 20.0, -24.0),
         spawn + DVec3::new(24.0, -8.0, 24.0),
+        70.0_f32.to_radians(),
+        1.0,
     );
     renderer.render(
         &gpu,

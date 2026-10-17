@@ -375,9 +375,11 @@ fn cameras() -> Vec<(&'static str, Camera, bool)> {
     // 1. Close, slightly down, spanning a LOD0/LOD1 border ahead.
     let mut cams: Vec<(&'static str, Camera, bool)> = vec![(
         "close",
-        looking_at(
+        Camera::looking_at(
             center + DVec3::new(24.0, 26.0, 24.0),
             surface + DVec3::new(-30.0, -6.0, -30.0),
+            FOV,
+            1.0,
         ),
         true,
     )];
@@ -385,22 +387,35 @@ fn cameras() -> Vec<(&'static str, Camera, bool)> {
     // the level-0 disk ends near x = 64..80).
     cams.push((
         "zoom_border01",
-        looking_at(DVec3::new(-20.0, 96.0, 16.0), DVec3::new(70.0, 62.0, 16.0)).zoomed(0.45),
+        Camera::looking_at(
+            DVec3::new(-20.0, 96.0, 16.0),
+            DVec3::new(70.0, 62.0, 16.0),
+            FOV,
+            1.0,
+        )
+        .zoomed(0.45),
         false,
     ));
     // 3. Steep-down onto the LOD0/LOD1 border.
     cams.push((
         "down_border01",
-        looking_at(DVec3::new(16.0, 130.0, 110.0), DVec3::new(60.0, 60.0, 30.0)),
+        Camera::looking_at(
+            DVec3::new(16.0, 130.0, 110.0),
+            DVec3::new(60.0, 60.0, 30.0),
+            FOV,
+            1.0,
+        ),
         false,
     ));
     // 4. Straight at the LOD1/LOD2 border (level-1 disk ends near
     // x = 3*64 = 192..256 blocks).
     cams.push((
         "border12",
-        looking_at(
+        Camera::looking_at(
             DVec3::new(60.0, 110.0, 60.0),
             DVec3::new(240.0, 60.0, -40.0),
+            FOV,
+            1.0,
         ),
         true,
     ));
@@ -409,27 +424,33 @@ fn cameras() -> Vec<(&'static str, Camera, bool)> {
     // corner columns; look down the diagonal from high up.
     cams.push((
         "corner3",
-        looking_at(
+        Camera::looking_at(
             DVec3::new(-120.0, 200.0, -120.0),
             DVec3::new(280.0, 40.0, 280.0),
+            FOV,
+            1.0,
         ),
         true,
     ));
     // 6. Low toward the horizon across all rings.
     cams.push((
         "horizon",
-        looking_at(
+        Camera::looking_at(
             DVec3::new(16.0, 92.0, 16.0),
             DVec3::new(600.0, 60.0, -500.0),
+            FOV,
+            1.0,
         ),
         false,
     ));
     // 7. High above, looking across the whole ring stack.
     cams.push((
         "high",
-        looking_at(
+        Camera::looking_at(
             DVec3::new(-300.0, 420.0, -300.0),
             DVec3::new(80.0, 50.0, 80.0),
+            FOV,
+            1.0,
         ),
         false,
     ));
@@ -439,20 +460,16 @@ fn cameras() -> Vec<(&'static str, Camera, bool)> {
     // disk sees legitimate below-horizon sky everywhere near it.)
     cams.push((
         "outside_in",
-        looking_at(DVec3::new(700.0, 190.0, 700.0), DVec3::new(0.0, 60.0, 0.0)).zoomed(0.5),
+        Camera::looking_at(
+            DVec3::new(700.0, 190.0, 700.0),
+            DVec3::new(0.0, 60.0, 0.0),
+            FOV,
+            1.0,
+        )
+        .zoomed(0.5),
         false,
     ));
     cams
-}
-
-fn looking_at(eye: DVec3, look_at: DVec3) -> Camera {
-    let d = look_at - eye;
-    let yaw = f32::atan2(d.x as f32, -d.z as f32);
-    let pitch = f32::atan2(d.y as f32, d.x.hypot(d.z) as f32);
-    let mut camera = Camera::new(eye, FOV, 1.0);
-    camera.set_yaw(yaw);
-    camera.set_pitch(pitch);
-    camera
 }
 
 /// Renders one frame with the sentinel sky and returns the image.
@@ -956,7 +973,12 @@ fn a_lod1_cube_renders_like_its_pattern_scaled() {
         // but covers the same blocks, so the coarse cube must land on
         // exactly the same pixels with the same per-block textures —
         // that is the x2 scale invariance under test.
-        let camera = looking_at(DVec3::new(48.0, 52.0, 48.0), DVec3::new(14.0, 8.0, 14.0));
+        let camera = Camera::looking_at(
+            DVec3::new(48.0, 52.0, 48.0),
+            DVec3::new(14.0, 8.0, 14.0),
+            FOV,
+            1.0,
+        );
         let _ = level;
         renderer.render(
             &gpu,
@@ -1016,7 +1038,12 @@ fn a_lod1_cube_renders_like_its_pattern_scaled() {
     for (key, drawn, mask) in coverage.take_changed() {
         terrain.set_draw_state(&gpu, key, drawn, mask);
     }
-    let camera = looking_at(DVec3::new(96.0, 104.0, 96.0), DVec3::new(28.0, 16.0, 28.0));
+    let camera = Camera::looking_at(
+        DVec3::new(96.0, 104.0, 96.0),
+        DVec3::new(28.0, 16.0, 28.0),
+        FOV,
+        1.0,
+    );
     let mut reference: Option<RgbaImage> = None;
     for path in [
         TerrainPath::GpuCull,
@@ -1097,7 +1124,12 @@ fn masked_octants_hide_their_volume_and_full_masks_draw_nothing() {
     // its quarter of the table was. The camera looks at the cube's
     // corner between octants.
     terrain.set_draw_state(&gpu, key, true, 0x01);
-    let camera = looking_at(DVec3::new(96.0, 80.0, 96.0), DVec3::new(30.0, 30.0, 30.0));
+    let camera = Camera::looking_at(
+        DVec3::new(96.0, 80.0, 96.0),
+        DVec3::new(30.0, 30.0, 30.0),
+        FOV,
+        1.0,
+    );
     let image = render_sentinel(&gpu, &mut renderer, &target, &depth, &mut terrain, &camera);
     let components = sentinel_components(&image, below_margin_region(&camera, image.height()));
     assert!(

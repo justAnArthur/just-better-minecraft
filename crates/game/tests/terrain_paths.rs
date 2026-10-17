@@ -35,17 +35,6 @@ use jbm_testkit::HeadlessServer;
 /// Cubes in the streaming shape for R = 3, V = 2: 29 columns of 5.
 const DESIRED_CUBES: usize = 29 * 5;
 
-/// A camera at `eye` looking at `look_at`.
-fn looking_at(eye: DVec3, look_at: DVec3) -> Camera {
-    let d = look_at - eye;
-    let yaw = f32::atan2(d.x as f32, -d.z as f32);
-    let pitch = f32::atan2(d.y as f32, d.x.hypot(d.z) as f32);
-    let mut camera = Camera::new(eye, 70.0_f32.to_radians(), 1.0);
-    camera.set_yaw(yaw);
-    camera.set_pitch(pitch);
-    camera
-}
-
 fn server_config() -> ServerConfig {
     ServerConfig {
         seed: DEFAULT_SEED,
@@ -311,9 +300,11 @@ fn terrain_spawn_paths_render_pixel_identical() {
     let (_, meshes, spawn) = streamed_scene(&mut server, &[]);
 
     // The terrain_spawn camera: above and behind spawn, looking down.
-    let camera = looking_at(
+    let camera = Camera::looking_at(
         spawn + DVec3::new(-24.0, 20.0, -24.0),
         spawn + DVec3::new(24.0, -8.0, 24.0),
+        70.0_f32.to_radians(),
+        1.0,
     );
     render_all_paths(&gpu, &meshes, &camera, "terrain_spawn");
 }
@@ -370,9 +361,11 @@ fn edit_spawn_paths_render_pixel_identical() {
     // The edit_spawn camera, without outline or overlay (those are not
     // part of the terrain pass under test).
     let base = surface(0, 0);
-    let camera = looking_at(
+    let camera = Camera::looking_at(
         DVec3::new(6.0, base as f64 + 5.5, -1.0),
         DVec3::new(1.5, base as f64 - 2.0, -2.0),
+        70.0_f32.to_radians(),
+        1.0,
     );
     render_all_paths(&gpu, &meshes, &camera, "edit_spawn");
 }
@@ -567,9 +560,11 @@ fn open_surface_view_stays_uncullled() {
 
     // The terrain_spawn camera on the surface; two warm-up frames so the
     // occlusion state is steady.
-    let camera = looking_at(
+    let camera = Camera::looking_at(
         spawn + DVec3::new(-24.0, 20.0, -24.0),
         spawn + DVec3::new(24.0, -8.0, 24.0),
+        70.0_f32.to_radians(),
+        1.0,
     );
     for _ in 0..2 {
         render_frame(&gpu, &mut renderer, &target, &depth, &mut terrain, &camera);
@@ -631,9 +626,11 @@ fn odd_resize_keeps_the_paths_identical() {
     terrain.set_prefer_gpu_cull(true);
     assert_eq!(terrain.path(), TerrainPath::GpuCull);
 
-    let camera = looking_at(
+    let camera = Camera::looking_at(
         spawn + DVec3::new(-24.0, 20.0, -24.0),
         spawn + DVec3::new(24.0, -8.0, 24.0),
+        70.0_f32.to_radians(),
+        1.0,
     );
     // One frame at 256x256 (this builds the pyramid), then the odd resize.
     render_frame(&gpu, &mut renderer, &target, &depth, &mut terrain, &camera);
@@ -657,9 +654,11 @@ fn terrain_spawn_stats_show_direction_skipping() {
     let mut server = HeadlessServer::with_config(server_config());
     let (_, meshes, spawn) = streamed_scene(&mut server, &[]);
 
-    let camera = looking_at(
+    let camera = Camera::looking_at(
         spawn + DVec3::new(-24.0, 20.0, -24.0),
         spawn + DVec3::new(24.0, -8.0, 24.0),
+        70.0_f32.to_radians(),
+        1.0,
     );
     let target = OffscreenTarget::new(&gpu.device, 256, 256);
     let depth = DepthTarget::new(&gpu.device, 256, 256);

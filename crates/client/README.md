@@ -17,7 +17,8 @@ coordinates and cfg-gated off under the crate's own `cube16` passthrough;
   for the window.
 - `camera::Camera` — f64 position, yaw/pitch (pitch clamped to ±89°),
   reverse-Z infinite-far projection, camera-relative `view_proj()` and
-  `relative()`.
+  `relative()`; `Camera::looking_at(eye, look_at, fov, aspect)` is the
+  fixed-camera constructor the tests and the playground share.
 - `input::InputState` — winit-independent key set, mouse delta
   accumulation and the F-key fly-toggle edge; `input::move_input` maps
   held keys onto the physics `MoveInput`, `input::apply_mouse_look`
