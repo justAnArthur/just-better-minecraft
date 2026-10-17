@@ -59,6 +59,7 @@ fn streamed_terrain_matches_golden() {
         lod_vertical_radius: 3,
         lod_send_budget_per_tick: 32,
         lod_max_in_flight: 256,
+        ..ServerConfig::default()
     });
     let mut client = server.connect("viewer");
     let mut world = ClientWorld::new();
