@@ -208,15 +208,15 @@ mod tests {
             1.0,
         );
         assert!(c.forward().abs_diff_eq(Vec3::new(0.0, 0.0, -1.0), 1e-6));
-        // From +X toward the origin: yaw 90°, and a downward pitch when
-        // the target sits lower.
+        // From +X toward the origin: the direction is -X (yaw -90°, so
+        // forward.x = sin(-90°) = -1), pitched down 45°.
         let c = Camera::looking_at(
             DVec3::new(10.0, 10.0, 0.0),
             DVec3::ZERO,
             70.0_f32.to_radians(),
             1.0,
         );
-        assert!((c.yaw - 90.0_f32.to_radians()).abs() < 1e-5);
+        assert!((c.yaw - (-90.0_f32.to_radians())).abs() < 1e-5);
         assert!((c.pitch - (-45.0_f32.to_radians())).abs() < 1e-5);
     }
 }
