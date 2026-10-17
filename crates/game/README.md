@@ -137,7 +137,10 @@ pre-2.10 fixed windows) and 16 (the default).
 slow real-server flight; run with `cargo test -p jbm-game --test
 lod_fly -- --ignored`) flies a real client against a threaded real
 server: 1.5 km straight, then a 90° turn for 300 m, 40 blocks above the
-terrain at pitch −15°. Every 100 blocks it waits (20 s cap) for the
+terrain at pitch −15°, then (task 2.10) 600 m low along a valley
+(20 over the terrain, cliffs towering over the camera) and one final
+stop looking straight down from 400 blocks. Every 100 blocks it waits
+(20 s cap) for the
 client mesh queue to be clear for a run of ticks (server ring readiness
 is never checked — whatever arrived and meshed by then is what the
 check sees), then checks the sentinel pixels below the horizon
