@@ -6,7 +6,8 @@
 
 use crate::hud::HudSnapshot;
 use crate::render::overlay::FrameStats;
-use crate::render::settings::RenderSettings;
+use crate::render::settings::{LOD_LEVELS, RenderSettings};
+use crate::render::terrain::LevelStats;
 
 /// The World section's editable half: the server view distances in cubes
 /// (`view_radius`, `lod_view_radius`), applied live through the game's
@@ -38,7 +39,8 @@ pub(crate) fn show(
 }
 
 /// Stats (read-only): frame timing, the same lines the bitmap overlay
-/// prints, and the frame-time spread over the last 120 frames.
+/// prints, the frame-time spread over the last 120 frames, and the
+/// per-LOD-level table (resident / drawn this frame / faces issued).
 fn stats_section(ui: &mut egui::Ui, snapshot: &HudSnapshot, stats: &FrameStats) {
     egui::CollapsingHeader::new("Stats")
         .default_open(true)
@@ -52,15 +54,106 @@ fn stats_section(ui: &mut egui::Ui, snapshot: &HudSnapshot, stats: &FrameStats) 
             for line in crate::hud::lines(snapshot) {
                 ui.monospace(line);
             }
+            ui.separator();
+            // Terrain totals: triangles are two per issued face, and the
+            // page accounting shows the GPU memory the meshes hold.
+            ui.monospace(format!(
+                "TRIS {} PAGES {} ({:.1} MiB) USED_FACES {}",
+                snapshot.terrain.faces * 2,
+                snapshot.terrain.pages,
+                snapshot.terrain.page_bytes as f64 / (1024.0 * 1024.0),
+                snapshot.terrain.used_faces,
+            ));
+            ui.monospace(format!(
+                "LEVEL  RESIDENT  DRAWN  FACES   (drawn counts {})",
+                if snapshot.path_name == "gpu-cull" {
+                    "GPU readback, 1-2 frames late"
+                } else {
+                    "exact"
+                }
+            ));
+            egui::Grid::new("levels")
+                .num_columns(4)
+                .striped(true)
+                .show(ui, |ui| {
+                    for entry in per_level_rows(&snapshot.levels) {
+                        ui.monospace(entry[0].clone());
+                        ui.monospace(entry[1].clone());
+                        ui.monospace(entry[2].clone());
+                        ui.monospace(entry[3].clone());
+                        ui.end_row();
+                    }
+                });
         });
 }
 
-/// Views: the debug toggles. Each checkbox edits `RenderSettings` — the
-/// renderer applies it next frame.
+/// The per-level table rows: level, resident cubes, cubes the cull drew
+/// this frame, faces issued this frame.
+fn per_level_rows(levels: &[LevelStats]) -> Vec<[String; 4]> {
+    levels
+        .iter()
+        .map(|stats| {
+            [
+                format!("L{}", stats.level),
+                stats.resident.to_string(),
+                stats.frame_drawn.to_string(),
+                stats.frame_faces.to_string(),
+            ]
+        })
+        .collect()
+}
+
+/// Views: the debug toggles. Each control edits `RenderSettings` — the
+/// renderer and the terrain pass apply it next frame, on every draw path
+/// (the path flags switch the path live).
 fn views_section(ui: &mut egui::Ui, settings: &mut RenderSettings) {
     egui::CollapsingHeader::new("Views").show(ui, |ui| {
+        ui.checkbox(&mut settings.wireframe, "wireframe (JBM_WIREFRAME)");
+        ui.add_enabled(
+            settings.wireframe,
+            egui::Checkbox::new(&mut settings.wireframe_only, "wireframe only"),
+        );
+        ui.checkbox(
+            &mut settings.chunk_borders,
+            "chunk borders (JBM_CHUNK_BORDERS)",
+        );
+        ui.checkbox(&mut settings.lod_tint, "level tint (F4, JBM_LOD_TINT)");
+        ui.checkbox(
+            &mut settings.freeze_cull,
+            "freeze culling (JBM_FREEZE_CULL)",
+        );
+        ui.separator();
+        // The explode slider: 0 is off; while nonzero the cull skips its
+        // frustum test (the moved cubes sit outside every bound).
+        let mut explode = settings.explode as i32;
+        ui.horizontal(|ui| {
+            ui.label("exploded (JBM_EXPLODE)");
+            ui.add(
+                egui::DragValue::new(&mut explode)
+                    .range(0..=8)
+                    .suffix(" gap"),
+            );
+        });
+        settings.explode = explode.clamp(0, 8) as u32;
+        ui.separator();
+        ui.label("levels (JBM_LEVELS): a hidden level leaves a hole");
+        ui.horizontal_wrapped(|ui| {
+            for level in 0..LOD_LEVELS {
+                let mut shown = settings.level_mask & (1 << level) != 0;
+                let label = format!("L{level}");
+                if ui.toggle_value(&mut shown, label).changed() {
+                    settings.level_mask ^= 1 << level;
+                }
+            }
+        });
+        ui.separator();
         ui.checkbox(&mut settings.fog, "distance fog");
-        ui.checkbox(&mut settings.lod_tint, "level tint (F4)");
+        ui.checkbox(
+            &mut settings.prefer_gpu_cull,
+            "prefer gpu cull (JBM_GPU_CULL)",
+        );
+        ui.checkbox(&mut settings.force_cpu_cull, "force cpu cull");
+        ui.checkbox(&mut settings.force_fallback, "force fallback (JBM_NO_MDI)");
     });
 }
 
@@ -121,4 +214,38 @@ fn drag_u32(
         changed = ui.add(egui::DragValue::new(value).range(range)).changed();
     });
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The per-level rows carry the cull's frame counters, not the
+    /// residency-only ones.
+    #[test]
+    fn per_level_rows_show_frame_counters() {
+        let levels = vec![
+            LevelStats {
+                level: 0,
+                resident: 120,
+                drawn: 120,
+                frame_drawn: 61,
+                faces: 90_000,
+                frame_faces: 30_000,
+                ..LevelStats::default()
+            },
+            LevelStats {
+                level: 1,
+                resident: 40,
+                drawn: 12,
+                frame_drawn: 3,
+                faces: 2_000,
+                frame_faces: 400,
+                ..LevelStats::default()
+            },
+        ];
+        let rows = per_level_rows(&levels);
+        assert_eq!(rows[0], ["L0", "120", "61", "30000"]);
+        assert_eq!(rows[1], ["L1", "40", "3", "400"]);
+    }
 }

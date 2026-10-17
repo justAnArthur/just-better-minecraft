@@ -12,9 +12,8 @@ use crate::render::renderer::DepthTarget;
 use crate::render::settings::RenderSettings;
 
 use super::TerrainPass;
-use super::layout::CullParams;
+use super::layout::{CullParams, cull_debug_words};
 use super::pipelines::{CMD_BYTES, FACE_BYTES};
-use super::space::{Frustum, camera_split};
 use super::stats::{CullStats, STATS_BYTES, TerrainStats};
 
 impl TerrainPass {
@@ -57,7 +56,6 @@ impl TerrainPass {
         }
 
         // The shared origin uniform (also read by the vertex shader).
-        let (camera_cube, camera_frac) = camera_split(camera.position);
         let terrain_uniforms = self.terrain_uniforms_for(camera, settings);
         gpu.queue.write_buffer(
             &self.terrain_uniforms,
@@ -83,11 +81,18 @@ impl TerrainPass {
             self.rebuild_cull_bind_group();
         }
 
-        // Grow the command buffer when the bound outgrew it.
-        let frustum = Frustum::from_view_proj(&camera.view_proj());
-        let page_bounds = self
-            .book
-            .frustum_page_bounds(camera_cube, camera_frac, &frustum);
+        // Grow the command buffer when the bound outgrew it. The bound
+        // follows the culling basis of the frame (task 2.12): the frozen
+        // view's split and frustum while freeze-cull is on, and — while
+        // exploded — the static per-page non-empty-direction totals, since
+        // the shader then emits every direction of every active cube.
+        let basis = self.cull_basis(camera);
+        let page_bounds = if settings.explode > 0 {
+            self.book.page_dir_counts.clone()
+        } else {
+            self.book
+                .frustum_page_bounds(basis.camera_cube, basis.camera_frac, &basis.frustum)
+        };
         let mut region_base = Vec::with_capacity(page_bounds.len());
         let mut bound_total = 0u32;
         for &bound in &page_bounds {
@@ -124,6 +129,7 @@ impl TerrainPass {
                     self.commands_capacity,
                     CUBE_SIZE as u32,
                 ],
+                debug: cull_debug_words(settings),
             }),
         );
         gpu.queue.write_buffer(

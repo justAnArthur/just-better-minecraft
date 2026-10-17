@@ -11,7 +11,7 @@ use crate::render::settings::RenderSettings;
 use crate::render::texture_array::BlockTextures;
 
 use super::TerrainPass;
-use super::layout::{CubeMeta, CullParams, TerrainUniforms};
+use super::layout::{CubeMeta, CullParams, FreezeParams, TerrainUniforms};
 use super::pages::MeshBookkeeping;
 use super::stats::{CullStats, STATS_BYTES, StatsRing};
 use super::worst_case_faces;
@@ -320,6 +320,18 @@ impl TerrainPass {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    // The freeze-cull view (task 2.12): the frozen
+                    // view-projection and camera split.
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let cull_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -383,6 +395,12 @@ impl TerrainPass {
             mapped_at_creation: false,
         });
         let stats_ring = StatsRing::new(device);
+        let freeze_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("jbm cull freeze view"),
+            size: std::mem::size_of::<FreezeParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         // A 1x1 placeholder pyramid view so the cull bind group always has
         // a texture bound; the real pyramid replaces it on the first
@@ -434,6 +452,7 @@ impl TerrainPass {
             &region_counter_buffer,
             &stats_buffer,
             &placeholder_view,
+            &freeze_buffer,
         );
 
         TerrainPass {
@@ -466,6 +485,8 @@ impl TerrainPass {
             region_counter_buffer,
             stats_buffer,
             stats_ring,
+            freeze_buffer,
+            frozen: None,
             hiz: None,
             pyramid_placeholder: placeholder_view,
             last_cull: CullStats::default(),
@@ -481,7 +502,7 @@ impl TerrainPass {
     /// The cull bind group: everything but the frame uniforms (group 0).
     /// Rebuilt whenever any of its resources is recreated (meta growth,
     /// command growth, region growth, pyramid recreation).
-    // The seven parameters are the bind group's own entries; a bundling
+    // The ten parameters are the bind group's own entries; a bundling
     // struct would only be unwrapped again here.
     #[allow(clippy::too_many_arguments)]
     fn make_cull_bind_group(
@@ -494,6 +515,7 @@ impl TerrainPass {
         region_counter_buffer: &wgpu::Buffer,
         stats_buffer: &wgpu::Buffer,
         pyramid: &wgpu::TextureView,
+        freeze_buffer: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("jbm cull"),
@@ -527,6 +549,10 @@ impl TerrainPass {
                     binding: 6,
                     resource: wgpu::BindingResource::TextureView(pyramid),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: freeze_buffer.as_entire_binding(),
+                },
             ],
         })
     }
@@ -546,6 +572,7 @@ impl TerrainPass {
             &self.region_counter_buffer,
             &self.stats_buffer,
             pyramid,
+            &self.freeze_buffer,
         );
     }
 

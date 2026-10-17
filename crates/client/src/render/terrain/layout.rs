@@ -102,6 +102,11 @@ pub struct TerrainUniforms {
     /// `JBM_LOD_TINT=1`); the fragment shader multiplies each fragment by
     /// [`LOD_TINT_COLORS`] at its cube's level. y, z, w spare.
     pub tint: [f32; 4],
+    /// The task 2.12 debug views. x = wireframe on (1.0) / off; y =
+    /// wireframe-only; z = the explode gap in blocks (0 = off); the
+    /// vertex shader shifts every cube by `z × its cube-grid offset` and
+    /// the fragment shader draws the quad edges. w spare.
+    pub debug: [f32; 4],
 }
 
 /// The level tint colors, linear RGB, indexed by LOD level; level 0 is
@@ -170,6 +175,49 @@ pub struct CullParams {
     /// x = the late half's base, in command elements; y = page count;
     /// z = command capacity, in elements; w = CUBE_SIZE.
     pub regions: [u32; 4],
+    /// The task 2.12 debug views, as seen by the cull shader. x = the
+    /// shown-level mask (bit L = level L draws; a hidden level emits
+    /// nothing); y = flags — bit 0 explode (skip the frustum, occlusion
+    /// and direction tests: every active cube emits every non-empty
+    /// direction, matching the CPU's `page_dir_counts` bound), bit 1
+    /// freeze (cull against the frozen view in the `freeze` uniform —
+    /// binding 7 — instead of the live camera). z, w spare.
+    pub debug: [u32; 4],
+}
+
+/// The freeze-cull view captured when the debug view switches on (group 1,
+/// binding 7 of cull.wgsl): the view-projection and camera split the cull
+/// keeps using while the real camera moves. 96 bytes, no tail padding.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct FreezeParams {
+    /// The frozen rotation-only view-projection (camera-relative).
+    pub view_proj: [[f32; 4]; 4],
+    /// The frozen `camera_cube` (xyz; w spare).
+    pub camera_cube: [i32; 4],
+    /// The frozen `camera_frac` (xyz; w = CUBE_SIZE, as in
+    /// [`TerrainUniforms`]).
+    pub camera_frac: [f32; 4],
+}
+
+/// The debug words of [`TerrainUniforms`] from the settings.
+pub(super) fn debug_uniform_words(settings: &crate::render::settings::RenderSettings) -> [f32; 4] {
+    [
+        if settings.wireframe { 1.0 } else { 0.0 },
+        if settings.wireframe_only { 1.0 } else { 0.0 },
+        settings.explode as f32,
+        0.0,
+    ]
+}
+
+/// The debug words of [`CullParams`] from the settings.
+pub(super) fn cull_debug_words(settings: &crate::render::settings::RenderSettings) -> [u32; 4] {
+    [
+        u32::from(settings.level_mask),
+        u32::from(settings.explode > 0) | u32::from(settings.freeze_cull) << 1,
+        0,
+        0,
+    ]
 }
 
 /// The meta image of one mesh (`key` is kept in the map key). The flags
@@ -224,13 +272,14 @@ mod tests {
 
     #[test]
     fn terrain_uniforms_layout_matches_wgsl() {
-        // The WGSL mirror (terrain.wgsl) is vec4i + vec4f + vec4f + vec4f =
-        // 64 bytes, every field 16-byte aligned.
-        assert_eq!(std::mem::size_of::<TerrainUniforms>(), 64);
+        // The WGSL mirror (terrain.wgsl) is vec4i + 4 × vec4f = 80 bytes,
+        // every field 16-byte aligned.
+        assert_eq!(std::mem::size_of::<TerrainUniforms>(), 80);
         assert_eq!(std::mem::offset_of!(TerrainUniforms, camera_cube), 0);
         assert_eq!(std::mem::offset_of!(TerrainUniforms, camera_frac), 16);
         assert_eq!(std::mem::offset_of!(TerrainUniforms, far), 32);
         assert_eq!(std::mem::offset_of!(TerrainUniforms, tint), 48);
+        assert_eq!(std::mem::offset_of!(TerrainUniforms, debug), 64);
         assert!(
             std::mem::size_of::<TerrainUniforms>().is_multiple_of(16),
             "no tail padding"
@@ -239,11 +288,41 @@ mod tests {
 
     #[test]
     fn cull_params_layout_matches_wgsl() {
-        assert_eq!(std::mem::size_of::<CullParams>(), 64);
+        assert_eq!(std::mem::size_of::<CullParams>(), 80);
         assert_eq!(std::mem::offset_of!(CullParams, camera_cube), 0);
         assert_eq!(std::mem::offset_of!(CullParams, camera_frac), 16);
         assert_eq!(std::mem::offset_of!(CullParams, screen), 32);
         assert_eq!(std::mem::offset_of!(CullParams, regions), 48);
+        assert_eq!(std::mem::offset_of!(CullParams, debug), 64);
+    }
+
+    #[test]
+    fn freeze_params_layout_matches_wgsl() {
+        // The WGSL mirror (cull.wgsl binding 7) is mat4x4f + vec4i +
+        // vec4f + vec4u = 96 bytes.
+        assert_eq!(std::mem::size_of::<FreezeParams>(), 96);
+        assert_eq!(std::mem::offset_of!(FreezeParams, view_proj), 0);
+        assert_eq!(std::mem::offset_of!(FreezeParams, camera_cube), 64);
+        assert_eq!(std::mem::offset_of!(FreezeParams, camera_frac), 80);
+    }
+
+    /// The debug-view words follow the settings exactly: the terrain
+    /// uniform carries the wireframe flags and explode gap, the cull
+    /// params the level mask and the explode/freeze flag bits.
+    #[test]
+    fn debug_words_follow_the_settings() {
+        use crate::render::settings::RenderSettings;
+        let mut settings = RenderSettings::default();
+        assert_eq!(debug_uniform_words(&settings), [0.0; 4]);
+        assert_eq!(cull_debug_words(&settings), [0x7F, 0, 0, 0]);
+        settings.wireframe = true;
+        settings.explode = 5;
+        settings.level_mask = 0b101;
+        settings.freeze_cull = true;
+        assert_eq!(debug_uniform_words(&settings), [1.0, 0.0, 5.0, 0.0]);
+        assert_eq!(cull_debug_words(&settings), [0b101, 0b11, 0, 0]);
+        settings.wireframe_only = true;
+        assert_eq!(debug_uniform_words(&settings), [1.0, 1.0, 5.0, 0.0]);
     }
 
     /// The level tint colors: LOD0 white, every level's zero-channel

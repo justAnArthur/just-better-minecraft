@@ -61,13 +61,27 @@ struct DrawCmd {
     first_instance: u32, // the meta slot, on every path
 };
 
-// Mirrored by `CullParams` in render/chunks.rs (64 bytes).
+// Mirrored by `CullParams` in render/chunks.rs (80 bytes).
 struct CullParams {
     camera_cube: vec4i, // xyz = floor(camera / CUBE_SIZE)
     camera_frac: vec4f, // xyz = camera - camera_cube * CUBE_SIZE
     screen: vec4u,      // x,y = depth size; z = max mip level; w = meta len
     regions: vec4u,     // x = late base (elements); y = page count; z = command capacity (elements); w = CUBE_SIZE
+    // Task 2.12 debug views. x = shown-level mask (bit L = level L
+    // draws); y = flags: bit 0 explode, bit 1 freeze; z, w spare.
+    debug: vec4u,
 }
+
+// The freeze-cull view (task 2.12), mirrored by `FreezeParams` in
+// render/chunks.rs (96 bytes, binding 7): the view-projection and camera
+// split captured when the view switched on. While the freeze flag is set
+// the cull tests against this instead of the live camera, so what draws
+// stops following the real view.
+struct FreezeParams {
+    view_proj: mat4x4f,
+    camera_cube: vec4i,
+    camera_frac: vec4f,
+};
 
 // Stats buffer indices; the overlay reads these one or two frames late.
 const STAT_CANDIDATES: u32 = 0u;
@@ -79,6 +93,15 @@ const STAT_COMMANDS: u32 = 5u;
 const STAT_FACES: u32 = 6u;
 // Commands dropped by the capacity clamp: a bound bug (must stay zero).
 const STAT_REGION_OVERFLOW: u32 = 7u;
+// Per-level counters (task 2.12): level L's drawn count at 8 + L and its
+// face count at 15 + L, levels 0..=6 (the last entry collects anything
+// beyond, which the shipped 7-level pyramid never produces).
+fn stat_level_drawn(level: u32) -> u32 {
+    return 8u + min(level, 6u);
+}
+fn stat_level_faces(level: u32) -> u32 {
+    return 15u + min(level, 6u);
+}
 
 // The projection's near plane (camera.rs NEAR); w of a projected point is
 // -z_view, so w <= NEAR means at or behind the near plane.
@@ -92,6 +115,32 @@ const NEAR: f32 = 0.05;
 @group(1) @binding(4) var<storage, read_write> region_counter: array<atomic<u32>>;
 @group(1) @binding(5) var<storage, read_write> stats: array<atomic<u32>>;
 @group(1) @binding(6) var pyramid: texture_2d<f32>;
+@group(1) @binding(7) var<uniform> freeze: FreezeParams;
+
+// The task 2.12 debug-view flags (params.debug.y).
+fn exploding() -> bool {
+    return (params.debug.y & 1u) != 0u;
+}
+fn frozen() -> bool {
+    return (params.debug.y & 2u) != 0u;
+}
+
+// Whether a level draws under the shown-level mask (task 2.12): a hidden
+// level leaves a hole — the cube emits nothing and never becomes
+// "visible", so switching it back on starts it in the late phase.
+fn level_shown(level: u32) -> bool {
+    return (params.debug.x >> min(level, 6u) & 1u) != 0u;
+}
+
+// The view the cull tests against: the frozen one while the freeze view
+// is on (the freeze uniform then also carries the matching camera split),
+// the live camera otherwise.
+fn cull_view_proj() -> mat4x4f {
+    if (frozen()) {
+        return freeze.view_proj;
+    }
+    return u.view_proj;
+}
 
 // The one origin formula, scaled by the cube's level and identical to
 // the vertex shader in terrain.wgsl and `cube_origin` in
@@ -99,12 +148,16 @@ const NEAR: f32 = 0.05;
 // camera_frac. The integer product stays inside i32 for any streamable
 // position (the CPU mirror asserts it), the only rounding is the final
 // f32 subtract, so CPU and GPU cull on the same numbers and no absolute
-// world coordinate ever reaches f32.
+// world coordinate ever reaches f32. While frozen (task 2.12) the split
+// comes from the freeze uniform, so the AABBs land in the frozen view's
+// space where the frozen frustum expects them.
 fn cube_origin(pos: vec3i, level: u32) -> vec3f {
     // pos * 2^level stays inside i32 for any streamable position.
-    let scaled = pos * vec3i(i32(1u << level)) - params.camera_cube.xyz;
+    let cube = select(params.camera_cube.xyz, freeze.camera_cube.xyz, frozen());
+    let frac = select(params.camera_frac.xyz, freeze.camera_frac.xyz, frozen());
+    let scaled = pos * vec3i(i32(1u << level)) - cube;
     let int_part = vec3f(scaled) * f32(params.regions.w);
-    return int_part - params.camera_frac.xyz;
+    return int_part - frac;
 }
 
 // A level-n cube is CUBE_SIZE * 2^n wide: the AABB half of the cull
@@ -122,7 +175,7 @@ fn matrix_row(m: mat4x4f, r: u32) -> vec4f {
 }
 
 fn frustum_visible(rel_min: vec3f, rel_max: vec3f) -> bool {
-    let m = u.view_proj;
+    let m = cull_view_proj();
     let r0 = matrix_row(m, 0u);
     let r1 = matrix_row(m, 1u);
     let r2 = matrix_row(m, 2u);
@@ -191,13 +244,21 @@ fn emit(m: CubeMeta, slot: u32, phase_base: u32, rel_min: vec3f, rel_max: vec3f)
     if ((m.start_flags.y >> 16u) & 0xFFu) == 0xFFu {
         return;
     }
+    let level = level_of(m);
+    // A hidden level emits nothing (task 2.12): the shown-level mask.
+    if (!level_shown(level)) {
+        return;
+    }
     let page = u32(m.pos_page.w);
     let dirs = visible_dirs(rel_min, rel_max);
     let start = m.start_flags.x;
     for (var d = 0u; d < 6u; d++) {
         let off = m.dirs[d / 2u][(d % 2u) * 2u];
         let cnt = m.dirs[d / 2u][(d % 2u) * 2u + 1u];
-        if (cnt == 0u || !dir_visible(dirs, d)) {
+        // While exploded (task 2.12) the direction test is skipped too:
+        // a cube can slide across the camera, and the CPU bound in that
+        // mode is the static per-page non-empty-direction total.
+        if (cnt == 0u || (!exploding() && !dir_visible(dirs, d))) {
             continue;
         }
         let idx = phase_base + region_base[page] + atomicAdd(&region_counter[page], 1u);
@@ -208,6 +269,7 @@ fn emit(m: CubeMeta, slot: u32, phase_base: u32, rel_min: vec3f, rel_max: vec3f)
         }
         atomicAdd(&stats[STAT_COMMANDS], 1u);
         atomicAdd(&stats[STAT_FACES], cnt);
+        atomicAdd(&stats[stat_level_faces(level)], cnt);
     }
 }
 
@@ -300,12 +362,19 @@ fn cull_early(@builtin(global_invocation_id) gid: vec3u) {
         return;
     }
     let level = level_of(m);
+    // A hidden level emits nothing (task 2.12), in either phase.
+    if (!level_shown(level)) {
+        return;
+    }
     let rel_min = cube_origin(m.pos_page.xyz, level);
     let rel_max = rel_min + vec3f(cube_extent(level));
     // Draw what was visible last frame; the early phase never touches the
-    // visible bit (the late phase needs last frame's value).
-    if ((m.start_flags.y & VISIBLE) != 0u && frustum_visible(rel_min, rel_max)) {
+    // visible bit (the late phase needs last frame's value). Exploded
+    // (task 2.12) skips the frustum test entirely.
+    let passes = exploding() || frustum_visible(rel_min, rel_max);
+    if ((m.start_flags.y & VISIBLE) != 0u && passes) {
         atomicAdd(&stats[STAT_DRAWN_EARLY], 1u);
+        atomicAdd(&stats[stat_level_drawn(level)], 1u);
         emit(m, slot, 0u, rel_min, rel_max);
     }
 }
@@ -322,13 +391,21 @@ fn cull_late(@builtin(global_invocation_id) gid: vec3u) {
     }
     atomicAdd(&stats[STAT_CANDIDATES], 1u);
     let level = level_of(m);
+    if (!level_shown(level)) {
+        // Hidden levels never draw, so they are never visible either.
+        cube_meta[slot].start_flags.y = m.start_flags.y & ~VISIBLE;
+        return;
+    }
     let rel_min = cube_origin(m.pos_page.xyz, level);
     let rel_max = rel_min + vec3f(cube_extent(level));
     var visible = true;
-    if (!frustum_visible(rel_min, rel_max)) {
+    // Exploded skips both tests (the moved geometry trusts no bound);
+    // frozen skips the occlusion test (the pyramid holds the real view's
+    // depth, not the frozen one) but keeps the frozen frustum.
+    if (!exploding() && !frustum_visible(rel_min, rel_max)) {
         atomicAdd(&stats[STAT_FRUSTUM_CULLED], 1u);
         visible = false;
-    } else if (occluded(rel_min, rel_max)) {
+    } else if (!exploding() && !frozen() && occluded(rel_min, rel_max)) {
         atomicAdd(&stats[STAT_OCCLUDED], 1u);
         visible = false;
     }
@@ -338,9 +415,12 @@ fn cull_late(@builtin(global_invocation_id) gid: vec3u) {
     }
     cube_meta[slot].start_flags.y = m.start_flags.y | VISIBLE;
     // Emitted early this frame iff it was visible last frame and passed
-    // the same frustum test (deterministic), so only the rest draw late.
+    // the same frustum test (deterministic — under explode every active
+    // cube passes, so the split still partitions them), so only the rest
+    // draw late.
     if ((m.start_flags.y & VISIBLE) == 0u) {
         atomicAdd(&stats[STAT_DRAWN_LATE], 1u);
+        atomicAdd(&stats[stat_level_drawn(level)], 1u);
         emit(m, slot, params.regions.x, rel_min, rel_max);
     }
 }

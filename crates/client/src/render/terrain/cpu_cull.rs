@@ -1,6 +1,11 @@
 //! The cpu-cull draw path (and the fallback path's culling): the CPU
 //! frustum and direction tests over the meta slots, with the shared
-//! origin formula, so the CPU and GPU cull on the same numbers.
+//! origin formula, so the CPU and GPU cull on the same numbers. The
+//! task 2.12 debug views apply here exactly as they do in cull.wgsl:
+//! hidden levels never walk, the freeze view keeps the captured frustum
+//! and camera split, and the explode view skips both tests (and the
+//! direction skip, whose bound the mode replaces with the static
+//! per-page totals).
 
 use glam::Vec3;
 
@@ -16,7 +21,39 @@ use super::pipelines::{CMD_BYTES, FACE_BYTES};
 use super::space::{Frustum, camera_split, cube_origin, cube_size, visible_directions};
 use super::stats::{CullStats, TerrainStats};
 
+/// The culling basis of the frame (task 2.12): the camera split and
+/// frustum the tests run against — the live camera, or the frozen one
+/// while the freeze-cull view is on.
+pub(super) struct CullBasis {
+    pub(super) camera_cube: glam::IVec3,
+    pub(super) camera_frac: Vec3,
+    pub(super) frustum: Frustum,
+}
+
 impl TerrainPass {
+    /// The culling basis of the frame (task 2.12): the live camera split
+    /// and frustum, or the frozen view's while `freeze_cull` is on.
+    pub(super) fn cull_basis(&self, camera: &Camera) -> CullBasis {
+        match &self.frozen {
+            Some(frozen) => CullBasis {
+                camera_cube: camera_split(frozen.position).0,
+                camera_frac: camera_split(frozen.position).1,
+                frustum: Frustum::from_view_proj(&frozen.view_proj),
+            },
+            None => CullBasis {
+                camera_cube: camera_split(camera.position).0,
+                camera_frac: camera_split(camera.position).1,
+                frustum: Frustum::from_view_proj(&camera.view_proj()),
+            },
+        }
+    }
+
+    /// Whether a level draws under the settings' shown-level mask
+    /// (task 2.12). Levels beyond 6 clamp to the last bit.
+    fn level_shown(settings: &RenderSettings, level: u8) -> bool {
+        settings.level_mask & (1 << (level.min(6))) != 0
+    }
+
     /// The cpu-cull frame (also the fallback path's culling): the CPU
     /// frustum and direction tests over the same meta slots, with the
     /// shared origin formula, so the CPU and GPU cull on the same numbers.
@@ -33,7 +70,6 @@ impl TerrainPass {
         uniforms: &wgpu::BindGroup,
         settings: &RenderSettings,
     ) {
-        let (camera_cube, camera_frac) = camera_split(camera.position);
         let terrain_uniforms = self.terrain_uniforms_for(camera, settings);
         gpu.queue.write_buffer(
             &self.terrain_uniforms,
@@ -41,33 +77,53 @@ impl TerrainPass {
             bytemuck::bytes_of(&terrain_uniforms),
         );
 
-        let frustum = Frustum::from_view_proj(&camera.view_proj());
-        // Deterministic order: HashMap iteration is randomized.
+        // The culling basis (task 2.12): frozen while the freeze view is
+        // on — the terrain uniform above still carries the real camera,
+        // so the frozen set renders from wherever the camera really is.
+        let basis = self.cull_basis(camera);
+        let exploding = settings.explode > 0;
+
+        // Deterministic order: HashMap iteration is randomized. The
+        // explode view skips the frustum test (the moved cubes sit
+        // outside every conservative bound); hidden levels never draw.
         let mut visible: Vec<(CubeKey, Vec3, &CubeMesh)> = self
             .book
             .meshes
             .iter()
             // Coverage: undrawn cubes (a finer level replaces them) and
             // fully masked ones emit nothing on any path.
-            .filter(|(_, mesh)| mesh.face_count > 0 && mesh.drawn && mesh.mask != 0xFF)
+            .filter(|(key, mesh)| {
+                mesh.face_count > 0
+                    && mesh.drawn
+                    && mesh.mask != 0xFF
+                    && Self::level_shown(settings, key.level)
+            })
             .filter_map(|(key, mesh)| {
-                let min = cube_origin(*key, camera_cube, camera_frac);
+                let min = cube_origin(*key, basis.camera_cube, basis.camera_frac);
                 let max = min + cube_size(key.level);
-                frustum
-                    .intersects_aabb(min, max)
-                    .then_some((*key, min, mesh))
+                if exploding || basis.frustum.intersects_aabb(min, max) {
+                    Some((*key, min, mesh))
+                } else {
+                    None
+                }
             })
             .collect();
         visible.sort_unstable_by_key(|(key, _, _)| *key);
 
         // The CPU-side mirror of the GPU counters: every drawn non-empty
-        // mesh is a candidate, the frustum test culls the rest (there is
-        // no occlusion culling on this path).
+        // mesh at a shown level is a candidate, the frustum test culls the
+        // rest (there is no occlusion culling on this path; the explode
+        // view culls nothing).
         let candidates = self
             .book
             .meshes
-            .values()
-            .filter(|m| m.face_count > 0 && m.drawn && m.mask != 0xFF)
+            .iter()
+            .filter(|(key, m)| {
+                m.face_count > 0
+                    && m.drawn
+                    && m.mask != 0xFF
+                    && Self::level_shown(settings, key.level)
+            })
             .count() as u32;
 
         let mut stats = self.page_stats(TerrainStats {
@@ -81,18 +137,23 @@ impl TerrainPass {
             used_faces: 0,
         });
 
-        // One command per visible cube and face direction with a non-empty,
-        // non-skipped range, grouped by page.
+        // One command per visible cube and face direction with a non-empty
+        // range — skipped only when back-facing, which the explode view
+        // forgoes (a cube can slide across the camera) — grouped by page.
         let mut per_page: Vec<Vec<wgpu::util::DrawIndirectArgs>> =
             self.pages.iter().map(|_| Vec::new()).collect();
         let mut faces = 0u64;
+        let mut level_drawn = [0u32; 7];
+        let mut level_faces = [0u32; 7];
         for (key, rel_min, mesh) in &visible {
             let Some((page, alloc_range)) = mesh.alloc.as_ref() else {
                 continue;
             };
             let dirs = visible_directions(*rel_min, *rel_min + cube_size(key.level));
+            let level_index = (key.level as usize).min(6);
+            level_drawn[level_index] += 1;
             for (dir, dir_range) in mesh.ranges.iter().enumerate() {
-                if dir_range.is_empty() || !dirs[dir] {
+                if dir_range.is_empty() || (!exploding && !dirs[dir]) {
                     continue;
                 }
                 per_page[*page].push(wgpu::util::DrawIndirectArgs {
@@ -102,6 +163,7 @@ impl TerrainPass {
                     first_instance: mesh.slot.expect("a drawn cube holds a meta slot"),
                 });
                 faces += dir_range.len() as u64;
+                level_faces[level_index] += dir_range.len() as u32;
             }
         }
         let mut commands: Vec<wgpu::util::DrawIndirectArgs> = Vec::new();
@@ -126,6 +188,8 @@ impl TerrainPass {
             commands: commands.len() as u32,
             faces: faces as u32,
             region_overflow: 0,
+            level_drawn,
+            level_faces,
         };
 
         if commands.is_empty() {

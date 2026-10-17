@@ -7,6 +7,7 @@ use jbm_core::coords::BlockPos;
 
 use crate::camera::Camera;
 use crate::gpu::Gpu;
+use crate::render::lines::{LineVertex, LinesPass};
 use crate::render::outline::OutlinePass;
 use crate::render::overlay::{OverlayRenderer, OverlayText};
 use crate::render::settings::RenderSettings;
@@ -210,6 +211,9 @@ pub struct Renderer {
     sky_pipeline: wgpu::RenderPipeline,
     overlay: OverlayRenderer,
     outline: OutlinePass,
+    /// The task 2.12 debug lines (chunk borders, the frozen frustum);
+    /// skipped while no vertices are set.
+    lines: LinesPass,
     viewport: (u32, u32),
     /// Sky color overrides (hole tests): linear RGB per slot.
     sky_override: Option<([f32; 4], [f32; 4], [f32; 4])>,
@@ -306,6 +310,7 @@ impl Renderer {
 
         let overlay = OverlayRenderer::new(gpu, color_format, &uniform_layout);
         let outline = OutlinePass::new(gpu, color_format, &uniform_layout);
+        let lines = LinesPass::new(gpu, color_format, &uniform_layout);
 
         Renderer {
             uniform_buffer,
@@ -314,6 +319,7 @@ impl Renderer {
             sky_pipeline,
             overlay,
             outline,
+            lines,
             viewport: (1, 1),
             sky_override: None,
             settings: RenderSettings::default(),
@@ -374,6 +380,15 @@ impl Renderer {
     /// the `ServerConfig` defaults; the game passes its own values.
     pub fn set_view_distance(&mut self, lod0_ring_radius: f32, furthest_ring_radius: f32) {
         self.settings.far_radii = [lod0_ring_radius, furthest_ring_radius];
+    }
+
+    /// Replaces the frame's debug lines (task 2.12): the chunk-border
+    /// boxes and the frozen cull frustum, camera-relative. The app
+    /// rebuilds the list whenever its debug views need it; an empty list
+    /// stands the pass down (offscreen tests that never call this see no
+    /// change).
+    pub fn set_debug_lines(&mut self, gpu: &Gpu, vertices: &[LineVertex]) {
+        self.lines.set_vertices(gpu, vertices);
     }
 
     /// Overrides the sky colors (horizon, zenith, ground haze; linear
@@ -476,6 +491,17 @@ impl Renderer {
                 frame.camera,
                 &self.uniform_bind_group,
                 &self.settings,
+            );
+        }
+
+        // The task 2.12 debug lines, over the terrain (depth-tested
+        // against it) and under the outline and overlay.
+        if self.lines.vertex_count() > 0 {
+            self.lines.draw(
+                &mut encoder,
+                frame.target,
+                frame.depth.view(),
+                &self.uniform_bind_group,
             );
         }
 

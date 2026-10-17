@@ -51,7 +51,7 @@ struct CubeMeta {
     dirs: array<vec4u, 3>,  // six per-direction (offset, count) pairs
 };
 
-// Mirrored by `TerrainUniforms` in render/chunks.rs (64 bytes). Terrain
+// Mirrored by `TerrainUniforms` in render/chunks.rs (80 bytes). Terrain
 // only: sky, outline and overlay share just FrameUniforms.
 struct TerrainUniforms {
     camera_cube: vec4i, // xyz = floor(camera / CUBE_SIZE)
@@ -64,6 +64,9 @@ struct TerrainUniforms {
     // Task 2.10 level tint. x = tint on (1.0) or off (0.0, the F4 /
     // JBM_LOD_TINT hook); y, z, w spare.
     tint: vec4f,
+    // Task 2.12 debug views. x = wireframe, y = wireframe-only,
+    // z = explode gap in blocks (0 = off), w spare.
+    debug: vec4f,
 };
 
 @group(0) @binding(0) var<uniform> u: FrameUniforms;
@@ -240,6 +243,13 @@ struct VsOut {
     @location(3) rel: vec3f,
     // The cube's LOD level (task 2.9), flat: far_color switches on it.
     @location(4) @interpolate(flat) level: u32,
+    // The quad-local corner position, 0..1 on each axis (task 2.12): the
+    // fragment shader's wireframe test measures the distance to the
+    // greedy quad's edges through it.
+    @location(5) quad: vec2f,
+    // The quad's size in blocks (width, height), flat (task 2.12): scales
+    // the quad-local fractions into block distances.
+    @location(6) @interpolate(flat) quad_size: vec2f,
 };
 
 @vertex
@@ -299,8 +309,18 @@ fn vs_main(
     // to 2^level blocks (task 2.6).
     let level = (m.start_flags.y >> 8u) & 15u;
     let scale = cell_scale(level);
-    let relative = cube_origin(m.pos_page.xyz, level)
+    var relative = cube_origin(m.pos_page.xyz, level)
         + vec3f(block + offset) * scale;
+    // The exploded-cube debug view (task 2.12): shift every cube by the
+    // gap times its own cube-grid offset, spreading the world apart
+    // radially from the world origin. A pure world-space translation, so
+    // it applies the same in camera-relative space. The cull skips its
+    // frustum test while this is on (the moved cubes sit outside every
+    // conservative bound) — see cull.wgsl.
+    if (terrain.debug.z > 0.0) {
+        let cube_offset = vec3f(m.pos_page.xyz * i32(1u << level)) * terrain.camera_frac.w;
+        relative += terrain.debug.z * cube_offset;
+    }
     // Sub-pixel expansion (level >= 1 only): greedy merging leaves
     // T-junctions where a merged quad's edge abuts smaller quads, and the
     // two edges' interpolation can differ by ulps — a hairline crack the
@@ -337,6 +357,8 @@ fn vs_main(
         out.shade = 0.0;
         out.rel = vec3f(0.0);
         out.level = 0u;
+        out.quad = vec2f(0.0);
+        out.quad_size = vec2f(0.0);
         return out;
     }
 
@@ -351,11 +373,37 @@ fn vs_main(
     out.shade = face_shade()[direction] * ao;
     out.rel = relative_expanded;
     out.level = level;
+    out.quad = c;
+    out.quad_size = vec2f(width, height) * scale;
     return out;
+}
+
+// The wireframe debug view's edge test (task 2.12): the minimum block
+// distance from the fragment to its greedy quad's edges, against a
+// thickness that keeps a floor (0.08 blocks, visible on LOD0) and scales
+// with the quad span (2% of the larger side, so coarse LOD quads keep
+// visible lines). The quad-local varying is where it comes from: every
+// quad carries c in 0..1 and its (width, height) in blocks.
+fn near_quad_edge(in: VsOut) -> f32 {
+    let du = min(in.quad.x, 1.0 - in.quad.x) * in.quad_size.x;
+    let dv = min(in.quad.y, 1.0 - in.quad.y) * in.quad_size.y;
+    return min(du, dv);
+}
+
+fn wireframe_edge(in: VsOut) -> bool {
+    let thickness = max(0.08, 0.02 * max(in.quad_size.x, in.quad_size.y));
+    return near_quad_edge(in) < thickness;
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
+    // Wireframe-only (task 2.12): the edges over a flat background — no
+    // textures, shade, tint or fog. Bright lines on near-black, so the
+    // pure geometry reads at any distance.
+    if (terrain.debug.y > 0.5) {
+        let edge = wireframe_edge(in);
+        return vec4f(select(vec3f(0.04), vec3f(0.95), edge), 1.0);
+    }
     // wgpu 30 follows the WGSL spec where the array layer is a separate
     // argument (not packed into coords.z). The sample must stay in uniform
     // control flow (WGSL requires it for textureSample), and the LOD level
@@ -395,6 +443,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
             u.ground_color.rgb,
         );
         color = mix(color, fog_color, f);
+    }
+    // Wireframe (task 2.12): dark lines over the shaded terrain, drawn
+    // last so they read through fog.
+    if (terrain.debug.x > 0.5 && wireframe_edge(in)) {
+        color = vec3f(0.05);
     }
     return vec4f(color, 1.0);
 }

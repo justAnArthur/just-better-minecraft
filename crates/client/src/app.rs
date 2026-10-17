@@ -710,6 +710,10 @@ impl App {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+        // The task 2.12 debug lines (chunk borders, the frozen frustum),
+        // rebuilt each frame from the settings and the resident set.
+        let debug_lines = self.build_debug_lines(&w.terrain, &self.camera, w.renderer.settings());
+        w.renderer.set_debug_lines(&w.gpu, &debug_lines);
         w.renderer.render(
             &w.gpu,
             FrameInputs {
@@ -735,6 +739,157 @@ impl App {
             w.window.request_redraw();
         }
     }
+
+    /// The frame's debug lines (task 2.12), camera-relative like the
+    /// terrain: the chunk-border boxes while that view is on, and the
+    /// frozen cull frustum while freeze-cull is on. Empty (and the line
+    /// pass stands down) when neither view is active.
+    fn build_debug_lines(
+        &self,
+        terrain: &TerrainPass,
+        camera: &Camera,
+        settings: &crate::render::settings::RenderSettings,
+    ) -> Vec<crate::render::lines::LineVertex> {
+        let mut vertices = Vec::new();
+        if settings.chunk_borders {
+            self.push_chunk_borders(&mut vertices, terrain, camera);
+        }
+        if settings.freeze_cull {
+            self.push_frozen_frustum(&mut vertices, terrain, camera);
+        }
+        vertices
+    }
+
+    /// Chunk-border boxes: resident drawn cubes within a small radius per
+    /// level, each level's boxes at that level's cube size and tinted
+    /// with the level's palette color, so LOD0 shows white 16-block boxes
+    /// and coarse levels their own larger boxes in their own color.
+    fn push_chunk_borders(
+        &self,
+        vertices: &mut Vec<crate::render::lines::LineVertex>,
+        terrain: &TerrainPass,
+        camera: &Camera,
+    ) {
+        /// How many cubes of each level around the camera draw borders.
+        const BORDER_RADIUS: i64 = 3;
+        let (camera_cube, camera_frac) = crate::render::terrain::camera_split(camera.position);
+        for key in terrain.resident_keys() {
+            // The cube's own level units: its position is already in them.
+            let stride = (jbm_core::coords::CUBE_SIZE as i64) << key.level;
+            let center = [
+                (camera.position.x / stride as f64).floor() as i64,
+                (camera.position.y / stride as f64).floor() as i64,
+                (camera.position.z / stride as f64).floor() as i64,
+            ];
+            let distance = [
+                i64::from(key.pos.x) - center[0],
+                i64::from(key.pos.y) - center[1],
+                i64::from(key.pos.z) - center[2],
+            ]
+            .iter()
+            .map(|&d| d.abs())
+            .max()
+            .unwrap_or(i64::MAX);
+            if distance > BORDER_RADIUS {
+                continue;
+            }
+            let min = crate::render::terrain::cube_origin(key, camera_cube, camera_frac);
+            let size = crate::render::terrain::space::cube_size(key.level);
+            let max = min + size;
+            let [r, g, b] = crate::render::terrain::lod_tint_color(key.level);
+            let color = [r, g, b, 0.8];
+            push_box_edges(vertices, min, max, color);
+        }
+    }
+
+    /// The frozen cull frustum as its corner box: near plane to a far
+    /// cutoff (the projection's far plane is at infinity, so the lines
+    /// stop at a fixed distance), re-based from the frozen camera's space
+    /// into the real camera's, where the renderer draws.
+    fn push_frozen_frustum(
+        &self,
+        vertices: &mut Vec<crate::render::lines::LineVertex>,
+        terrain: &TerrainPass,
+        camera: &Camera,
+    ) {
+        /// The far cutoff of the drawn frustum, in blocks (the real far
+        /// plane is at infinity).
+        const FAR_CUTOFF_DEPTH: f32 = 1.0 / 2048.0;
+        let Some((frozen_pos, view_proj)) = terrain.frozen_view() else {
+            return;
+        };
+        let inverse = view_proj.inverse();
+        // NDC depth 1 = the near plane; reverse-Z depth d sits at
+        // NEAR / d blocks (the camera constant rides in the projection).
+        let rebased = |ndc: glam::Vec4| -> glam::Vec3 {
+            let unprojected = inverse * ndc;
+            let rel_frozen = unprojected.truncate() / unprojected.w;
+            let shift = (frozen_pos - camera.position).as_vec3();
+            rel_frozen + shift
+        };
+        let near: [glam::Vec3; 4] = [
+            rebased(glam::Vec4::new(-1.0, -1.0, 1.0, 1.0)),
+            rebased(glam::Vec4::new(1.0, -1.0, 1.0, 1.0)),
+            rebased(glam::Vec4::new(1.0, 1.0, 1.0, 1.0)),
+            rebased(glam::Vec4::new(-1.0, 1.0, 1.0, 1.0)),
+        ];
+        let far: [glam::Vec3; 4] = [
+            rebased(glam::Vec4::new(-1.0, -1.0, FAR_CUTOFF_DEPTH, 1.0)),
+            rebased(glam::Vec4::new(1.0, -1.0, FAR_CUTOFF_DEPTH, 1.0)),
+            rebased(glam::Vec4::new(1.0, 1.0, FAR_CUTOFF_DEPTH, 1.0)),
+            rebased(glam::Vec4::new(-1.0, 1.0, FAR_CUTOFF_DEPTH, 1.0)),
+        ];
+        let color = [1.0, 0.25, 0.2, 0.9];
+        for ring in [near, far] {
+            for i in 0..4 {
+                push_segment(vertices, ring[i], ring[(i + 1) % 4], color);
+            }
+        }
+        for i in 0..4 {
+            push_segment(vertices, near[i], far[i], color);
+        }
+    }
+}
+
+/// One box's twelve edges, axis-aligned `[min, max]`.
+fn push_box_edges(
+    vertices: &mut Vec<crate::render::lines::LineVertex>,
+    min: glam::Vec3,
+    max: glam::Vec3,
+    color: [f32; 4],
+) {
+    let (a, b) = (min, max);
+    let corners = [
+        glam::Vec3::new(a.x, a.y, a.z),
+        glam::Vec3::new(b.x, a.y, a.z),
+        glam::Vec3::new(b.x, b.y, a.z),
+        glam::Vec3::new(a.x, b.y, a.z),
+        glam::Vec3::new(a.x, a.y, b.z),
+        glam::Vec3::new(b.x, a.y, b.z),
+        glam::Vec3::new(b.x, b.y, b.z),
+        glam::Vec3::new(a.x, b.y, b.z),
+    ];
+    // Bottom rect, top rect, then the four pillars.
+    for i in 0..4 {
+        push_segment(vertices, corners[i], corners[(i + 1) % 4], color);
+        push_segment(vertices, corners[i + 4], corners[(i + 1) % 4 + 4], color);
+        push_segment(vertices, corners[i], corners[i + 4], color);
+    }
+}
+
+/// One line segment, two vertices.
+fn push_segment(
+    vertices: &mut Vec<crate::render::lines::LineVertex>,
+    from: glam::Vec3,
+    to: glam::Vec3,
+    color: [f32; 4],
+) {
+    let vertex = |p: glam::Vec3| crate::render::lines::LineVertex {
+        pos: [p.x, p.y, p.z, 0.0],
+        color,
+    };
+    vertices.push(vertex(from));
+    vertices.push(vertex(to));
 }
 
 /// Prints the autopilot's frame-time summary: count, mean, p50, p95, p99,
