@@ -331,6 +331,12 @@ impl Renderer {
         &self.settings
     }
 
+    /// Mutable access for the debug panel (task 2.12): it edits the
+    /// settings; the renderer applies them next frame.
+    pub fn settings_mut(&mut self) -> &mut RenderSettings {
+        &mut self.settings
+    }
+
     /// Enables or disables terrain distance fog. Off via `JBM_NO_FOG=1`
     /// (through `RenderSettings::from_env`); screenshot tests use this to
     /// isolate geometry from fog. Fog never touches the sky pass, so the

@@ -33,14 +33,22 @@ impl OverlayText {
 
 /// Averages frame time over a sliding window (0.5 s by default). Pure
 /// logic; unit-tested with synthetic frame times. The window holds frames
-/// that ended within the last `window` seconds.
+/// that ended within the last `window` seconds. A second, count-based
+/// window of the last [`SPREAD_WINDOW`] frames feeds the debug panel's
+/// average / p99 / worst line.
 #[derive(Debug)]
 pub struct FrameStats {
     window: f64,
     /// (frame end time, duration) in seconds; end times are cumulative.
     samples: VecDeque<(f64, f64)>,
+    /// The last `SPREAD_WINDOW` durations, in seconds.
+    spread: VecDeque<f64>,
     now: f64,
 }
+
+/// How many recent frames the debug panel's frame-time spread covers
+/// (task 2.12): two seconds at 60 fps.
+const SPREAD_WINDOW: usize = 120;
 
 impl Default for FrameStats {
     fn default() -> Self {
@@ -53,6 +61,7 @@ impl FrameStats {
         FrameStats {
             window: window_secs,
             samples: VecDeque::new(),
+            spread: VecDeque::new(),
             now: 0.0,
         }
     }
@@ -63,6 +72,10 @@ impl FrameStats {
         let duration = frame_time.as_secs_f64();
         self.now += duration;
         self.samples.push_back((self.now, duration));
+        self.spread.push_back(duration);
+        if self.spread.len() > SPREAD_WINDOW {
+            self.spread.pop_front();
+        }
         let cutoff = self.now - self.window;
         while let Some(&(end, _)) = self.samples.front() {
             if end < cutoff {
@@ -71,6 +84,25 @@ impl FrameStats {
                 break;
             }
         }
+    }
+
+    /// The frame-time spread the debug panel prints: `(average, p99,
+    /// worst)` in milliseconds over the last 120 frames (zeros with no
+    /// samples yet). The p99 index is `(len - 1) · 0.99` rounded, so it
+    /// lands on the worst sample only from 100 frames on.
+    pub fn frame_ms_spread(&self) -> (f64, f64, f64) {
+        if self.spread.is_empty() {
+            return (0.0, 0.0, 0.0);
+        }
+        let mut sorted: Vec<f64> = self.spread.iter().copied().collect();
+        sorted.sort_by(f64::total_cmp);
+        let average = sorted.iter().sum::<f64>() / sorted.len() as f64;
+        let p99_index = ((sorted.len() as f64 - 1.0) * 0.99).round() as usize;
+        (
+            average * 1000.0,
+            sorted[p99_index.min(sorted.len() - 1)] * 1000.0,
+            sorted[sorted.len() - 1] * 1000.0,
+        )
     }
 
     fn total(&self) -> f64 {
@@ -540,6 +572,45 @@ mod tests {
         let stats = FrameStats::default();
         assert_eq!(stats.fps(), 0.0);
         assert_eq!(stats.frame_ms(), 0.0);
+        assert_eq!(stats.frame_ms_spread(), (0.0, 0.0, 0.0));
+    }
+
+    /// The debug panel's spread (task 2.12): average, p99 and worst over
+    /// the last 120 frames in milliseconds, and only the last 120 — an
+    /// ancient 5 s frame must age out of all three.
+    #[test]
+    fn spread_reports_avg_p99_worst_of_the_last_120_frames() {
+        let mut stats = FrameStats::default();
+        for _ in 0..120 {
+            stats.push(Duration::from_secs_f64(1.0 / 60.0));
+        }
+        // One huge frame, then fill past the window so it ages out.
+        stats.push(Duration::from_secs_f64(5.0));
+        for _ in 0..120 {
+            stats.push(Duration::from_secs_f64(1.0 / 60.0));
+        }
+        let (avg, p99, worst) = stats.frame_ms_spread();
+        let sixth = 1000.0 / 60.0;
+        assert!((avg - sixth).abs() < 0.01, "avg {avg}");
+        assert!((p99 - sixth).abs() < 0.01, "p99 {p99}");
+        assert!((worst - sixth).abs() < 0.01, "worst {worst}");
+        // Without the fill, four huge frames sit in the top 2%: p99 and
+        // worst both reach them, and the average moves toward them.
+        let mut stats = FrameStats::default();
+        for _ in 0..200 {
+            stats.push(Duration::from_secs_f64(0.010));
+        }
+        for _ in 0..4 {
+            stats.push(Duration::from_secs_f64(0.050));
+        }
+        let (avg, p99, worst) = stats.frame_ms_spread();
+        // The window holds the last 120 frames only: 116 fast + 4 slow.
+        assert!(
+            (avg - (116.0 * 10.0 + 4.0 * 50.0) / 120.0).abs() < 0.01,
+            "avg {avg}"
+        );
+        assert!((worst - 50.0).abs() < 1e-9, "worst {worst}");
+        assert!((p99 - 50.0).abs() < 1e-9, "p99 {p99}");
     }
 
     #[test]

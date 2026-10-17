@@ -18,6 +18,7 @@ fn view_setup(config: &ServerConfig) -> ViewSetup {
     ViewSetup {
         lod0_ring_radius,
         furthest_ring_radius,
+        debug: None,
     }
 }
 

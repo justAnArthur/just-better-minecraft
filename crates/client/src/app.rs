@@ -19,6 +19,10 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
 use crate::camera::Camera;
+use crate::debug_ui::DebugHooks;
+use crate::debug_ui::EguiPass;
+use crate::debug_ui::game_keys_enabled;
+use crate::debug_ui::panel::WorldSetup;
 use crate::edit::{Hotbar, Repeat, place_target};
 use crate::gpu::Gpu;
 use crate::hud::{HudPlayer, HudSnapshot, lines as hud_lines};
@@ -63,8 +67,9 @@ pub fn run(link: ClientLink) -> Result<(), Box<dyn Error>> {
 /// values the client cannot learn from the link itself. The LOD0 ring
 /// radius sets where LOD0's textures fade into the flat average colors;
 /// the furthest ring radius sets the distance-fog window (see
-/// `Renderer::set_view_distance`).
-#[derive(Debug, Clone, Copy)]
+/// `Renderer::set_view_distance`). `debug` (task 2.12) is the optional
+/// server bridge the debug panel's World section uses; the client stays
+/// free of server types — the game fills the closures.
 pub struct ViewSetup {
     /// The LOD0 streaming disk radius, in blocks (`view_radius ·
     /// CUBE_SIZE`).
@@ -72,14 +77,25 @@ pub struct ViewSetup {
     /// The furthest (outermost LOD level's) ring radius, in blocks
     /// (`lod_view_radius · CUBE_SIZE · 2^lod_levels`).
     pub furthest_ring_radius: f32,
+    /// The debug panel's server hooks, when the caller has a server to
+    /// talk to (the game's in-process one).
+    pub debug: Option<DebugHooks>,
+}
+
+impl ViewSetup {
+    /// The documented defaults (`lod0_ring_radius` 8 cubes, 6 LOD levels).
+    pub fn default_radii() -> ViewSetup {
+        ViewSetup {
+            lod0_ring_radius: crate::render::terrain::DEFAULT_LOD0_RING_RADIUS,
+            furthest_ring_radius: crate::render::terrain::DEFAULT_FURTHEST_RING_RADIUS,
+            debug: None,
+        }
+    }
 }
 
 impl Default for ViewSetup {
     fn default() -> ViewSetup {
-        ViewSetup {
-            lod0_ring_radius: crate::render::terrain::DEFAULT_LOD0_RING_RADIUS,
-            furthest_ring_radius: crate::render::terrain::DEFAULT_FURTHEST_RING_RADIUS,
-        }
+        ViewSetup::default_radii()
     }
 }
 
@@ -102,6 +118,9 @@ struct Windowed {
     renderer: Renderer,
     depth: DepthTarget,
     terrain: TerrainPass,
+    /// The egui debug panel's plumbing; created with the window, so
+    /// offscreen tests never touch it.
+    egui: EguiPass,
 }
 
 struct App {
@@ -148,6 +167,20 @@ struct App {
     frame_times: Vec<f64>,
     /// When the last presented frame rendered; spans skipped loops.
     last_present: Option<Instant>,
+    /// Whether the egui debug panel is open (task 2.12, F3). While it is,
+    /// the cursor is released, egui owns the mouse and keyboard (game
+    /// keys apply only while it does not want the keyboard), and the
+    /// bitmap overlay stands down for the panel's Stats section.
+    panel_open: bool,
+    /// The World section's editable view distances (cube units).
+    panel_world: Option<WorldSetup>,
+    /// The debug panel's server bridge, when the caller passed one.
+    debug_hooks: Option<DebugHooks>,
+    /// Server label/value rows for the panel, refreshed a few times per
+    /// second (the hooks' `server_lines` clone is not free).
+    server_lines: Vec<(String, String)>,
+    /// When the panel's server rows were last refreshed.
+    server_lines_at: Option<Instant>,
 }
 
 /// How long the autopilot waits before re-sending a fly toggle that the
@@ -234,10 +267,16 @@ impl App {
             view: ViewSetup::default(),
             frame_times: Vec::new(),
             last_present: None,
+            panel_open: false,
+            panel_world: None,
+            debug_hooks: None,
+            server_lines: Vec::new(),
+            server_lines_at: None,
         }
     }
 
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<(), Box<dyn Error>> {
+        let debug = self.view.debug.take();
         let window = Arc::new(
             event_loop.create_window(
                 WindowAttributes::default()
@@ -300,6 +339,22 @@ impl App {
             &textures,
             &settings,
         );
+        let egui = EguiPass::new(&gpu, &window, format)?;
+        // The panel's World sliders start at the view distances the caller
+        // passed; the ring radius assumes the shipped 6 LOD levels.
+        let ring_levels = 64.0;
+        self.panel_world = Some(WorldSetup {
+            view_radius: ((self.view.lod0_ring_radius
+                / crate::render::terrain::DEFAULT_LOD0_RING_RADIUS
+                * 8.0)
+                .round()
+                .max(2.0)) as u32,
+            lod_view_radius: ((self.view.furthest_ring_radius
+                / (jbm_core::coords::CUBE_SIZE as f32 * ring_levels))
+                .round()
+                .max(2.0)) as u32,
+        });
+        self.debug_hooks = debug;
 
         window.request_redraw();
         self.windowed = Some(Windowed {
@@ -310,6 +365,7 @@ impl App {
             renderer,
             depth,
             terrain,
+            egui,
         });
         Ok(())
     }
@@ -586,8 +642,34 @@ impl App {
             lod_tint: w.renderer.lod_tint(),
         };
         let mut overlay = OverlayText::new();
-        for line in hud_lines(&snapshot) {
-            overlay.push(line);
+        if self.panel_open {
+            // The panel's Stats section prints these lines instead of the
+            // bitmap overlay (task 2.12): the two can never disagree.
+            let refresh = self
+                .server_lines_at
+                .is_none_or(|at| at.elapsed() >= Duration::from_millis(500));
+            if refresh && let Some(hooks) = &self.debug_hooks {
+                self.server_lines = (hooks.server_lines)();
+                self.server_lines_at = Some(Instant::now());
+            }
+            w.egui.begin_frame(&w.window);
+            let world = self
+                .panel_world
+                .as_mut()
+                .expect("panel world set at window init");
+            crate::debug_ui::panel::show(
+                &w.egui.context,
+                &snapshot,
+                &self.stats,
+                w.renderer.settings_mut(),
+                world,
+                self.debug_hooks.as_ref(),
+                &self.server_lines,
+            );
+        } else {
+            for line in hud_lines(&snapshot) {
+                overlay.push(line);
+            }
         }
 
         // The autopilot finishes once its distance is flown: print the
@@ -636,9 +718,15 @@ impl App {
                 camera: &self.camera,
                 terrain: Some(&mut w.terrain),
                 outline: target.map(|hit| hit.block),
-                overlay: Some(&overlay),
+                overlay: (!self.panel_open).then_some(&overlay),
             },
         );
+        // The egui panel is drawn last, over sky, terrain, the crosshair
+        // and the hotbar, into the same surface view (its own encoder and
+        // submit, still before the present).
+        if self.panel_open {
+            w.egui.draw(&w.gpu, &w.window, &view);
+        }
         w.gpu.queue.present(frame);
         // Only presented frames count for the autopilot summary —
         // Occluded-surface skips return before this point.
@@ -746,6 +834,23 @@ impl ApplicationHandler for App {
         if w.window.id() != window_id {
             return;
         }
+        // While the debug panel is open, egui sees the input events first
+        // (task 2.12); the game's own arms below then stand down for the
+        // events egui owns. F3 and Escape are pre-empted before egui so
+        // the panel can always be toggled and closed.
+        if self.panel_open {
+            match &event {
+                WindowEvent::KeyboardInput { .. }
+                | WindowEvent::CursorMoved { .. }
+                | WindowEvent::MouseInput { .. }
+                | WindowEvent::MouseWheel { .. }
+                | WindowEvent::Resized { .. }
+                | WindowEvent::Focused(..) => {
+                    w.egui.on_event(&w.window, &event);
+                }
+                _ => {}
+            }
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -772,7 +877,12 @@ impl ApplicationHandler for App {
                 let pressed = event.state == ElementState::Pressed;
                 match &event.logical_key {
                     Key::Named(NamedKey::Escape) if pressed => {
-                        if self.cursor_grabbed {
+                        if self.panel_open {
+                            // The panel is open and the cursor already
+                            // free: Escape closes the panel, never the
+                            // game.
+                            self.panel_open = false;
+                        } else if self.cursor_grabbed {
                             release_cursor(&w.window);
                             self.cursor_grabbed = false;
                             self.edit_break.set_held(false);
@@ -781,7 +891,28 @@ impl ApplicationHandler for App {
                             event_loop.exit();
                         }
                     }
+                    // F3 toggles the debug panel (task 2.12). Opening it
+                    // releases the cursor and stands the game input down;
+                    // closing it leaves the cursor free for the usual
+                    // click-to-grab.
+                    key if pressed && matches!(key, Key::Named(NamedKey::F3)) => {
+                        self.panel_open = !self.panel_open;
+                        if self.panel_open {
+                            if self.cursor_grabbed {
+                                release_cursor(&w.window);
+                                self.cursor_grabbed = false;
+                            }
+                            self.input.clear_keys();
+                            self.edit_break.set_held(false);
+                            self.edit_place.set_held(false);
+                        }
+                    }
                     key => {
+                        // Game keys apply unless the open panel's egui
+                        // wants the keyboard (a text box has focus).
+                        if !game_keys_enabled(self.panel_open, w.egui.wants_keyboard_input()) {
+                            return;
+                        }
                         // F toggles flying: one edge per press, consumed by
                         // the next sim tick.
                         if pressed && matches!(key, Key::Character(c) if c.to_lowercase() == "f") {
@@ -811,6 +942,11 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                // The open panel owns the mouse: no grabbing, no breaking
+                // or placing (egui already saw the event above).
+                if self.panel_open {
+                    return;
+                }
                 let pressed = state == ElementState::Pressed;
                 match button {
                     // While the cursor is free, the first left click grabs

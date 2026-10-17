@@ -4,6 +4,7 @@
 
 pub mod app;
 pub mod camera;
+pub mod debug_ui;
 pub mod edit;
 pub mod gpu;
 pub mod hud;
