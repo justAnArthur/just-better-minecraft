@@ -179,6 +179,11 @@ pub struct TerrainPass {
     force_cpu_cull: bool,
     /// Forced fallback for tests and benches (`set_force_fallback`).
     force_fallback: bool,
+    /// The path flags the last draw applied from `RenderSettings`, so a
+    /// settings change (the panel) is detected and applied while the
+    /// `set_*` setters' overrides survive until the settings actually
+    /// change (they hold between draws by design).
+    applied_paths: [bool; 3],
     stats: TerrainStats,
 }
 
@@ -742,13 +747,21 @@ impl TerrainPass {
         uniforms: &wgpu::BindGroup,
         settings: &RenderSettings,
     ) {
-        // Live path switching (task 2.12): the settings' path flags win
-        // over the cached ones every frame. The set_force_* setters stay
-        // as the test and bench override for exactly the frames between
-        // two draws.
-        self.prefer_gpu_cull = settings.prefer_gpu_cull;
-        self.force_cpu_cull = settings.force_cpu_cull;
-        self.force_fallback = settings.force_fallback;
+        // Live path switching (task 2.12): a settings change (the panel)
+        // is applied on the next draw. The set_force_* setters hold
+        // between draws by design, so unchanged settings never clobber
+        // them.
+        let paths = [
+            settings.prefer_gpu_cull,
+            settings.force_cpu_cull,
+            settings.force_fallback,
+        ];
+        if paths != self.applied_paths {
+            self.applied_paths = paths;
+            self.prefer_gpu_cull = settings.prefer_gpu_cull;
+            self.force_cpu_cull = settings.force_cpu_cull;
+            self.force_fallback = settings.force_fallback;
+        }
         self.update_frozen(gpu, camera, settings);
         match self.active_path() {
             TerrainPath::GpuCull => {

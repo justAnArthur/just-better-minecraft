@@ -495,6 +495,11 @@ impl TerrainPass {
             prefer_gpu_cull: settings.prefer_gpu_cull,
             force_cpu_cull: settings.force_cpu_cull,
             force_fallback: settings.force_fallback,
+            applied_paths: [
+                settings.prefer_gpu_cull,
+                settings.force_cpu_cull,
+                settings.force_fallback,
+            ],
             stats: Default::default(),
         }
     }
