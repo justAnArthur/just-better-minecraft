@@ -158,7 +158,7 @@ impl EguiPass {
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -191,5 +191,12 @@ mod tests {
         assert!(game_keys_enabled(false, true), "closed beats egui");
         assert!(game_keys_enabled(true, false), "open but egui idle");
         assert!(!game_keys_enabled(true, true), "egui owns the keyboard");
+    }
+
+    /// egui 0.37 ships no fonts unless `default_fonts` is on; without
+    /// them every glyph in the panel renders as a replacement box.
+    #[test]
+    fn egui_has_its_default_fonts() {
+        assert!(!egui::FontDefinitions::default().font_data.is_empty());
     }
 }
