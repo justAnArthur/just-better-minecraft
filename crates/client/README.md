@@ -262,6 +262,17 @@ reference):
   faces are ordinary faces (same AO from same-level neighbors, same
   texture, greedy-merged within the octant rule); `MeshOutput::skirts`
   counts them for the overhead report.
+- **Lids** (+Y only, wave D), the skirts' counterpart for horizontal
+  seams. Emit cell *c*'s top face even though the cell above is filled
+  when *c* is filled and sits at y = `CUBE_SIZE / 2 − 1` (the octant
+  plane) or y = `CUBE_SIZE − 1` (the cube border). The upper octants or
+  the cube above may be drawn by finer cubes that are air at that height;
+  without the lid a slope crossing the seam shows a contour line of holes
+  (the lod_fly test over the 2.8 mountains found it). No column
+  restriction, since a cliff can leave a finer column air at the seam
+  however high the coarse one reaches; buried lids are hidden in terrain
+  and greedy-merge to a few quads per octant. `MeshOutput::lids` counts
+  them.
 
 The mesher also feeds the renderer a per-face skirt bit and counts
 skirt faces; the render expands level ≥ 1 quads by ~1/512 block
