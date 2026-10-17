@@ -139,6 +139,10 @@ pub struct Renderer {
     viewport: (u32, u32),
     /// Sky color overrides (task 2.6 hole tests): linear RGB per slot.
     sky_override: Option<([f32; 4], [f32; 4], [f32; 4])>,
+    /// Whether terrain distance fog applies (task 2.9); `JBM_NO_FOG=1` at
+    /// construction, later `set_fog`. Propagated to the terrain pass every
+    /// frame — the flag rides in the terrain uniform.
+    fog: bool,
 }
 
 impl Renderer {
@@ -175,9 +179,18 @@ impl Renderer {
             }],
         });
 
+        // The sky gradient snippet is concatenated ahead of the sky text so
+        // the terrain pass's fog can evaluate the identical function (WGSL
+        // has no includes; task 2.9). It has no dependencies, so leading
+        // with it is valid.
+        let sky_source = format!(
+            "{}{}",
+            include_str!("shaders/sky_gradient.wgsl"),
+            include_str!("shaders/sky.wgsl")
+        );
         let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("jbm sky"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/sky.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(sky_source.into()),
         });
         let sky_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("jbm sky layout"),
@@ -228,7 +241,22 @@ impl Renderer {
             outline,
             viewport: (1, 1),
             sky_override: None,
+            fog: !std::env::var_os("JBM_NO_FOG").is_some_and(|v| v == "1"),
         }
+    }
+
+    /// Enables or disables terrain distance fog (task 2.9). Off via
+    /// `JBM_NO_FOG=1` at construction; screenshot tests use this to isolate
+    /// geometry from fog. Fog never touches the sky pass, so the sentinel
+    /// hole tests keep working with it on: a hole still shows the sentinel
+    /// sky, while fogged terrain dissolves into the horizon color.
+    pub fn set_fog(&mut self, enabled: bool) {
+        self.fog = enabled;
+    }
+
+    /// Whether distance fog is on (task 2.9).
+    pub fn fog(&self) -> bool {
+        self.fog
     }
 
     /// Overrides the sky colors (horizon, zenith, ground haze; linear
@@ -321,6 +349,9 @@ impl Renderer {
         }
 
         if let Some(terrain) = frame.terrain {
+            // The fog on/off hook rides along each frame (task 2.9): the
+            // terrain pass bakes it into its per-frame uniform.
+            terrain.set_fog(self.fog);
             terrain.draw(
                 gpu,
                 &mut encoder,
