@@ -1,69 +1,18 @@
-//! Client-side LOD state (task 2.6): the cube key every level shares and
-//! the coverage rule that decides which level draws which volume. Pure
-//! logic, no GPU — the renderer asks [`Coverage`] what to draw, the world
-//! stores the cubes themselves keyed by [`CubeKey`].
+//! Client-side LOD state: the cube key every level shares (defined in
+//! `jbm_core::lod`, re-exported here so call sites keep one path) and the
+//! coverage rule that decides which level draws which volume. Pure logic,
+//! no GPU — the renderer asks [`Coverage`] what to draw, the world stores
+//! the cubes themselves keyed by [`CubeKey`].
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use jbm_core::coords::CubePos;
-use jbm_core::lod::{octant_offset, parent};
+pub use jbm_core::lod::CubeKey;
 
 /// The highest level [`Coverage`] tracks. Ancestor chains stop here: a
 /// ready cube at the cap draws under the "no ready ancestor" clause, and a
 /// level above it that arrives later still finds it (its own downward walk
 /// reaches the entry). Far above any `lod_levels` a server configures.
 pub const MAX_COVERED_LEVEL: u8 = 16;
-
-/// A cube at a LOD level. Level 0 is the streamed world itself ("LOD0");
-/// a level-*n* cube at `pos` covers blocks `pos * CUBE_SIZE * 2^n` onwards
-/// and each of its cells is `2^n` blocks per side. One key type names
-/// meshes, mesh jobs, GPU residency and coverage entries at every level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct CubeKey {
-    pub level: u8,
-    pub pos: CubePos,
-}
-
-impl CubeKey {
-    /// The LOD0 cube at `pos`.
-    pub fn lod0(pos: CubePos) -> CubeKey {
-        CubeKey { level: 0, pos }
-    }
-
-    /// The parent cube one level up, and which octant of it this key fills
-    /// (`dx + 2·dz + 4·dy`, as in `jbm_core::lod::parent`).
-    pub fn parent(&self) -> (CubeKey, u8) {
-        debug_assert!(self.level < MAX_COVERED_LEVEL, "no parent above the cap");
-        let (pos, octant) = parent(self.pos);
-        (
-            CubeKey {
-                level: self.level + 1,
-                pos,
-            },
-            octant,
-        )
-    }
-
-    /// The child cube filling `octant` of this one, one level down.
-    pub fn child(&self, octant: u8) -> CubeKey {
-        debug_assert!(self.level > 0, "level 0 has no children");
-        let [dx, dy, dz] = octant_offset(octant);
-        CubeKey {
-            level: self.level - 1,
-            pos: CubePos {
-                x: self.pos.x * 2 + dx as i32,
-                y: self.pos.y * 2 + dy as i32,
-                z: self.pos.z * 2 + dz as i32,
-            },
-        }
-    }
-
-    /// The world-space side length of one cube at this level, in blocks:
-    /// `CUBE_SIZE * 2^level`.
-    pub fn block_size(&self) -> u64 {
-        u64::from(jbm_core::coords::CUBE_SIZE as u32) << self.level
-    }
-}
 
 /// One tracked cube: whether it is ready, whether it draws, and which of
 /// its octants a ready child replaces.
@@ -340,7 +289,8 @@ impl Coverage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jbm_core::coords::CUBE_SIZE;
+    use jbm_core::coords::CubePos;
+    use jbm_core::lod::parent;
 
     /// Small local xorshift, so tests never need the `rand` crate.
     struct XorShift64(u64);
@@ -361,45 +311,6 @@ mod tests {
             level,
             pos: CubePos { x, y, z },
         }
-    }
-
-    #[test]
-    fn parent_child_round_trip_at_negative_coordinates() {
-        for (level, x, y, z) in [
-            (1u8, -3i32, -2i32, -1i32),
-            (2, -1, 0, 1),
-            (3, 7, -8, 9),
-            (0, -5, 5, -6),
-        ] {
-            let k = key(level, x, y, z);
-            let (parent, octant) = k.parent();
-            assert_eq!(parent.child(octant), k);
-            assert_eq!(parent.level, level + 1);
-            assert_eq!(parent.pos.x, x.div_euclid(2));
-        }
-        // Level 0 children of a level-1 cube tile its volume exactly.
-        let parent = key(1, -2, 3, -4);
-        let mut seen = HashSet::new();
-        for octant in 0..8u8 {
-            let child = parent.child(octant);
-            assert_eq!(child.level, 0);
-            assert!(seen.insert(child), "octants overlap");
-            let (back, o) = child.parent();
-            assert_eq!((back, o), (parent, octant));
-        }
-    }
-
-    #[test]
-    fn block_size_scales_with_level() {
-        assert_eq!(key(0, 0, 0, 0).block_size(), u64::from(CUBE_SIZE as u32));
-        assert_eq!(
-            key(1, 0, 0, 0).block_size(),
-            u64::from(CUBE_SIZE as u32) * 2
-        );
-        assert_eq!(
-            key(4, 0, 0, 0).block_size(),
-            u64::from(CUBE_SIZE as u32) * 16
-        );
     }
 
     /// A ready cube with nothing above draws; a ready ancestor takes over

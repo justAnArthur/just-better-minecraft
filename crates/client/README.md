@@ -79,8 +79,9 @@ coordinates and cfg-gated off under the crate's own `cube16` passthrough;
   behind the pages (pure logic, no wgpu).
 - `render::overlay` — debug overlay (`OverlayText`, `OverlayRenderer`,
   `FrameStats`).
-- `lod` — the client's LOD state (task 2.6): the `CubeKey` every level
-  shares and the coverage rule (`Coverage`).
+- `lod` — the client's LOD state (task 2.6): the coverage rule
+  (`Coverage`) and `core::lod::CubeKey` re-exported as
+  `jbm_client::lod::CubeKey`, the one path every call site uses.
 - `render::texture_array::BlockTextures` + `placeholder_layers(n)` —
   block texture array with CPU-generated mipmaps (repeat addressing so
   merged faces tile per block), plus each layer's average color (task
