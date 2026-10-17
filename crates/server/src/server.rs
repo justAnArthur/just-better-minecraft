@@ -106,6 +106,11 @@ struct EditVersions {
 pub struct ServerConfig {
     /// World seed fed to the terrain generator.
     pub seed: u64,
+    /// Which shipped worldgen graph generates the world (task 2.8).
+    /// `Overworld` (the default) is the dramatic terrain with a sea;
+    /// `Classic` is the pre-2.8 terrain, pinned by tests, benches and
+    /// goldens that depend on it.
+    pub worldgen: crate::worldgen::Preset,
     /// Whether cubes are streamed to players at all.
     pub streaming: bool,
     /// Horizontal streaming radius, in cubes (`dx² + dz² ≤ r²`).
@@ -150,6 +155,7 @@ impl Default for ServerConfig {
         let parallelism = std::thread::available_parallelism().map_or(1, |n| n.get());
         Self {
             seed: DEFAULT_SEED,
+            worldgen: crate::worldgen::Preset::Overworld,
             streaming: true,
             view_radius: 8,
             vertical_radius: 4,
@@ -415,7 +421,7 @@ impl Server {
             None => None,
         };
         let seed = storage.as_ref().map_or(config.seed, |s| s.seed());
-        let generator = Arc::new(Generator::new(seed, blocks));
+        let generator = Arc::new(Generator::with_preset(seed, blocks, config.worldgen));
         let pool = GenPool::new(config.gen_threads, Arc::clone(&generator), storage.clone());
         let desired = desired_offsets(config.view_radius, config.vertical_radius);
         let spawn = generator.spawn();
@@ -427,7 +433,7 @@ impl Server {
         if let Some(storage) = &storage
             && config.lod_levels > 0
             && let Err(error) =
-                storage.set_worldgen_fingerprint(crate::worldgen::overworld().fingerprint())
+                storage.set_worldgen_fingerprint(config.worldgen.compiled().fingerprint())
         {
             return Err(error);
         }

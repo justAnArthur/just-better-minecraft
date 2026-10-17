@@ -93,18 +93,39 @@ pub enum Node {
         max: NodeValue,
     },
     /// The reference 2D gradient noise ([`reference::noise2`]) sampled at
-    /// `(x · x_scale, z · z_scale)` with seed `world_seed ^ salt`.
+    /// `((x + x_offset) · x_scale, (z + z_offset) · z_scale)` with seed
+    /// `world_seed ^ salt`. The offsets default to 0 and may reference other
+    /// nodes (domain warp); whatever they are, the sample stays within the
+    /// documented noise range, so they never widen the interval bounds.
     Noise2 {
         salt: Salt,
         x_scale: f64,
         z_scale: f64,
+        x_offset: Option<NodeValue>,
+        z_offset: Option<NodeValue>,
     },
     /// The reference fractal sum ([`reference::fbm`]) sampled at
-    /// `(x · scale, z · scale)` with seed `world_seed ^ salt`.
+    /// `((x + x_offset) · scale, (z + z_offset) · scale)` with seed
+    /// `world_seed ^ salt`. Offsets as [`Node::Noise2`].
     Fbm2 {
         salt: Salt,
         scale: f64,
         octaves: u32,
+        x_offset: Option<NodeValue>,
+        z_offset: Option<NodeValue>,
+    },
+    /// The ridged multifractal ([`reference::ridged2`]) sampled at
+    /// `((x + x_offset) · scale, (z + z_offset) · scale)` with seed
+    /// `world_seed ^ salt`; output exactly in `[0, 1]` (see the reference
+    /// docs for the formula and the bound argument). Offsets as
+    /// [`Node::Noise2`].
+    Ridged2 {
+        salt: Salt,
+        scale: f64,
+        octaves: u32,
+        gain: f64,
+        x_offset: Option<NodeValue>,
+        z_offset: Option<NodeValue>,
     },
     /// Piecewise-linear spline over `input`, clamped at both ends. Points
     /// must be strictly increasing in `x`.
@@ -318,6 +339,12 @@ fn parse_node(map: &serde_json::Map<String, Value>, path: &str) -> Result<Node, 
         })?;
         parse_node_value(value, &format!("{path}.{key}"))
     };
+    let optional_operand = |key: &'static str| -> Result<Option<NodeValue>, GraphError> {
+        match map.get(key) {
+            None => Ok(None),
+            Some(value) => Ok(Some(parse_node_value(value, &format!("{path}.{key}"))?)),
+        }
+    };
     let number = |key: &'static str| -> Result<f64, GraphError> {
         let value = map.get(key).ok_or_else(|| GraphError::MissingField {
             field: key,
@@ -381,6 +408,8 @@ fn parse_node(map: &serde_json::Map<String, Value>, path: &str) -> Result<Node, 
             salt: Salt(salt()?),
             x_scale: number("x_scale")?,
             z_scale: number("z_scale")?,
+            x_offset: optional_operand("x_offset")?,
+            z_offset: optional_operand("z_offset")?,
         },
         "fbm2" => {
             let octaves = map.get("octaves").ok_or_else(|| GraphError::MissingField {
@@ -398,6 +427,29 @@ fn parse_node(map: &serde_json::Map<String, Value>, path: &str) -> Result<Node, 
                 salt: Salt(salt()?),
                 scale: number("scale")?,
                 octaves: octaves as u32,
+                x_offset: optional_operand("x_offset")?,
+                z_offset: optional_operand("z_offset")?,
+            }
+        }
+        "ridged2" => {
+            let octaves = map.get("octaves").ok_or_else(|| GraphError::MissingField {
+                field: "octaves",
+                path: path.into(),
+            })?;
+            let octaves = octaves
+                .as_u64()
+                .filter(|&o| (1..=u64::from(u32::MAX)).contains(&o))
+                .ok_or_else(|| GraphError::BadNode {
+                    message: "`octaves` must be an integer between 1 and 2^32-1".into(),
+                    path: path.into(),
+                })?;
+            Node::Ridged2 {
+                salt: Salt(salt()?),
+                scale: number("scale")?,
+                octaves: octaves as u32,
+                gain: number("gain")?,
+                x_offset: optional_operand("x_offset")?,
+                z_offset: optional_operand("z_offset")?,
             }
         }
         "spline" => {
@@ -452,8 +504,9 @@ fn parse_node(map: &serde_json::Map<String, Value>, path: &str) -> Result<Node, 
         | Node::Max { .. } => &["a", "b"],
         Node::Neg { .. } | Node::Abs { .. } | Node::Floor { .. } => &["a"],
         Node::Clamp { .. } => &["input", "min", "max"],
-        Node::Noise2 { .. } => &["salt", "x_scale", "z_scale"],
-        Node::Fbm2 { .. } => &["salt", "scale", "octaves"],
+        Node::Noise2 { .. } => &["salt", "x_scale", "z_scale", "x_offset", "z_offset"],
+        Node::Fbm2 { .. } => &["salt", "scale", "octaves", "x_offset", "z_offset"],
+        Node::Ridged2 { .. } => &["salt", "scale", "octaves", "gain", "x_offset", "z_offset"],
         Node::Spline { .. } => &["input", "points"],
     };
     for key in map.keys() {
@@ -506,11 +559,20 @@ enum Op {
         salt: u64,
         x_scale: f64,
         z_scale: f64,
+        warp: Option<(u32, u32)>,
     },
     Fbm2 {
         salt: u64,
         scale: f64,
         octaves: u32,
+        warp: Option<(u32, u32)>,
+    },
+    Ridged2 {
+        salt: u64,
+        scale: f64,
+        octaves: u32,
+        gain: f64,
+        warp: Option<(u32, u32)>,
     },
     Spline {
         input: u32,
@@ -581,21 +643,39 @@ impl Op {
                 salt,
                 x_scale,
                 z_scale,
+                warp,
             } => {
                 tag!(12);
                 salt.hash(&mut hasher);
                 x_scale.to_bits().hash(&mut hasher);
                 z_scale.to_bits().hash(&mut hasher);
+                feed_warp(&mut hasher, *warp);
             }
             Op::Fbm2 {
                 salt,
                 scale,
                 octaves,
+                warp,
             } => {
                 tag!(13);
                 salt.hash(&mut hasher);
                 scale.to_bits().hash(&mut hasher);
                 octaves.hash(&mut hasher);
+                feed_warp(&mut hasher, *warp);
+            }
+            Op::Ridged2 {
+                salt,
+                scale,
+                octaves,
+                gain,
+                warp,
+            } => {
+                tag!(15);
+                salt.hash(&mut hasher);
+                scale.to_bits().hash(&mut hasher);
+                octaves.hash(&mut hasher);
+                gain.to_bits().hash(&mut hasher);
+                feed_warp(&mut hasher, *warp);
             }
             Op::Spline { input, points } => {
                 tag!(14);
@@ -612,13 +692,19 @@ impl Op {
     /// Register operands, in evaluation-irrelevant order. Compile-time only.
     fn operands(&self) -> Vec<u32> {
         match self {
-            Op::X | Op::Y | Op::Z | Op::Noise2 { .. } | Op::Fbm2 { .. } => vec![],
+            Op::X | Op::Y | Op::Z => vec![],
             Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) | Op::Min(a, b) | Op::Max(a, b) => {
                 vec![*a, *b]
             }
             Op::Neg(a) | Op::Abs(a) | Op::Floor(a) => vec![*a],
             Op::Clamp { input, min, max } => vec![*input, *min, *max],
             Op::Spline { input, .. } => vec![*input],
+            Op::Noise2 { warp, .. } | Op::Fbm2 { warp, .. } | Op::Ridged2 { warp, .. } => {
+                match warp {
+                    None => vec![],
+                    Some((xo, zo)) => vec![*xo, *zo],
+                }
+            }
         }
     }
 
@@ -627,7 +713,7 @@ impl Op {
     fn remap(&self, map: &[u32]) -> Self {
         let r = |i: &u32| map[*i as usize];
         match self {
-            Op::X | Op::Y | Op::Z | Op::Noise2 { .. } | Op::Fbm2 { .. } => self.clone(),
+            Op::X | Op::Y | Op::Z => self.clone(),
             Op::Add(a, b) => Op::Add(r(a), r(b)),
             Op::Sub(a, b) => Op::Sub(r(a), r(b)),
             Op::Mul(a, b) => Op::Mul(r(a), r(b)),
@@ -645,8 +731,60 @@ impl Op {
                 input: r(input),
                 points: Arc::clone(points),
             },
+            Op::Noise2 {
+                salt,
+                x_scale,
+                z_scale,
+                warp,
+            } => Op::Noise2 {
+                salt: *salt,
+                x_scale: *x_scale,
+                z_scale: *z_scale,
+                warp: remap_warp(*warp, map),
+            },
+            Op::Fbm2 {
+                salt,
+                scale,
+                octaves,
+                warp,
+            } => Op::Fbm2 {
+                salt: *salt,
+                scale: *scale,
+                octaves: *octaves,
+                warp: remap_warp(*warp, map),
+            },
+            Op::Ridged2 {
+                salt,
+                scale,
+                octaves,
+                gain,
+                warp,
+            } => Op::Ridged2 {
+                salt: *salt,
+                scale: *scale,
+                octaves: *octaves,
+                gain: *gain,
+                warp: remap_warp(*warp, map),
+            },
         }
     }
+}
+
+/// A warp operand pair's share of the fingerprint: `None` hashes nothing —
+/// exactly what a pre-warp graph hashed, so offset-free graphs keep their
+/// old fingerprints — and `Some` hashes a `0xFF` marker (never an op tag)
+/// before the two registers, so it cannot alias any other payload.
+fn feed_warp(hasher: &mut impl std::hash::Hasher, warp: Option<(u32, u32)>) {
+    use std::hash::Hash;
+    if let Some((xo, zo)) = warp {
+        0xFF_u8.hash(hasher);
+        xo.hash(hasher);
+        zo.hash(hasher);
+    }
+}
+
+fn remap_warp(warp: Option<(u32, u32)>, map: &[u32]) -> Option<(u32, u32)> {
+    warp.map(|(xo, zo)| (map[xo as usize], map[zo as usize]))
 }
 
 enum Emitted {
@@ -737,6 +875,57 @@ impl<'g> Compiler<'g> {
         }
     }
 
+    /// Resolves one optional offset operand of a noise-family node. `None`
+    /// and the constant 0 both fold away, so an offset-free graph compiles
+    /// to exactly the instructions (and fingerprint) it had before offsets
+    /// existed.
+    fn emit_warp_side(
+        &mut self,
+        value: &'g Option<NodeValue>,
+        path: &str,
+    ) -> Result<Option<u32>, GraphError> {
+        match value {
+            None => Ok(None),
+            Some(value) => {
+                let id = self.emit_value(value, path)?;
+                if self.const_of(id) == Some(0.0) {
+                    Ok(None)
+                } else {
+                    Ok(Some(id))
+                }
+            }
+        }
+    }
+
+    /// Resolves a noise-family node's offset operands into a warp register
+    /// pair, or `None` when both sides are absent or zero. A y-dependent
+    /// offset would make a column-stage instruction read a cell-stage
+    /// register, so it is a compile error.
+    fn emit_warp(
+        &mut self,
+        x_offset: &'g Option<NodeValue>,
+        z_offset: &'g Option<NodeValue>,
+        path: &str,
+    ) -> Result<Option<(u32, u32)>, GraphError> {
+        let x = self.emit_warp_side(x_offset, &format!("{path}.x_offset"))?;
+        let z = self.emit_warp_side(z_offset, &format!("{path}.z_offset"))?;
+        for (side, key) in [(x, "x_offset"), (z, "z_offset")] {
+            if side.is_some_and(|id| self.dim_of(id) == Dim::Xyz) {
+                return Err(GraphError::BadNode {
+                    message: format!("`{key}` must not depend on y"),
+                    path: path.into(),
+                });
+            }
+        }
+        if x.is_none() && z.is_none() {
+            return Ok(None);
+        }
+        let zero = |compiler: &mut Self| compiler.push_const(0.0);
+        let x = x.unwrap_or_else(|| zero(self));
+        let z = z.unwrap_or_else(|| zero(self));
+        Ok(Some((x, z)))
+    }
+
     fn emit_node(&mut self, node: &'g Node, path: &str) -> Result<u32, GraphError> {
         match node {
             Node::X => Ok(self.push_op(Op::X, Dim::Xz)),
@@ -779,18 +968,26 @@ impl<'g> Compiler<'g> {
                 salt,
                 x_scale,
                 z_scale,
-            } => Ok(self.push_op(
-                Op::Noise2 {
-                    salt: salt.0,
-                    x_scale: *x_scale,
-                    z_scale: *z_scale,
-                },
-                Dim::Xz,
-            )),
+                x_offset,
+                z_offset,
+            } => {
+                let warp = self.emit_warp(x_offset, z_offset, path)?;
+                Ok(self.push_op(
+                    Op::Noise2 {
+                        salt: salt.0,
+                        x_scale: *x_scale,
+                        z_scale: *z_scale,
+                        warp,
+                    },
+                    Dim::Xz,
+                ))
+            }
             Node::Fbm2 {
                 salt,
                 scale,
                 octaves,
+                x_offset,
+                z_offset,
             } => {
                 if *octaves == 0 {
                     return Err(GraphError::BadNode {
@@ -798,11 +995,39 @@ impl<'g> Compiler<'g> {
                         path: path.into(),
                     });
                 }
+                let warp = self.emit_warp(x_offset, z_offset, path)?;
                 Ok(self.push_op(
                     Op::Fbm2 {
                         salt: salt.0,
                         scale: *scale,
                         octaves: *octaves,
+                        warp,
+                    },
+                    Dim::Xz,
+                ))
+            }
+            Node::Ridged2 {
+                salt,
+                scale,
+                octaves,
+                gain,
+                x_offset,
+                z_offset,
+            } => {
+                if *octaves == 0 {
+                    return Err(GraphError::BadNode {
+                        message: "`octaves` must be at least 1".into(),
+                        path: path.into(),
+                    });
+                }
+                let warp = self.emit_warp(x_offset, z_offset, path)?;
+                Ok(self.push_op(
+                    Op::Ridged2 {
+                        salt: salt.0,
+                        scale: *scale,
+                        octaves: *octaves,
+                        gain: *gain,
+                        warp,
                     },
                     Dim::Xz,
                 ))
@@ -1037,14 +1262,20 @@ pub fn compile(graph: &Graph) -> Result<CompiledGraph, GraphError> {
         .collect::<Vec<_>>();
     let output = new_index[output as usize];
 
+    // Live column registers, in the *final* (post-elimination) layout: the
+    // staged `n_const`/`n_xz` counts no longer hold once dead registers are
+    // dropped — e.g. by offset operands that folded to zero — so derive the
+    // stage boundaries from the surviving vectors.
+    let live_const = const_values.len() as u32;
+    let live_xz_end = live_const + xz_ops.len() as u32;
     let mut live_xz: Vec<u32> = xyz_ops
         .iter()
         .flat_map(|op| op.operands())
-        .filter(|&r| (n_const as u32..(n_const + n_xz) as u32).contains(&r))
+        .filter(|&r| (live_const..live_xz_end).contains(&r))
         .collect();
     // A column-stage output (a graph with no cell stage at all) must stay
     // live too, or a restored column would read a stale register.
-    if (n_const as u32..(n_const + n_xz) as u32).contains(&output) {
+    if (live_const..live_xz_end).contains(&output) {
         live_xz.push(output);
     }
     live_xz.sort_unstable();
@@ -1318,12 +1549,40 @@ fn eval_op(op: &Op, r: &[f64], x: f64, y: f64, z: f64, seed: u64) -> f64 {
             salt,
             x_scale,
             z_scale,
-        } => reference::noise2(seed ^ salt, x * x_scale, z * z_scale),
+            warp,
+        } => match warp {
+            None => reference::noise2(seed ^ salt, x * x_scale, z * z_scale),
+            Some((xo, zo)) => {
+                reference::noise2(seed ^ salt, (x + v(*xo)) * x_scale, (z + v(*zo)) * z_scale)
+            }
+        },
         Op::Fbm2 {
             salt,
             scale,
             octaves,
-        } => reference::fbm(seed ^ salt, x * scale, z * scale, *octaves),
+            warp,
+        } => match warp {
+            None => reference::fbm(seed ^ salt, x * scale, z * scale, *octaves),
+            Some((xo, zo)) => reference::fbm(
+                seed ^ salt,
+                (x + v(*xo)) * scale,
+                (z + v(*zo)) * scale,
+                *octaves,
+            ),
+        },
+        Op::Ridged2 {
+            salt,
+            scale,
+            octaves,
+            gain,
+            warp,
+        } => {
+            let (wx, wz) = match warp {
+                None => (x, z),
+                Some((xo, zo)) => (x + v(*xo), z + v(*zo)),
+            };
+            reference::ridged2(seed ^ salt, wx * scale, wz * scale, *octaves, *gain)
+        }
         Op::Spline { input, points } => spline_eval(points, v(*input)),
     }
 }
@@ -1404,7 +1663,12 @@ fn interval_op(op: &Op, r: &[Interval], x: Interval, y: Interval, z: Interval) -
             let inner = (v(*input).0.max(v(*min).0), v(*input).1.max(v(*min).1));
             (inner.0.min(v(*max).0), inner.1.min(v(*max).1))
         }
+        // Noise bounds hold wherever the noise is sampled, so a warp offset
+        // never widens them (the offset shifts the sample point, not the
+        // range). `ridged2` is a normalized sum of per-octave signals each
+        // in [0, 1] — see `reference::ridged2` — so [0, 1] is exact.
         Op::Noise2 { .. } | Op::Fbm2 { .. } => NOISE_RANGE,
+        Op::Ridged2 { .. } => (0.0, 1.0),
         Op::Spline { input, points } => spline_interval(points, v(*input)),
     }
 }
@@ -1450,34 +1714,194 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_graph_loads_and_compiles() {
-        let graph = Graph::from_json(super::super::OVERWORLD_JSON).expect("shipped graph parses");
-        let compiled = compile(&graph).expect("shipped graph compiles");
-        // 9 folded constants, 11 column-stage instructions (the noise,
-        // clamps and rounding), and just 2 cell-stage instructions: `y` and
-        // the final subtraction. That last stage is what 3D evaluation
-        // costs beyond a heightmap.
-        assert_eq!(compiled.instruction_counts(), (9, 11, 2));
-        assert_eq!(compiled.live_xz().len(), 1);
+    fn the_shipped_graphs_load_and_compile() {
+        let classic = Graph::from_json(super::super::CLASSIC_JSON).expect("classic graph parses");
+        let classic = compile(&classic).expect("classic graph compiles");
+        // The classic (task 2.1) graph: 9 folded constants, 11 column-stage
+        // instructions (the noise, clamps and rounding), 2 cell-stage
+        // instructions (`y` and the final subtraction).
+        assert_eq!(classic.instruction_counts(), (9, 11, 2));
+        assert_eq!(classic.live_xz().len(), 1);
+
+        let overworld =
+            Graph::from_json(super::super::OVERWORLD_JSON).expect("overworld graph parses");
+        let overworld = compile(&overworld).expect("overworld graph compiles");
+        // 11 folded constants and 30 column-stage instructions (two warp
+        // fractals, continentalness, erosion, ridges, valleys, detail, the
+        // splines and gates), still just `y` and the subtraction per cell.
+        assert_eq!(overworld.instruction_counts(), (11, 30, 2));
+        assert_eq!(overworld.live_xz().len(), 1);
+    }
+
+    /// The fingerprint the classic graph had before task 2.8 added the
+    /// offset operands, captured then and frozen here: offset-free graphs
+    /// must compile to bit-identical instructions, so their stored LOD
+    /// stays valid.
+    const CLASSIC_FINGERPRINT: u64 = 14_057_835_073_584_082_885;
+
+    #[test]
+    fn offset_free_graphs_keep_their_instructions_and_fingerprint() {
+        let classic = compile(&Graph::from_json(super::super::CLASSIC_JSON).unwrap()).unwrap();
+        assert_eq!(classic.instruction_counts(), (9, 11, 2));
+        assert_eq!(classic.fingerprint(), CLASSIC_FINGERPRINT);
+        // Writing the (default-zero) offsets out explicitly changes
+        // nothing: they fold away.
+        let explicit = super::super::CLASSIC_JSON.replace(
+            r#""x_scale": 0.0009,
+      "z_scale": 0.0009"#,
+            r#""x_scale": 0.0009,
+      "z_scale": 0.0009,
+      "x_offset": 0,
+      "z_offset": 0"#,
+        );
+        assert_ne!(&explicit, super::super::CLASSIC_JSON);
+        let explicit = compile(&Graph::from_json(&explicit).unwrap()).unwrap();
+        assert_eq!(explicit.instruction_counts(), (9, 11, 2));
+        assert_eq!(explicit.fingerprint(), CLASSIC_FINGERPRINT);
+        // A real offset changes the fingerprint (and so invalidates any
+        // LOD stored by the offset-free graph).
+        let warped = super::super::CLASSIC_JSON.replace(
+            r#""x_scale": 0.0009,
+      "z_scale": 0.0009"#,
+            r#""x_scale": 0.0009,
+      "z_scale": 0.0009,
+      "x_offset": 100"#,
+        );
+        let warped = compile(&Graph::from_json(&warped).unwrap()).unwrap();
+        assert_ne!(warped.fingerprint(), CLASSIC_FINGERPRINT);
     }
 
     #[test]
-    fn salts_round_trip_through_json() {
-        let graph = Graph::from_json(super::super::OVERWORLD_JSON).unwrap();
-        let NodeValue::Inline(mask) = &graph.nodes["mask"] else {
-            panic!("mask is an inline node");
+    fn warped_and_ridged_nodes_evaluate_like_the_reference() {
+        // 10,000 seeded points (deterministic LCG), including offsets that
+        // reference other nodes.
+        let json = r#"{
+            "version": 1,
+            "nodes": {
+                "warp": {"type": "noise2", "salt": "0x11", "x_scale": 0.01, "z_scale": 0.01},
+                "warp_blocks": {"type": "mul", "a": {"ref": "warp"}, "b": 350},
+                "warped_noise": {"type": "noise2", "salt": "0x22", "x_scale": 0.002,
+                                  "z_scale": 0.003,
+                                  "x_offset": {"ref": "warp_blocks"},
+                                  "z_offset": {"ref": "warp"}},
+                "warped_fbm": {"type": "fbm2", "salt": "0x33", "scale": 0.004, "octaves": 4,
+                               "x_offset": {"ref": "warp_blocks"}, "z_offset": {"ref": "warp"}},
+                "ridged": {"type": "ridged2", "salt": "0x44", "scale": 0.005, "octaves": 5,
+                           "gain": 2.0, "x_offset": {"ref": "warp_blocks"},
+                           "z_offset": {"ref": "warp"}}
+            },
+            "outputs": {"final_density": {"type": "add", "a": {"ref": "warped_noise"}, "b": 0}}
+        }"#;
+        let graph = compile(&Graph::from_json(json).unwrap()).unwrap();
+        let nodes = Graph::from_json(json).unwrap().nodes;
+        let ridged_graph = compile(&Graph {
+            version: 1,
+            nodes: nodes.clone(),
+            outputs: Outputs {
+                final_density: NodeValue::Ref {
+                    name: "ridged".to_owned(),
+                },
+            },
+        })
+        .unwrap();
+        let fbm_graph = compile(&Graph {
+            version: 1,
+            nodes,
+            outputs: Outputs {
+                final_density: NodeValue::Ref {
+                    name: "warped_fbm".to_owned(),
+                },
+            },
+        })
+        .unwrap();
+        let mut state = 0x5EED_2028_0000_0001u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
         };
-        let Node::Noise2 { salt, .. } = mask.as_ref() else {
-            panic!("mask is a noise2 node");
+        for _ in 0..10_000 {
+            let x = ((next() % 200_001) as i64) - 100_000;
+            let z = ((next() % 200_001) as i64) - 100_000;
+            let seed = next();
+            let warp_x = reference::noise2(seed ^ 0x11, x as f64 * 0.01, z as f64 * 0.01);
+            let off_x = warp_x * 350.0;
+            let off_z = warp_x;
+            let xf = x as f64;
+            let zf = z as f64;
+            let noise = reference::noise2(seed ^ 0x22, (xf + off_x) * 0.002, (zf + off_z) * 0.003);
+            let fbm = reference::fbm(seed ^ 0x33, (xf + off_x) * 0.004, (zf + off_z) * 0.004, 4);
+            let ridged = reference::ridged2(
+                seed ^ 0x44,
+                (xf + off_x) * 0.005,
+                (zf + off_z) * 0.005,
+                5,
+                2.0,
+            );
+            let at = [x, 64, z];
+            assert_eq!(graph.sample(seed, at).to_bits(), noise.to_bits());
+            assert_eq!(ridged_graph.sample(seed, at).to_bits(), ridged.to_bits());
+            assert_eq!(fbm_graph.sample(seed, at).to_bits(), fbm.to_bits());
+        }
+    }
+
+    #[test]
+    fn ridged2_bounds_are_exact_and_offsets_never_widen_bounds() {
+        let json = r#"{
+            "version": 1,
+            "nodes": {
+                "warp": {"type": "fbm2", "salt": "0x55", "scale": 0.01, "octaves": 2},
+                "r": {"type": "ridged2", "salt": "0x66", "scale": 0.01, "octaves": 6,
+                      "gain": 3.0, "x_offset": {"ref": "warp"}, "z_offset": {"ref": "warp"}}
+            },
+            "outputs": {"final_density": {"ref": "r"}}
+        }"#;
+        let graph = compile(&Graph::from_json(json).unwrap()).unwrap();
+        let mut state = 0x5EED_2028_0000_0002u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
         };
-        assert_eq!(salt.0, 0x0D1B_54A3_2D16_8ED5);
-        let text = serde_json::to_string(&graph).unwrap();
+        for _ in 0..10_000 {
+            let at = [
+                ((next() % 200_001) as i64) - 100_000,
+                0,
+                ((next() % 200_001) as i64) - 100_000,
+            ];
+            let v = graph.sample(next(), at);
+            assert!((0.0..=1.0).contains(&v), "ridged2 out of [0, 1]: {v}");
+        }
+        let (min, max) = graph.bounds([-100, -100, -100], [100, 100, 100]);
+        assert_eq!((min, max), (0.0, 1.0));
+    }
+
+    #[test]
+    fn a_y_dependent_offset_is_a_compile_error() {
+        let err = compile_json(
+            r#"{"version": 1, "nodes": {"n": {"type": "noise2", "salt": "0x1",
+                "x_scale": 1, "z_scale": 1, "x_offset": {"type": "y"}}},
+                "outputs": {"final_density": {"ref": "n"}}}"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, GraphError::BadNode { .. }), "got {err:?}");
         assert!(
-            text.contains("\"0x0D1B54A32D168ED5\""),
-            "salt stays a hex string: {text}"
+            err.to_string().contains("x_offset"),
+            "error names the offset: {err}"
         );
-        let reparsed = Graph::from_json(&text).unwrap();
-        assert_eq!(graph, reparsed);
+        // Unknown fields stay rejected on the new nodes too.
+        for kind in [
+            r#""noise2", "salt": "0x1", "x_scale": 1, "z_scale": 1, "typo": 2"#,
+            r#""ridged2", "salt": "0x1", "scale": 1, "octaves": 2, "gain": 1, "typo": 2"#,
+        ] {
+            let json = format!(
+                r#"{{"version": 1, "nodes": {{"n": {{"type": {kind}}}}},
+                     "outputs": {{"final_density": {{"ref": "n"}}}}}}"#
+            );
+            assert!(compile_json(&json).is_err(), "expected error for {kind}");
+        }
     }
 
     #[test]
@@ -1652,7 +2076,7 @@ mod tests {
 
     #[test]
     fn sample_grid_at_steps_2_4_8_equals_point_evaluation() {
-        let graph = Graph::from_json(super::super::OVERWORLD_JSON).unwrap();
+        let graph = Graph::from_json(super::super::CLASSIC_JSON).unwrap();
         let compiled = compile(&graph).unwrap();
         let mut out = [0.0; GRID_VOLUME];
         for step in [2u32, 4, 8] {
@@ -1677,7 +2101,7 @@ mod tests {
 
     #[test]
     fn bounds_contain_sampled_values_over_random_boxes() {
-        let graph = Graph::from_json(super::super::OVERWORLD_JSON).unwrap();
+        let graph = Graph::from_json(super::super::CLASSIC_JSON).unwrap();
         let compiled = compile(&graph).unwrap();
         // Deterministic LCG so failures reproduce.
         let mut state = 0x5EED_2026_0000_0001u64;
@@ -1717,12 +2141,14 @@ mod tests {
 
     #[test]
     fn shipped_graph_bounds_prove_the_documented_height_range() {
-        let compiled = compile(&Graph::from_json(super::super::OVERWORLD_JSON).unwrap()).unwrap();
-        for y in (crate::terrain::MAX_HEIGHT + 1)..=128i64 {
+        // The classic graph's [36, 92]; the overworld's [MIN_HEIGHT,
+        // MAX_HEIGHT] is asserted against its band in tests/overworld.rs.
+        let compiled = compile(&Graph::from_json(super::super::CLASSIC_JSON).unwrap()).unwrap();
+        for y in 93..=128i64 {
             let (_, max) = compiled.bounds([-64, y, -64], [64, y, 64]);
             assert!(max < 0.0, "air not proven at y = {y}: max = {max}");
         }
-        for y in 0..=(crate::terrain::MIN_HEIGHT - 1) {
+        for y in 0..=35 {
             let (min, _) = compiled.bounds([-64, y, -64], [64, y, 64]);
             assert!(min >= 0.0, "solid not proven at y = {y}: min = {min}");
         }

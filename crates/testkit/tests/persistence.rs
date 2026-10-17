@@ -10,6 +10,7 @@ use jbm_core::coords::BlockPos;
 use jbm_core::physics::MoveInput;
 use jbm_core::protocol::{ClientMsg, ServerMsg};
 use jbm_server::server::ServerConfig;
+use jbm_server::worldgen::Preset;
 use jbm_testkit::{HeadlessServer, TestClient};
 use tempfile::TempDir;
 
@@ -17,6 +18,7 @@ use tempfile::TempDir;
 /// save interval (one batch per tick).
 fn persistent_config(dir: &TempDir, save_interval: Duration) -> ServerConfig {
     ServerConfig {
+        worldgen: Preset::Classic, // today's terrain, as before 2.8
         streaming: true,
         view_radius: 1,
         vertical_radius: 1,
@@ -397,6 +399,7 @@ fn a_failed_save_keeps_cubes_pinned_and_retries() {
 fn a_restored_edit_survives_eviction_with_threaded_generation() {
     let dir = TempDir::new().unwrap();
     let config = || ServerConfig {
+        worldgen: Preset::Classic, // today's terrain, as before 2.8
         gen_threads: 4,
         view_radius: 8,
         vertical_radius: 4,

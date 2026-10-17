@@ -14,7 +14,14 @@ When the window closes (or the server drops the link), `app::run` returns
 and `handle.stop()` joins the server thread. The server thread is never
 detached; stopping it propagates a server panic rather than swallowing it.
 
-`Server::new()` streams generated terrain around the player (task 1.5).
+`Server::new()` streams generated terrain around the player (task 1.5); it
+runs the default `Overworld` worldgen preset (task 2.8's continents,
+mountain ranges and sea). Every test, bench and example here that depends
+on the pre-2.8 terrain pins `ServerConfig { worldgen: Preset::Classic }`
+(`terrain_screenshot`, `edit_screenshot`, `edit_e2e`, `prediction`,
+`terrain_paths`, the draw benches and the cube-size metrics) so their
+goldens and height assumptions keep their meaning; `lod_fly` alone uses
+the new `Overworld`, as the real-flight check.
 
 **Far-look wiring (task 2.9):** `main` derives a
 `jbm_client::app::ViewSetup` from its `ServerConfig` before the config

@@ -19,6 +19,7 @@ use jbm_server::DEFAULT_SEED;
 use jbm_server::server::{Server, ServerConfig};
 use jbm_server::storage::Storage;
 use jbm_server::terrain::Generator;
+use jbm_server::worldgen::Preset;
 use jbm_testkit::HeadlessServer;
 
 /// Environment variable selecting which child role the test binary runs.
@@ -193,7 +194,7 @@ fn placed_state() -> jbm_core::block::BlockStateId {
 fn generator() -> Generator {
     let mut registry = BlockRegistry::new();
     let blocks = Blocks::register(&mut registry);
-    Generator::new(DEFAULT_SEED, blocks)
+    Generator::with_preset(DEFAULT_SEED, blocks, Preset::Classic)
 }
 
 #[test]
@@ -206,6 +207,7 @@ fn kill_during_server_save_keeps_a_prefix_of_placements() {
 
     // A fresh server on the same directory (no stuck lock)...
     let config = ServerConfig {
+        worldgen: Preset::Classic, // today's terrain, as before 2.8
         world_dir: Some(dir.path().to_owned()),
         save_interval: Duration::from_millis(50),
         streaming: false,
@@ -303,6 +305,7 @@ fn kill_child_server() {
     }
     let dir = std::env::var(DIR_VAR).expect("child gets the world dir");
     let config = ServerConfig {
+        worldgen: Preset::Classic, // today's terrain, as before 2.8
         world_dir: Some(std::path::PathBuf::from(dir)),
         save_interval: Duration::from_millis(50),
         streaming: true,

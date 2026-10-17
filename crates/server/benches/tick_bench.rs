@@ -10,6 +10,7 @@ use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION};
 use jbm_server::Server;
 use jbm_server::server::ServerConfig;
 use jbm_server::tick::TickClock;
+use jbm_server::worldgen::Preset;
 
 /// Drain every queued message from a client link (untimed helper).
 trait TryRecvDrain {
@@ -88,6 +89,7 @@ fn bench(c: &mut Criterion) {
         // One player fully loaded at R = 8, inline generation. Measures a
         // tick with nothing left to send: the idle-player floor.
         let mut server = Server::with_config(ServerConfig {
+            worldgen: Preset::Classic, // keeps the pre-2.8 terrain comparable
             gen_threads: 0,
             ..ServerConfig::default()
         });

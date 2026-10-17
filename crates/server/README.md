@@ -6,16 +6,31 @@ server side of the protocol.
 ## Terrain (`terrain`)
 
 `Generator::new(seed, Blocks)` produces cubes by evaluating the compiled
-shipped worldgen graph (below); `generate(CubePos) -> Cube` is a pure
-function of `(seed, pos)`, and `surface_height(x, z) -> i64` is public (the
-spawn point is `[0.5, h(0,0) + 2.0, 0.5]`). `Generator::from_graph(seed,
-Blocks, &CompiledGraph)` runs any graph instead — for tests now, mods from
-Stage 3. `MIN_HEIGHT = 36` and `MAX_HEIGHT = 92` stay the documented bounds
-of the shipped graph.
+shipped overworld graph (below); `generate(CubePos) -> Cube` is a pure
+function of `(seed, pos)`, and `surface_height(x, z) -> i64` is public.
+`Generator::with_preset(seed, Blocks, worldgen::Preset)` picks the shipped
+graph (`Overworld`, the default, or `Classic`), and
+`Generator::from_graph(seed, Blocks, &CompiledGraph)` runs any graph instead
+— for tests now, mods from Stage 3. `MIN_HEIGHT = 23` and `MAX_HEIGHT = 408`
+are the overworld's documented bounds, derived from its interval bounds (the
+classic graph's narrower `[36, 92]` sits inside them).
 
-- **Layering per column with surface height `h`:** grass_block at `h`, dirt
-  from `h-3` to `h-1`, stone below; sand replaces grass and dirt where
-  `h ≤ 61`. No water, trees or caves yet.
+- **Water and sea level (task 2.8).** `SEA_LEVEL = 64`: air cells at or
+  below it become `base:water` — in `generate` and `sample_lod` alike.
+  Water is non-solid, so physics passes through it; no swimming or flow.
+  Sea-less worlds (`Classic`, custom graphs) never gain water.
+- **Surface materials (overworld):** per column, from that column's own
+  surface height `h` and its steepest neighbour step `slope` — stone when
+  `h ≥ SEA_LEVEL + 180` (bare-rock peaks; snow is a follow-up) or
+  `slope ≥ 4` (cliffs), sand when `h ≤ SEA_LEVEL − 3` (beaches, seabed),
+  otherwise grass over a 3-deep dirt belt, stone below. Local per column,
+  so it is cheap and LOD-consistent. `sample_lod` scales the slope bar by
+  the sample stride, so a level-*n* cube classifies the terrain
+  `generate`'s per-block rule would.
+- **Spawn search (overworld):** outward from `(0, 0)` in a fixed spiral
+  (ring by ring, each ring in a fixed order) for the first land column at
+  or above sea level whose steepest neighbour step is ≤ 2. Deterministic
+  per seed. Sea-less worlds keep spawning over `(0, 0)` exactly as before.
 - **Fast paths:** interval bounds over the cube decide uniform air (density
   max < 0) and uniform stone (density min ≥ 0 over the cube extended 4 cells
   up, so every surface run is provably saturated). Mixed cubes evaluate per
@@ -25,16 +40,25 @@ of the shipped graph.
   nothing; it is a pure-function cache and cannot change answers.
 - The task 1.5 noise terrain lives on as `worldgen::reference`, kept only
   for the equivalence tests and the comparison bench.
+- **Preview:** `cargo run -p jbm-server --example worldgen_preview --
+  [seed_hex [km]]` writes a hillshaded top-down PNG of the overworld to
+  `target/worldgen_preview/overworld_<seed>_<km>km.png` — the tuning loop's
+  eye (continents, ridges, valleys at a glance).
 
 ## Worldgen graph (`worldgen`)
 
 Terrain shape is data: a JSON graph of density functions, compiled once by
 `compile(&Graph) -> CompiledGraph` into a flat, topologically ordered
 instruction list over a register array — no recursion, no allocation per
-sample. A cell is **solid** when `final_density ≥ 0`. The shipped graph is
-`assets/worldgen/overworld.json` (`worldgen::OVERWORLD_JSON`, also compiled
-once per process by `worldgen::overworld()`); it re-expresses the task 1.5
-terrain bit-identically.
+sample. A cell is **solid** when `final_density ≥ 0`. Two graphs ship:
+`assets/worldgen/overworld.json` (`worldgen::OVERWORLD_JSON`) — the task
+2.8 terrain of continents, ridged ranges and a sea — and
+`assets/worldgen/classic.json` (`worldgen::CLASSIC_JSON`), the pre-2.8
+terrain frozen bit-for-bit for the tests, benches and goldens that depend
+on it. `worldgen::Preset` (`ServerConfig::worldgen`, default `Overworld`)
+picks one; both compile once per process. Old worlds keep their stored
+edits and LOD0 records; the worldgen fingerprint invalidates their stored
+LOD, and new terrain generates around them.
 
 **Format** (`Graph::from_json`, version 1): a `nodes` map of named,
 shareable subexpressions (compiled once per sample however often they are
@@ -53,9 +77,61 @@ missing output. Loading never panics on bad input.
 | `add`, `sub`, `mul`, `min`, `max` | `a`, `b` | |
 | `neg`, `abs`, `floor` | `a` | |
 | `clamp` | `input`, `min`, `max` | `f64::clamp` semantics; `min > max` is a compile error when constant |
-| `noise2` | `salt`, `x_scale`, `z_scale` | the reference 2D gradient noise at `(x·x_scale, z·z_scale)`, seeded `world_seed ^ salt`; range ±√2/2 |
-| `fbm2` | `salt`, `scale`, `octaves` | the reference fractal sum at `(x·scale, z·scale)`, normalized; range ±√2/2 |
+| `noise2` | `salt`, `x_scale`, `z_scale`, `x_offset?`, `z_offset?` | the reference 2D gradient noise at `((x + x_offset)·x_scale, (z + z_offset)·z_scale)`, seeded `world_seed ^ salt`; range ±√2/2 |
+| `fbm2` | `salt`, `scale`, `octaves`, `x_offset?`, `z_offset?` | the reference fractal sum at `((x + x_offset)·scale, (z + z_offset)·scale)`, normalized; range ±√2/2 |
+| `ridged2` | `salt`, `scale`, `octaves`, `gain`, `x_offset?`, `z_offset?` | the ridged multifractal (below); range exactly `[0, 1]` |
 | `spline` | `input`, `points` | piecewise linear over `[[x, y], …]`, clamped at both ends; points strictly increasing in `x`, at least two |
+
+**Domain warp (task 2.8).** The noise-family nodes take optional
+`x_offset` / `z_offset` operands (`NodeValue`, default 0) and sample at
+`(x + x_offset, z + z_offset)` — the offsets may reference other nodes,
+typically noise × a few hundred blocks, so ridges bend and coasts wander
+instead of reading as plain noise. Noise bounds hold wherever the noise is
+sampled, so an offset never widens the interval bounds. A y-dependent
+offset is a compile error (it would make a column-stage instruction read a
+cell-stage register). Offset-free graphs — `classic.json` included —
+compile to the same instructions and the same fingerprint they had before
+offsets existed, so their stored LOD stays valid (tested).
+
+**`ridged2` formula** (the classic Musgrave form, per octave with amplitude
+`amp` halving and frequency `freq` doubling like `fbm2`, weight starting at
+1):
+
+```text
+ridge   = 1 − |noise2(x·freq, z·freq)|        (in (0, 1])
+signal  = ridge² · weight
+sum    += amp · signal;  norm += amp
+weight  = clamp(signal · gain, 0, 1)           (the next octave's weight)
+result  = sum / norm
+```
+
+The ridgeline lives at `noise = 0`, where `ridge` peaks; squaring sharpens
+the crest and the previous octave's weight erodes detail off valley floors.
+Bounds are exact: each `signal ∈ [0, 1]`, so `sum/norm ∈ [0, 1]`.
+
+**The overworld's layers** (each a named node in `overworld.json`; heights
+stay `floor`-integers and the density stays `surface(x, z) − y`, so the
+band/heightmap fast paths and `sample_lod` keep working):
+
+1. **Warp** (`warp_x`, `warp_z`): two fbm2 fields, ×300 blocks, feeding
+   every later field's offsets — the domain warp that bends ridges and
+   coasts.
+2. **Continentalness** (`cont`, `base`): a warped fbm2 over a few
+   kilometres, through a spline to the base height — deep ocean floor
+   around y = 28, coasts near sea level, lowlands and highlands up to 79.
+3. **Erosion** (`ero`, `rugged`): a second warped low-frequency field
+   through a step spline, deciding how much of the mountain field applies —
+   ranges sit in bands, plains stay plain.
+4. **Mountains** (`ridge`, `shape`, `land_gate`, `scale_m`, `mountains`):
+   a warped `ridged2`, squared and shaped by a spline, gated by
+   continentalness (no mountains in oceans) and erosion, peaking around
+   +340 blocks over the base — so the roughest peaks sit near +250…+350
+   over sea level.
+5. **Valleys** (`valley`, `channel`, `keep`): `|fbm2|` channels whose
+   centres carve the mountain scale down to ~35%, so wide valleys thread
+   the highlands; valley floors below sea level fill with water.
+6. **Detail** (`detail_n`, `detail`): a small high-frequency fbm, ×2 on
+   plains and ×9 in rugged areas, for local roughness.
 
 Salts are full `u64`s written as hex strings (`"0x0D1B54A32D168ED5"`) so
 values above 2⁵³ round-trip through JSON exactly.
@@ -66,33 +142,35 @@ values above 2⁵³ round-trip through JSON exactly.
 platform, so the same `(seed, graph)` gives identical terrain everywhere.
 No `sin`/`cos`/`exp`/`powf` anywhere. Float arithmetic is commutative but
 **not associative**: the expression tree's shape fixes the bits, so keep
-operand nesting exactly as written when editing `overworld.json` — it
-computes `(40 · hilliness) · rolling`, not `40 · (hilliness · rolling)`.
-The equivalence tests catch any drift.
+operand nesting exactly as written when editing either shipped graph —
+`classic.json` computes `(40 · hilliness) · rolling`, not
+`40 · (hilliness · rolling)`. The equivalence tests catch any drift.
 
 **Compilation stages.** `compile` folds constants, then splits
 instructions by dimension analysis: constants run once, column-stage (xz)
 instructions once per `(x, z)` column, cell-stage (xyz) instructions once
-per block. The shipped graph's only cell-stage work is `y` and `- y`, so 3D
-evaluation stays near heightmap cost. `CompiledGraph::bounds(min, max)`
+per block. Both shipped graphs' only cell-stage work is `y` and `- y`, so
+3D evaluation stays near heightmap cost. `CompiledGraph::bounds(min, max)`
 gives sound interval bounds over an inclusive box (noise contributes its
 documented ±√2/2); the cube fast paths above are built on it.
 
 **Surface stage** (code, not graph, for now): for a solid cell at `y`, let
 `d` be the number of consecutive solid cells directly above it, capped at
-4. If `d ≤ 3` and the surface `y + d` is at or below 61 (`SAND_LEVEL`):
-sand; else if `d = 0`: grass; else if `d ≤ 3`: dirt; else stone. Computing
-`d` for the top rows evaluates up to 4 cells above the cube — never a
-neighbour cube. For a pure heightmap density this is exactly the old
+4. Sea-less worlds keep the pre-2.8 rules: `d ≤ 3` at or below `SAND_LEVEL`:
+sand; else `d = 0`: grass; else `d ≤ 3`: dirt; else stone. The overworld
+uses the per-column material rules above (see Terrain). Computing `d` for
+the top rows evaluates up to 4 cells above the cube — never a neighbour
+cube. For a pure heightmap density the sea-less rules are exactly the old
 `column_block`; the equivalence argument is a comment on
 `terrain::surface_block`.
 
 **Per-column cache.** Rows the interval bounds cannot decide form a band
-(the shipped graph's is `y ∈ (36, 93)`); the generator caches one solidity
-bit per band row per column — today's heightmap cache, generalized — so
-vertically adjacent cubes reuse it instead of re-running noise. Graphs
-whose band cannot be proven fall back to caching live column-stage values
-and evaluating rows on demand.
+(the classic graph's is `y ∈ (36, 93)`, the overworld's spans its full
+`[MIN_HEIGHT, MAX_HEIGHT]` relief, 384 rows — well under the 512-row cache
+limit); the generator caches one solidity bit per band row per column —
+today's heightmap cache, generalized — so vertically adjacent cubes reuse
+it instead of re-running noise. Graphs whose band cannot be proven fall
+back to caching live column-stage values and evaluating rows on demand.
 
 **`sample_grid` layout** (for later LOD tasks): `CompiledGraph::
 sample_grid(seed, origin, step, out)` fills a 32³ grid of densities at
@@ -589,6 +667,15 @@ Current cases:
 - `worldgen/sample_lod/{1,2,4}/surface` (task 2.7) — `sample_lod` on a
   mixed surface cube per level, asserted mixed in setup.
 - `worldgen/sample_lod/2/air` — the uniform-air fast path.
+- `worldgen/overworld/heightmap_32x32` (task 2.8) — the overworld's 32×32
+  surface-height patch, next to the classic one.
+- `worldgen/overworld/surface_cube_mountain` — a steep mountain surface
+  cube (≥ 24 blocks of height range in its columns, asserted in setup);
+  must stay within 2× of classic `worldgen/surface_cube` in the same run.
+- `worldgen/overworld/surface_cube_lowland` — a gentle land cube near
+  spawn.
+- `worldgen/sample_lod_overworld/{1,2,4}/surface` — `sample_lod` on the
+  overworld's mountain cube per level.
 - `storage/encode_surface_cube` ≈ 9 µs — codec plus zstd level 3 (bulk
   frames, which record their content size).
 - `storage/decode_surface_cube` ≈ 30 µs — exact-size zstd decompress plus
