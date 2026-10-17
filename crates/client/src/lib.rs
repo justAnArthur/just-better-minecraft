@@ -11,6 +11,7 @@ pub mod lod;
 pub mod mesh;
 pub mod predict;
 pub mod render;
+pub mod terrain_sync;
 pub mod world;
 
 #[cfg(any(test, feature = "testing"))]
