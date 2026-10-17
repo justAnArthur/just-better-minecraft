@@ -3,6 +3,7 @@
 
 use std::panic;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
@@ -11,11 +12,21 @@ use std::time::Instant;
 use jbm_core::link::ServerLink;
 
 use crate::server::Server;
+use crate::server::ServerStats;
+
+/// The debug panel's read side: the shared slot the server thread's
+/// snapshots land in (task 2.12).
+pub type StatsSlot = Arc<Mutex<Option<ServerStats>>>;
 
 /// Handle to a server running on its own thread. Dropping it stops and
 /// joins the thread — a handle never detaches.
 pub struct ServerHandle {
     new_links: mpsc::Sender<ServerLink>,
+    /// Live view-radius changes for the debug panel (task 2.12): applied
+    /// at the start of the next tick.
+    control: mpsc::Sender<(u32, u32)>,
+    /// The latest stats snapshot, republished every 10 ticks (0.5 s).
+    stats: Arc<Mutex<Option<ServerStats>>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<Server>>,
 }
@@ -24,27 +35,37 @@ pub struct ServerHandle {
 /// handle to it.
 pub fn spawn(server: Server) -> ServerHandle {
     let (new_links_tx, new_links_rx) = mpsc::channel::<ServerLink>();
+    let (control_tx, control_rx) = mpsc::channel::<(u32, u32)>();
     let stop = Arc::new(AtomicBool::new(false));
+    let stats = Arc::new(Mutex::new(None));
     let thread_stop = Arc::clone(&stop);
+    let thread_stats = Arc::clone(&stats);
     let thread = thread::Builder::new()
         .name("jbm-server".to_owned())
-        .spawn(move || drive(server, new_links_rx, thread_stop))
+        .spawn(move || drive(server, new_links_rx, control_rx, thread_stats, thread_stop))
         .expect("spawning the jbm-server thread");
     ServerHandle {
         new_links: new_links_tx,
+        control: control_tx,
+        stats,
         stop,
         thread: Some(thread),
     }
 }
 
 /// The loop the server thread runs: measure elapsed time with `Instant`,
-/// drain new connections, run due ticks, then sleep until the next one.
+/// drain new connections, apply queued view-radius changes, run due
+/// ticks, publish a stats snapshot twice a second, then sleep until the
+/// next one.
 fn drive(
     mut server: Server,
     new_links: mpsc::Receiver<ServerLink>,
+    control: mpsc::Receiver<(u32, u32)>,
+    stats: Arc<Mutex<Option<ServerStats>>>,
     stop: Arc<AtomicBool>,
 ) -> Server {
     let mut last = Instant::now();
+    let mut published_bucket = u64::MAX;
     while !stop.load(Ordering::Acquire) {
         let now = Instant::now();
         let elapsed = now - last;
@@ -52,7 +73,19 @@ fn drive(
         while let Ok(link) = new_links.try_recv() {
             server.add_connection(link);
         }
+        while let Ok((view_radius, lod_view_radius)) = control.try_recv() {
+            server.set_view_radius(view_radius, lod_view_radius);
+        }
         server.update(elapsed);
+        // Publish the counters every 10 ticks (0.5 s at 20 Hz): often
+        // enough for a debug panel, cheap enough to never matter. The
+        // first publication waits for the first tick, so a snapshot never
+        // shows the pre-tick void (tick 0, no players, empty desired).
+        let bucket = server.tick_count() / 10;
+        if bucket != published_bucket && server.tick_count() > 0 {
+            published_bucket = bucket;
+            *stats.lock().expect("stats mutex poisoned") = Some(server.stats());
+        }
         thread::sleep(server.until_next_tick());
     }
     server
@@ -64,6 +97,28 @@ impl ServerHandle {
     /// already gone (it panicked); [`ServerHandle::stop`] surfaces that.
     pub fn connect(&self, link: ServerLink) {
         let _ = self.new_links.send(link);
+    }
+
+    /// The latest stats snapshot (task 2.12's debug panel), republished
+    /// every 10 ticks: `None` only before the first publication or after
+    /// the thread died.
+    pub fn stats(&self) -> Option<ServerStats> {
+        self.stats.lock().expect("stats mutex poisoned").clone()
+    }
+
+    /// Changes the server's view distances (LOD0 cubes, LOD ring cubes)
+    /// live; the server thread clamps and applies them at the start of
+    /// its next tick, exactly as [`Server::set_view_radius`] does.
+    pub fn set_view_radius(&self, view_radius: u32, lod_view_radius: u32) {
+        let _ = self.control.send((view_radius, lod_view_radius));
+    }
+
+    /// The debug panel's bridge into the running server (task 2.12): the
+    /// shared stats slot and a clone of the control sender, so the game
+    /// can build plain closures over them without borrowing the handle
+    /// (and without the client ever depending on this crate).
+    pub fn debug_bridge(&self) -> (StatsSlot, mpsc::Sender<(u32, u32)>) {
+        (Arc::clone(&self.stats), self.control.clone())
     }
 
     /// Stop the server thread, join it and return the [`Server`] so tests

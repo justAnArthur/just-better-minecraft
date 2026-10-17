@@ -26,6 +26,84 @@ use crate::spans::SurfaceSpans;
 const LOD_SKIP_WINDOW: usize = 512;
 
 impl Server {
+    /// Changes the view distances live (task 2.12's F3 panel): clamps
+    /// LOD0 to 2..=32 cubes and the LOD rings to 2..=16, updates the
+    /// config, and replays the same transitions a border crossing does —
+    /// sent cubes that left the new keep sets are unloaded (both LOD0
+    /// and every ring level), the desired sets and merged LOD walks are
+    /// forced to rebuild next tick, and eviction re-runs against the new
+    /// keep sets. Growing works the same way in reverse: the rebuilt
+    /// desired sets simply reach further, and the span store's fill queue
+    /// feeds the wider square.
+    pub fn set_view_radius(&mut self, view_radius: u32, lod_view_radius: u32) {
+        self.config.view_radius = view_radius.clamp(2, 32);
+        self.config.lod_view_radius = lod_view_radius.clamp(2, 16);
+        let (r, v, cap) = (
+            self.config.view_radius,
+            self.config.vertical_radius,
+            self.config.max_column_cubes,
+        );
+        let (lod_r, lod_v) = (self.config.lod_view_radius, self.config.lod_vertical_radius);
+        for conn in &mut self.connections {
+            let ConnectionState::Joined(player) = &mut conn.state else {
+                continue;
+            };
+            // LOD0: unload what left the new keep set, then force the
+            // desired rebuild (the version sentinel, as at join).
+            let center = player.center;
+            let to_unload: Vec<CubePos> = player
+                .sent
+                .iter()
+                .copied()
+                .filter(|&pos| !lod0_keeps(&self.spans, pos, center, r, v, cap))
+                .collect();
+            for pos in to_unload {
+                player.sent.remove(&pos);
+                if conn.link.send(ServerMsg::UnloadCube { pos }).is_err() {
+                    // The link is closed; the next streaming tick drops
+                    // the connection, which also re-dirties eviction.
+                    break;
+                }
+            }
+            player.desired.clear();
+            player.desired_version = u64::MAX;
+            player.cursor = 0;
+            // LOD rings, level by level, against each level's keep set.
+            for (index, level_state) in player.lod.iter_mut().enumerate() {
+                let level = index as u8 + 1;
+                let center = level_state.center;
+                let to_unload: Vec<CubePos> = level_state
+                    .sent
+                    .iter()
+                    .copied()
+                    .filter(|&pos| {
+                        !lod_level_keeps(&self.spans, level, pos, center, lod_r, lod_v, cap)
+                    })
+                    .collect();
+                for pos in to_unload {
+                    level_state.sent.remove(&pos);
+                    if conn
+                        .link
+                        .send(ServerMsg::UnloadLodCube { level, pos })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+            player.lod_walk.clear();
+            player.lod_walk_version = u64::MAX;
+            player.lod_cursor = 0;
+        }
+        self.eviction_dirty = true;
+    }
+
+    /// The server's effective `(view_radius, lod_view_radius)` — the
+    /// clamped values the streams run with (task 2.12's tests read them).
+    pub fn config_view_radius(&self) -> (u32, u32) {
+        (self.config.view_radius, self.config.lod_view_radius)
+    }
+
     /// The streaming pass, once per tick. Collects finished generation
     /// results, then per player (in join order): unloads cubes that left
     /// their keep set, sends newly in-range cubes nearest-first up to the
