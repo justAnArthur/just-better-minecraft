@@ -21,11 +21,11 @@ use jbm_client::gpu::Gpu;
 use jbm_client::lod::Coverage;
 use jbm_client::mesh::appearance::{BlockAppearance, builtin_textures};
 use jbm_client::mesh::pool::MeshPool;
-use jbm_client::render::chunks::TerrainPass;
 use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::renderer::{
     DepthTarget, FrameInputs, HORIZON_COLOR, Renderer, ZENITH_COLOR,
 };
+use jbm_client::render::terrain::TerrainPass;
 use jbm_client::render::texture_array::BlockTextures;
 use jbm_client::world::ClientWorld;
 use jbm_core::coords::{CUBE_SIZE, CubePos};

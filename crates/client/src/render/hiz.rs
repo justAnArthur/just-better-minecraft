@@ -3,7 +3,7 @@
 //! depth target; mip k+1 is a 2x2 **min** reduction of mip k, because in
 //! reverse-Z the smaller depth is the farther surface and occlusion needs
 //! the farthest one. The occlusion cull in `shaders/cull.wgsl` samples the
-//! pyramid. See `render/chunks.rs` for how it is used per frame.
+//! pyramid. See `render/terrain/gpu_cull.rs` for how it is used per frame.
 
 use crate::gpu::Gpu;
 

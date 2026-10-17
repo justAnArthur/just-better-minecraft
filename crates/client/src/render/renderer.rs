@@ -7,9 +7,10 @@ use jbm_core::coords::BlockPos;
 
 use crate::camera::Camera;
 use crate::gpu::Gpu;
-use crate::render::chunks::TerrainPass;
 use crate::render::outline::OutlinePass;
 use crate::render::overlay::{OverlayRenderer, OverlayText};
+use crate::render::settings::RenderSettings;
+use crate::render::terrain::TerrainPass;
 
 /// Depth buffer format. Reverse-Z (cleared to 0.0, `Greater` compare) with
 /// an infinite far plane keeps precision near the camera for Stage 2's
@@ -210,16 +211,13 @@ pub struct Renderer {
     overlay: OverlayRenderer,
     outline: OutlinePass,
     viewport: (u32, u32),
-    /// Sky color overrides (task 2.6 hole tests): linear RGB per slot.
+    /// Sky color overrides (hole tests): linear RGB per slot.
     sky_override: Option<([f32; 4], [f32; 4], [f32; 4])>,
-    /// Whether terrain distance fog applies (task 2.9); `JBM_NO_FOG=1` at
-    /// construction, later `set_fog`. Propagated to the terrain pass every
-    /// frame — the flag rides in the terrain uniform.
-    fog: bool,
-    /// Whether the level tint applies (task 2.10); set by the app's F4
-    /// toggle / `JBM_LOD_TINT=1` at startup, propagated to the terrain
-    /// pass every frame like the fog flag.
-    lod_tint: bool,
+    /// The frame-level settings (fog, level tint, far-look radii, path
+    /// flags) the renderer owns; passed to the terrain pass with every
+    /// draw. Seeded from `RenderSettings::from_env()` by the app through
+    /// `set_settings`; defaults otherwise.
+    settings: RenderSettings,
 }
 
 impl Renderer {
@@ -318,36 +316,58 @@ impl Renderer {
             outline,
             viewport: (1, 1),
             sky_override: None,
-            fog: !std::env::var_os("JBM_NO_FOG").is_some_and(|v| v == "1"),
-            lod_tint: false,
+            settings: RenderSettings::default(),
         }
     }
 
-    /// Enables or disables terrain distance fog (task 2.9). Off via
-    /// `JBM_NO_FOG=1` at construction; screenshot tests use this to isolate
-    /// geometry from fog. Fog never touches the sky pass, so the sentinel
-    /// hole tests keep working with it on: a hole still shows the sentinel
-    /// sky, while fogged terrain dissolves into the horizon color.
+    /// Replaces the renderer-owned settings wholesale (the app's one
+    /// `RenderSettings::from_env()` read lands here).
+    pub fn set_settings(&mut self, settings: RenderSettings) {
+        self.settings = settings;
+    }
+
+    /// The renderer-owned settings the terrain draws run with.
+    pub fn settings(&self) -> &RenderSettings {
+        &self.settings
+    }
+
+    /// Enables or disables terrain distance fog. Off via `JBM_NO_FOG=1`
+    /// (through `RenderSettings::from_env`); screenshot tests use this to
+    /// isolate geometry from fog. Fog never touches the sky pass, so the
+    /// sentinel hole tests keep working with it on: a hole still shows
+    /// the sentinel sky, while fogged terrain dissolves into the horizon
+    /// color.
     pub fn set_fog(&mut self, enabled: bool) {
-        self.fog = enabled;
+        self.settings.fog = enabled;
     }
 
-    /// Whether distance fog is on (task 2.9).
+    /// Whether distance fog is on.
     pub fn fog(&self) -> bool {
-        self.fog
+        self.settings.fog
     }
 
-    /// Enables or disables the level tint (task 2.10), the debug view
-    /// that multiplies every fragment by a fixed color per LOD level.
-    /// The app's F4 key toggles it; `JBM_LOD_TINT=1` starts it on.
-    /// Propagates to the terrain pass every frame like the fog flag.
+    /// Enables or disables the level tint, the debug view that
+    /// multiplies every fragment by a fixed color per LOD level. The
+    /// app's F4 key toggles it; `JBM_LOD_TINT=1` starts it on.
     pub fn set_lod_tint(&mut self, enabled: bool) {
-        self.lod_tint = enabled;
+        self.settings.lod_tint = enabled;
     }
 
-    /// Whether the level tint is on (task 2.10).
+    /// Whether the level tint is on.
     pub fn lod_tint(&self) -> bool {
-        self.lod_tint
+        self.settings.lod_tint
+    }
+
+    /// Sets the far-look view distances: the LOD0 ring radius and the
+    /// furthest ring radius, both in blocks. The LOD0 radius sets where
+    /// LOD0's textures fade into the flat average colors
+    /// (`FADE_START_FRACTION`..`FADE_END_FRACTION` of it, so both sides
+    /// of the LOD0/LOD1 border are flat); the furthest radius sets the
+    /// distance-fog window (`FOG_START_FRACTION`..`FOG_END_FRACTION` of
+    /// it, so the outermost ring's edge is never visible). Defaults match
+    /// the `ServerConfig` defaults; the game passes its own values.
+    pub fn set_view_distance(&mut self, lod0_ring_radius: f32, furthest_ring_radius: f32) {
+        self.settings.far_radii = [lod0_ring_radius, furthest_ring_radius];
     }
 
     /// Overrides the sky colors (horizon, zenith, ground haze; linear
@@ -440,11 +460,8 @@ impl Renderer {
         }
 
         if let Some(terrain) = frame.terrain {
-            // The fog on/off hook rides along each frame (task 2.9): the
-            // terrain pass bakes it into its per-frame uniform. The level
-            // tint flag (task 2.10) rides the same way.
-            terrain.set_fog(self.fog);
-            terrain.set_lod_tint(self.lod_tint);
+            // The frame settings (fog, level tint) ride along each draw:
+            // the terrain pass bakes them into its per-frame uniform.
             terrain.draw(
                 gpu,
                 &mut encoder,
@@ -452,6 +469,7 @@ impl Renderer {
                 frame.depth,
                 frame.camera,
                 &self.uniform_bind_group,
+                &self.settings,
             );
         }
 
