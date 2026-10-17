@@ -434,8 +434,12 @@ impl MeshBookkeeping {
         slot
     }
 
-    /// An empty mesh: entry kept, no allocation, no slot.
-    fn commit_empty(&mut self, key: CubeKey) {
+    /// An empty mesh: entry kept, no allocation, no slot. `drawn`/`mask`
+    /// carry the cube's coverage state over, exactly as a non-empty
+    /// re-mesh does: resetting them here once let a cube the coverage
+    /// rule had hidden draw again after an empty-then-non-empty re-mesh
+    /// (two levels drawing the same water, z-fighting).
+    fn commit_empty(&mut self, key: CubeKey, drawn: bool, mask: u8) {
         self.meshes.insert(
             key,
             CubeMesh {
@@ -444,8 +448,8 @@ impl MeshBookkeeping {
                 slot: None,
                 ranges: std::array::from_fn(|_| 0u32..0),
                 skirts: 0,
-                drawn: true,
-                mask: 0,
+                drawn,
+                mask,
             },
         );
     }
@@ -1614,7 +1618,11 @@ impl TerrainPass {
                 self.zero_meta_slot(gpu, slot);
                 self.book.free_meta_slot(slot);
             }
-            self.book.commit_empty(key);
+            self.book.commit_empty(
+                key,
+                released.drawn.unwrap_or(true),
+                released.mask.unwrap_or(0),
+            );
             return;
         }
         let len = output.faces.len() as u32;
@@ -2903,7 +2911,7 @@ mod tests {
                     book.free_meta_slot(slot);
                 }
                 if rng.next().is_multiple_of(8) {
-                    book.commit_empty(pos);
+                    book.commit_empty(pos, true, 0);
                     live.swap_remove(i);
                 } else {
                     let ranges = random_ranges(&mut rng);
