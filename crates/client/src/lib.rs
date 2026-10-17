@@ -6,6 +6,7 @@ pub mod app;
 pub mod camera;
 pub mod edit;
 pub mod gpu;
+pub mod hud;
 pub mod input;
 pub mod lod;
 pub mod mesh;
