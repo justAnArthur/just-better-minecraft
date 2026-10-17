@@ -34,6 +34,7 @@ use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
 use jbm_client::render::terrain::{TerrainPass, TerrainPath};
 use jbm_client::render::texture_array::BlockTextures;
 use jbm_client::terrain_sync::TerrainSync;
+use jbm_client::testing::heightfield::{HeightGrid, layer_state};
 use jbm_client::testing::holes::{
     PinholeRule, assert_only_pinholes_with, component_details, describe_holes, sentinel_components,
 };
@@ -81,67 +82,17 @@ fn block_span() -> (Range<i64>, Range<i64>) {
     (-reach..reach, -reach..reach)
 }
 
-/// Precomputed heights over the scene's block span.
-struct HeightGrid {
-    min_x: i64,
-    min_z: i64,
-    stride: usize,
-    heights: Vec<i16>,
+/// Precomputed heights over the scene's block span (the shared
+/// heightfield grid at per-block stride; this scene has no sand).
+fn height_grid() -> HeightGrid {
+    let (xs, zs) = block_span();
+    HeightGrid::build(xs, zs, 1, height_at)
 }
 
-impl HeightGrid {
-    fn build() -> HeightGrid {
-        let (xs, zs) = block_span();
-        let stride = (zs.end - zs.start) as usize;
-        let mut heights = Vec::with_capacity((xs.end - xs.start) as usize * stride);
-        for x in xs.clone() {
-            for z in zs.clone() {
-                heights.push(height_at(x, z) as i16);
-            }
-        }
-        HeightGrid {
-            min_x: xs.start,
-            min_z: zs.start,
-            stride,
-            heights,
-        }
-    }
-
-    fn at(&self, x: i64, z: i64) -> i64 {
-        let index = ((x - self.min_x) as usize) * self.stride + (z - self.min_z) as usize;
-        i64::from(self.heights[index])
-    }
-
-    /// The solid-leaning level-`level` sample of the heightfield for the
-    /// cell with block corner `(x, y, z)` (all multiples of the cell
-    /// size): filled when the terrain pokes above the cell's top
-    /// anywhere in its footprint. The max runs over the 3x3 grid at half
-    /// the cell step — the corner points of the four child-level cells —
-    /// so a coarser sample can never sit below the finer level's sample
-    /// it replaces (that ordering is what keeps level seams skirt- and
-    /// gap-free: the coarse surface hangs over or meets the fine one).
-    fn cell_filled(&self, x: i64, y: i64, z: i64, level: u8) -> bool {
-        let step = (1i64 << level).max(2);
-        let half = step / 2;
-        let mut max_height = i64::MIN;
-        for i in 0..3 {
-            for j in 0..3 {
-                max_height = max_height.max(self.at(x + i * half, z + j * half));
-            }
-        }
-        y < max_height
-    }
-}
-
-/// Layering for the scene: grass on top, dirt below, stone at depth.
+/// Layering for the scene: grass on top, dirt below, stone at depth (no
+/// sand in this synthetic scene).
 fn scene_state(blocks: &Blocks, y: i64, surface: i64) -> BlockStateId {
-    if y == surface {
-        blocks.grass_block
-    } else if y >= surface - 3 {
-        blocks.dirt
-    } else {
-        blocks.stone
-    }
+    layer_state(blocks, y, surface, None)
 }
 
 /// The exact level-0 cube at `pos`.
@@ -167,10 +118,10 @@ fn sampled_cube(grid: &HeightGrid, blocks: &Blocks, pos: CubePos, level: u8) -> 
         let x = base_x + i64::from(local.x) * cell_blocks;
         let y = base_y + i64::from(local.y) * cell_blocks;
         let z = base_z + i64::from(local.z) * cell_blocks;
-        if grid.cell_filled(x, y, z, level) {
+        if y < grid.max_over_cell(x, z, level) {
             // Material: grass at the topmost filled cell of the column,
             // sampled at the cell's corner.
-            let above_filled = grid.cell_filled(x, y + cell_blocks, z, level);
+            let above_filled = y + cell_blocks < grid.max_over_cell(x, z, level);
             if above_filled {
                 blocks.stone
             } else {
@@ -221,7 +172,7 @@ fn build_scene() -> (ClientWorld, BlockAppearance, Blocks) {
     let mut registry = BlockRegistry::new();
     let blocks = Blocks::register(&mut registry);
     let appearance = BlockAppearance::new(&registry);
-    let grid = HeightGrid::build();
+    let grid = height_grid();
 
     let mut world = ClientWorld::new();
 
@@ -664,7 +615,7 @@ fn lod0_lod1_border_is_invisible_with_flat_colors() {
     renderer.set_view_distance(64.0, 1.0e9);
     renderer.set_fog(false);
 
-    let grid = HeightGrid::build();
+    let grid = height_grid();
     for name in ["zoom_border01", "down_border01"] {
         let (_, camera, _) = cameras()
             .into_iter()

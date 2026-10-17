@@ -116,6 +116,14 @@ coordinates and cfg-gated off under the crate's own `cube16` passthrough;
   with `render_with_sky(gpu, camera, sky) -> RgbaImage` (sky-color
   override for this frame only) and `read_depth(gpu)`. Tests keep only
   their protocol state and drive a `TerrainSync` against `rig.terrain`.
+- `testing::heightfield` (same gate) — the heightfield-to-cube scene
+  fixtures shared by the rings test and the game's rings/cube-size
+  benches: `HeightGrid::build(xs, zs, step, height)` (a cached height
+  grid over a block span), `max_over_cell(x, z, level)` (the
+  solid-leaning coarse sample; a cell at `y` is filled iff
+  `y < max_over_cell`) and `layer_state(blocks, y, surface,
+  sand_level)` (grass/dirt/stone, sand below the sea level a caller
+  passes, `None` for no sand; air stays the caller's case).
 
 ## Invariants
 

@@ -21,6 +21,7 @@ use glam::DVec3;
 use jbm_client::camera::Camera;
 use jbm_client::lod::CubeKey;
 use jbm_client::mesh::{self, MeshInput, neighbor_index};
+use jbm_client::testing::heightfield::{HeightGrid, layer_state};
 use jbm_core::block::BlockStateId;
 use jbm_core::block::builtin::Blocks;
 use jbm_core::coords::{CUBE_SIZE, CubePos, LocalPos};
@@ -35,73 +36,22 @@ const RING_RADIUS: i64 = 8;
 /// (default `lod_vertical_radius`).
 const RING_VERTICAL: i64 = 3;
 
-/// A cached height grid over a block span, sampled every `stride`
-/// blocks (heights are read at stride multiples only).
-struct HeightGrid {
-    min: i64,
-    stride: i64,
-    side: usize,
-    heights: Vec<i16>,
-}
+/// The bench grid's sand level, mirrored from the generator's surface
+/// stage.
+const SAND_LEVEL: i64 = 61;
 
-impl HeightGrid {
-    fn build(generator: &Generator, min: i64, max: i64, stride: i64) -> HeightGrid {
-        let side = ((max - min) / stride + 1) as usize;
-        let mut heights = Vec::with_capacity(side * side);
-        for i in 0..side as i64 {
-            for j in 0..side as i64 {
-                heights.push(generator.surface_height(min + i * stride, min + j * stride) as i16);
-            }
-        }
-        HeightGrid {
-            min,
-            stride,
-            side,
-            heights,
-        }
-    }
-
-    /// The height at `(x, z)`, which must be a stride multiple in span.
-    fn at(&self, x: i64, z: i64) -> i64 {
-        let i = ((x - self.min) / self.stride) as usize;
-        let j = ((z - self.min) / self.stride) as usize;
-        i64::from(self.heights[i * self.side + j])
-    }
-
-    /// The solid-leaning level-`level` sample: filled when the terrain
-    /// pokes above the cell's top anywhere in its footprint. The max
-    /// runs over the 3x3 grid at half the cell step — the corner points
-    /// of the four child-level cells — so a coarser sample never sits
-    /// below the finer level's sample it replaces (that ordering keeps
-    /// level seams skirt- and gap-free).
-    fn max_over_cell(&self, x: i64, z: i64, level: u8) -> i64 {
-        let half = (1i64 << level) / 2;
-        let mut best = i64::MIN;
-        for i in 0..3 {
-            for j in 0..3 {
-                best = best.max(self.at(x + i * half, z + j * half));
-            }
-        }
-        best
-    }
+/// A cached grid over `min..=max` (inclusive), sampled every `stride`
+/// blocks — the shared heightfield grid over an exactly-covering span.
+fn build_grid(generator: &Generator, min: i64, max: i64, stride: i64) -> HeightGrid {
+    HeightGrid::build(min..max + stride, min..max + stride, stride, |x, z| {
+        generator.surface_height(x, z)
+    })
 }
 
 /// Layering mirrored from the generator's surface stage (grass / dirt
 /// / stone by depth, sand near sea level).
 fn scene_state(blocks: &Blocks, y: i64, surface: i64) -> BlockStateId {
-    if surface <= 61 {
-        if y >= surface - 3 {
-            blocks.sand
-        } else {
-            blocks.stone
-        }
-    } else if y == surface {
-        blocks.grass_block
-    } else if y >= surface - 3 {
-        blocks.dirt
-    } else {
-        blocks.stone
-    }
+    layer_state(blocks, y, surface, Some(SAND_LEVEL))
 }
 
 /// The rings scene: every cube pre-meshed, keyed for upload, plus a
@@ -150,16 +100,16 @@ impl RingsScene {
         // level-1 ring's children span ~ +-17 level-0 cubes around the
         // center cube).
         let block_span = (RING_RADIUS * 2 + 4) * i64::from(CUBE_SIZE) * 2;
-        let fine = HeightGrid::build(generator, -block_span, block_span, 1);
+        let fine = build_grid(generator, -block_span, block_span, 1);
 
         // Grid 2: heights over the middle rings (levels 2 and 3 sample at
         // multiples of 2 blocks), and grid 3 over the far rings (levels 4
         // and 5 sample at multiples of 8 — level 5's disk reaches
         // ±(8+2)·32·32 blocks, where a stride-2 grid would be ~200 MB).
         let mid_span = (RING_RADIUS + 2) * i64::from(CUBE_SIZE) * 8;
-        let coarse = HeightGrid::build(generator, -mid_span, mid_span, 2);
+        let coarse = build_grid(generator, -mid_span, mid_span, 2);
         let far_span = (RING_RADIUS + 2) * i64::from(CUBE_SIZE) * 32;
-        let far = HeightGrid::build(generator, -far_span, far_span, 8);
+        let far = build_grid(generator, -far_span, far_span, 8);
 
         // Level 0 cubes: exact cubes wherever the LOD0 ring and the
         // level-1 downsampling need them.
