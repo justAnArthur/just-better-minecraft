@@ -25,9 +25,9 @@ the new `Overworld`, as the real-flight check.
 
 **Far-look wiring (task 2.9):** `main` derives a
 `jbm_client::app::ViewSetup` from its `ServerConfig` before the config
-moves into the server — the LOD0 ring radius (`view_radius ·
-CUBE_SIZE`) and the furthest ring radius (`lod_view_radius · CUBE_SIZE
-· 2^lod_levels`) — and runs the client with `app::run_with_view`. The
+moves into the server, via `ServerConfig::ring_radii()` (the LOD0 ring
+radius and the furthest ring radius, in blocks), and runs the client
+with `app::run_with_view`. The
 client cannot learn these from the link; its terrain pass scales the
 texture→flat fade and the distance-fog windows on them (see the client
 README, "The far look").
