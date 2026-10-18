@@ -12,7 +12,8 @@ use jbm_core::protocol::ServerMsg;
 
 use super::config::ServerConfig;
 use super::stream_plan::{
-    desired_offsets_surface, extra_dy_keeps, in_keep, level_center, lod_walk_surface, offset_pos,
+    column_extra_dys, desired_offsets_surface, in_keep, level_center, lod_walk_surface, offset_pos,
+    span_dy_keeps,
 };
 use super::{ConnectionState, Player, Server, cube_containing};
 use crate::gen_pool::GenPool;
@@ -38,10 +39,21 @@ impl Server {
     pub fn set_view_radius(&mut self, view_radius: u32, lod_view_radius: u32) {
         self.config.view_radius = view_radius.clamp(2, 32);
         self.config.lod_view_radius = lod_view_radius.clamp(2, 16);
-        let (r, v, cap) = (
+        // Task 2.13 E's floor, live: keep L1 beyond the LOD0 disk (the
+        // same clamp and warning ServerConfig::clamped prints).
+        let min = ServerConfig::min_lod_view_radius(self.config.view_radius);
+        if self.config.lod_view_radius < min {
+            eprintln!(
+                "jbm: lod_view_radius {} would leave L1 inside LOD0 (view_radius {}); using {min}",
+                self.config.lod_view_radius, self.config.view_radius
+            );
+            self.config.lod_view_radius = min;
+        }
+        let (r, v, cap, window_r) = (
             self.config.view_radius,
             self.config.vertical_radius,
             self.config.max_column_cubes,
+            self.config.camera_window_radius,
         );
         let (lod_r, lod_v) = (self.config.lod_view_radius, self.config.lod_vertical_radius);
         for conn in &mut self.connections {
@@ -55,7 +67,7 @@ impl Server {
                 .sent
                 .iter()
                 .copied()
-                .filter(|&pos| !lod0_keeps(&self.spans, pos, center, r, v, cap))
+                .filter(|&pos| !lod0_keeps(&self.spans, pos, center, r, v, cap, window_r))
                 .collect();
             for pos in to_unload {
                 player.sent.remove(&pos);
@@ -77,7 +89,16 @@ impl Server {
                     .iter()
                     .copied()
                     .filter(|&pos| {
-                        !lod_level_keeps(&self.spans, level, pos, center, lod_r, lod_v, cap)
+                        !lod_level_keeps(
+                            &self.spans,
+                            level,
+                            pos,
+                            center,
+                            lod_r,
+                            lod_v,
+                            cap,
+                            window_r,
+                        )
                     })
                     .collect();
                 for pos in to_unload {
@@ -245,11 +266,12 @@ impl Server {
         if eviction_dirty {
             let (r, v) = (self.config.view_radius, self.config.vertical_radius);
             let cap = self.config.max_column_cubes;
-            let centers: Vec<CubePos> = self
-                .connections
-                .iter()
-                .filter_map(|conn| conn.joined_player().map(|player| player.center))
-                .collect();
+            let mut centers: Vec<CubePos> = Vec::new();
+            let mut sent_sets: Vec<&std::collections::HashSet<CubePos>> = Vec::new();
+            for player in self.connections.iter().filter_map(|c| c.joined_player()) {
+                centers.push(player.center);
+                sent_sets.push(&player.sent);
+            }
             let spans = &self.spans;
             let Server {
                 world,
@@ -265,11 +287,20 @@ impl Server {
                     .is_some_and(|edit| edit.version > edit.saved_version),
                 None => pinned.contains(pos),
             };
+            let window_r = self.config.camera_window_radius;
             world.retain(|pos, _| {
                 is_pinned(pos)
                     || centers
                         .iter()
-                        .any(|&c| lod0_keeps(spans, *pos, c, r, v, cap))
+                        .any(|&c| lod0_keeps(spans, *pos, c, r, v, cap, window_r))
+                    // A cube a player was sent stays until the unload pass
+                    // hands it back: dropping it here would strand the
+                    // client's copy (and the walk skips sent cubes, so it
+                    // would never re-stream). Task 2.13 D's far-column
+                    // spans made this reachable — a window cube sent while
+                    // its column was near can leave the span-only keep band
+                    // between center moves.
+                    || sent_sets.iter().any(|sent| sent.contains(pos))
             });
             // Evicted cubes take their edit bookkeeping with them: their
             // committed edits are on disk, and a reload starts fresh.
@@ -279,10 +310,12 @@ impl Server {
     }
 }
 
-/// Is `pos` in a player's LOD0 keep set? The camera keep (radii +1, as
-/// before) plus, for a column of the keep ring, the span extras trimmed
-/// one looser than the desired set — the same hysteresis in window and
-/// cap the radii get.
+/// Is `pos` in a player's LOD0 keep set (task 2.13 D)? The camera window
+/// (radii +1, as before) applies only within `window_r` cubes
+/// horizontally; every column of the keep ring instead keeps its surface
+/// span trimmed one looser than the desired cap. The band between
+/// `window_r` and `window_r + 1` keeps both shapes, so a player walking
+/// along the boundary never flaps cubes in and out.
 fn lod0_keeps(
     spans: &SurfaceSpans,
     pos: CubePos,
@@ -290,8 +323,9 @@ fn lod0_keeps(
     r: u32,
     v: u32,
     cap: usize,
+    window_r: u32,
 ) -> bool {
-    if in_keep(pos, center, r, v) {
+    if in_keep(pos, center, window_r.min(r), v) {
         return true;
     }
     let dx = i64::from(pos.x - center.x);
@@ -301,19 +335,23 @@ fn lod0_keeps(
         return false;
     }
     let span = spans.lod0(pos.x, pos.z);
-    extra_dy_keeps(
+    span_dy_keeps(
         span,
         i64::from(jbm_core::coords::CUBE_SIZE),
         i64::from(center.y),
-        v + 1,
         cap + 1,
         pos.y - center.y,
     )
 }
 
-/// The level-`level` form of [`lod0_keeps`] for ring cubes: level 1
-/// unions its span, coarser levels are camera-keep only (their default
-/// window already covers the shipped relief; see `lod_walk_surface`).
+/// The level-`level` form of [`lod0_keeps`] for ring cubes (task 2.13 D):
+/// level 1's camera window applies only within `window_r` and its far
+/// columns keep their sampled span; coarser levels are camera-keep only
+/// (their default window already covers the shipped relief; see
+/// `lod_walk_surface`).
+// The eight parameters are one keep test's context; a bundling struct
+// would only be unpacked again here.
+#[allow(clippy::too_many_arguments)]
 fn lod_level_keeps(
     spans: &SurfaceSpans,
     level: u8,
@@ -322,6 +360,7 @@ fn lod_level_keeps(
     r: u32,
     v: u32,
     cap: usize,
+    window_r: u32,
 ) -> bool {
     if in_keep(pos, center, r, v) {
         return true;
@@ -336,11 +375,21 @@ fn lod_level_keeps(
         return false;
     }
     let span = spans.l1(pos.x, pos.z);
-    extra_dy_keeps(
+    if dx * dx + dz * dz <= i64::from(window_r) * i64::from(window_r) {
+        // Near column: also keep the span extras beyond the window.
+        let side = i64::from(jbm_core::coords::CUBE_SIZE) * 2;
+        let center_y = i64::from(center.y);
+        for dy in column_extra_dys(span, side, center_y, v + 1, cap + 1) {
+            if dy == pos.y - center.y {
+                return true;
+            }
+        }
+        return false;
+    }
+    span_dy_keeps(
         span,
         i64::from(jbm_core::coords::CUBE_SIZE) * 2,
         i64::from(center.y),
-        v + 1,
         cap + 1,
         pos.y - center.y,
     )
@@ -368,6 +417,7 @@ fn stream_player(
     let center = cube_containing(player.state.position);
     let (r, v) = (config.view_radius, config.vertical_radius);
     let cap = config.max_column_cubes;
+    let window_r = config.camera_window_radius;
 
     if center != player.center {
         player.center = center;
@@ -385,7 +435,7 @@ fn stream_player(
             .sent
             .iter()
             .copied()
-            .filter(|&pos| !lod0_keeps(spans, pos, center, r, v, cap))
+            .filter(|&pos| !lod0_keeps(spans, pos, center, r, v, cap, window_r))
             .collect();
         for pos in to_unload {
             player.sent.remove(&pos);
@@ -404,9 +454,10 @@ fn stream_player(
         if player.desired.is_empty() {
             spans.ensure_around((center.x, center.z), r, config.lod_levels);
         }
-        player.desired = desired_offsets_surface(r, v, cap, i64::from(center.y), |dx, dz| {
-            spans.lod0(center.x + dx, center.z + dz)
-        });
+        player.desired =
+            desired_offsets_surface(r, v, cap, i64::from(center.y), window_r, |dx, dz| {
+                spans.lod0(center.x + dx, center.z + dz)
+            });
         player.desired_version = spans.version();
         player.cursor = 0;
     }
@@ -485,6 +536,7 @@ fn stream_player_lod(
     let lod0_center = cube_containing(player.state.position);
     let (r, v) = (config.lod_view_radius, config.lod_vertical_radius);
     let cap = config.max_column_cubes;
+    let window_r = config.camera_window_radius;
 
     // 1. Level centers: unload what left that level's keep set (the
     //    desired shape at +1 in both radii, level-1 surface spans
@@ -501,7 +553,7 @@ fn stream_player_lod(
             .sent
             .iter()
             .copied()
-            .filter(|&pos| !lod_level_keeps(spans, level, pos, center, r, v, cap))
+            .filter(|&pos| !lod_level_keeps(spans, level, pos, center, r, v, cap, window_r))
             .collect();
         for pos in to_unload {
             level_state.sent.remove(&pos);
@@ -565,6 +617,7 @@ fn stream_player_lod(
             v,
             cap,
             l1_center.map_or(0, |c| i64::from(c.y)),
+            window_r,
             |dx, dz| l1_center.and_then(|c| spans.l1(c.x + dx, c.z + dz)),
         );
         player.lod_walk_version = spans.version();

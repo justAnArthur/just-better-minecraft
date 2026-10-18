@@ -22,9 +22,7 @@ use jbm_core::coords::CUBE_SIZE;
 
 use crate::mesh::appearance::BlockAppearance;
 use crate::mesh::face::{DIRECTIONS, Direction, FaceFields, pack};
-use crate::mesh::input::{
-    F_AIR, F_OPAQUE_AO, F_OPAQUE_CULL, FLAGS_SHIFT, ORIGIN, PAD, PAD_Y, PAD_Z,
-};
+use crate::mesh::input::{F_AIR, F_OPAQUE_AO, F_OPAQUE_CULL, FLAGS_SHIFT, ORIGIN, PAD_Y, PAD_Z};
 use crate::mesh::seams::{LID_KEY_BIT, SKIRT_KEY_BIT, lid, skirt};
 
 use crate::mesh::input::MeshOutput;
@@ -39,7 +37,48 @@ pub(crate) fn stride(axis: [i32; 3]) -> isize {
 /// identical (layer, AO, light) into maximal rectangles. At level >= 1,
 /// rectangles never cross an octant plane (see the module docs) and faces
 /// covered by the skirt or lid rules are emitted with their key bit set.
-pub(crate) fn mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u8) -> MeshOutput {
+pub fn mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u8) -> MeshOutput {
+    sweep(pad, appearance, level, u32::MAX)
+}
+
+/// [`mesh_padded`] with merge-key bits masked out: every face key is
+/// ANDed with `key_keep` before merging, so dropping the AO byte or the
+/// layer field lets quads merge across them. Test-only measurement hook
+/// (task 2.13 A's quad-split study); the packed layer/AO fields of the
+/// result are garbage — only the face count is meaningful.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn sweep_key_masked(
+    pad: &[u32],
+    appearance: &BlockAppearance,
+    level: u8,
+    key_keep: u32,
+) -> MeshOutput {
+    sweep(pad, appearance, level, key_keep)
+}
+
+/// The mask of merge-key bits the AO byte occupies (bits 7..15).
+#[cfg(any(test, feature = "testing"))]
+pub(crate) const KEY_AO_BITS: u32 = 0xFF << 7;
+/// The mask of merge-key bits the texture layer occupies (bits 15..30,
+/// below the skirt bit).
+#[cfg(any(test, feature = "testing"))]
+pub(crate) const KEY_LAYER_BITS: u32 = 0x7FFF << 15;
+
+/// The bitmask sweep (task 2.13 B). Instead of a per-cell key pass over
+/// every slice, three walks over the padded array (one per axis) first
+/// build the **boundary planes**: for each of the six directions, per
+/// slice `k` and row `vi`, a `u32` of the u-cells whose A/B pair differs
+/// — the only cells that can ever be visible (equal pairs are culled, and
+/// so are air-A and opaque-B pairs, both tested per candidate). The sweep
+/// then walks the set bits only, and the greedy merge runs over the set
+/// bits of the key mask. A volume too noisy for that to pay off (the
+/// pair-density along an axis rises above half — a checkerboard) is
+/// detected while the planes are built; that axis's two directions sweep
+/// every slice cell by cell instead, exactly like the reference. The
+/// output — the same `PackedFace` list, order included, at every level —
+/// is pinned bit for bit against `oracle::reference_mesh_padded`, the
+/// verbatim pre-2.13 sweep.
+fn sweep(pad: &[u32], appearance: &BlockAppearance, level: u8, key_keep: u32) -> MeshOutput {
     let mut output = MeshOutput {
         faces: Vec::new(),
         ranges: std::array::from_fn(|_| 0u32..0),
@@ -48,7 +87,17 @@ pub(crate) fn mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u8) 
     };
     let size = CUBE_SIZE as usize;
     let half = size / 2;
+    let last = size - 1;
     let mut mask = [0u32; MASK_LEN];
+    let mut bits = [0u32; CUBE_SIZE as usize];
+
+    // The boundary planes, `[direction][k][vi]` with bit ui in that
+    // direction's own mask layout (the u axis of a negative-stride
+    // direction walks the world axis backwards, so its bits are mirrored
+    // — each walk sets both directions' bits at once). `dense` marks the
+    // axes whose walk aborted (see `build_differ_planes`).
+    let mut differ = [[[0u32; CUBE_SIZE as usize]; CUBE_SIZE as usize]; 6];
+    let dense = build_differ_planes(pad, &mut differ);
 
     for (dir_index, &direction) in DIRECTIONS.iter().enumerate() {
         let n = stride(direction.normal());
@@ -60,9 +109,9 @@ pub(crate) fn mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u8) 
         // Walk u and v from the block corner where both strides are
         // positive, so negative-stride axes still cover blocks
         // 0..CUBE_SIZE - 1.
-        let last = CUBE_SIZE as isize - 1;
-        let u_shift = if u < 0 { -last * u } else { 0 };
-        let v_shift = if v < 0 { -last * v } else { 0 };
+        let last_i = CUBE_SIZE as isize - 1;
+        let u_shift = if u < 0 { -last_i * u } else { 0 };
+        let v_shift = if v < 0 { -last_i * v } else { 0 };
         let corner = ORIGIN as isize + u_shift + v_shift;
 
         // layer-of-kind lookup for this direction (kind = state id + 1).
@@ -75,111 +124,210 @@ pub(crate) fn mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u8) 
             direction,
             Direction::PosX | Direction::NegX | Direction::PosZ | Direction::NegZ
         );
+        // A dense axis never got its planes: both of its directions take
+        // the per-cell pass on every slice.
+        let dense_dir = match direction {
+            Direction::PosX | Direction::NegX => dense[0],
+            Direction::PosY | Direction::NegY => dense[1],
+            Direction::PosZ | Direction::NegZ => dense[2],
+        };
+        // The mask (u0, v0) cell of slice k is the A cell at cube
+        // coordinates `cell_of(k, v0, u0)` — an affine map, because the
+        // u/v/n frames are signed unit axes (the module docs). Decoding
+        // the owner's padded index back through % and / gives the same
+        // numbers; this spells them out per direction.
+        let cell_of = |k: u32, v0: u32, u0: u32| -> (u32, u32, u32) {
+            match direction {
+                Direction::PosX => (k, v0, last as u32 - u0),
+                Direction::NegX => (k, v0, u0),
+                Direction::PosY => (v0, k, u0),
+                Direction::NegY => (u0, k, v0),
+                Direction::PosZ => (u0, v0, k),
+                Direction::NegZ => (last as u32 - u0, v0, k),
+            }
+        };
 
         let start = output.faces.len() as u32;
-        for k in 0..CUBE_SIZE as isize {
-            let a_row = corner + k * n_axis;
-            let b_row = a_row + n;
+        for (k, plane) in differ[dir_index].iter().enumerate() {
+            let a_row = corner + k as isize * n_axis;
+            // Seam rules only exist at level >= 1 and only on the slices
+            // the boundary condition can hold (the slice axis IS the
+            // boundary axis; `skirt`'s octant/cube planes per direction —
+            // the negative directions boundary at 0 and half, the
+            // positive ones at half-1 and size-1). Those slices — and
+            // every slice of a dense direction — take the full per-cell
+            // pass: the seam rules read culled cells too, and a dense
+            // volume's planes cost more than the cells they skip.
+            let seam_slice = level > 0
+                && match direction {
+                    Direction::PosX | Direction::PosY | Direction::PosZ => {
+                        k == half - 1 || k == size - 1
+                    }
+                    Direction::NegX | Direction::NegZ => k == 0 || k == half,
+                    Direction::NegY => false,
+                };
+            let full_pass = seam_slice || dense_dir;
 
-            // Build the mask of face keys for this slice.
-            for vi in 0..CUBE_SIZE as isize {
-                for ui in 0..CUBE_SIZE as isize {
-                    let a_index = (a_row + ui * u + vi * v) as usize;
-                    let b_index = (b_row + ui * u + vi * v) as usize;
-                    let a = pad[a_index];
-                    let b = pad[b_index];
-                    let a_air = a & (F_AIR << FLAGS_SHIFT) != 0;
-                    let b_cull = b & (F_OPAQUE_CULL << FLAGS_SHIFT) != 0;
-                    // Same state on both sides culls: opaque blocks via
-                    // b_cull, and non-opaque ones too — water, glass and
-                    // cutout leaves draw no faces between equal neighbors
-                    // (an ocean once emitted every internal water face).
-                    let culled = a_air || b_cull || a == b;
-                    let key = if culled {
-                        if level > 0 && side && !a_air && b_cull && skirt(pad, a_index, direction) {
-                            (1 << 31)
-                                | SKIRT_KEY_BIT
-                                | (u32::from(layer_of_kind[(a & 0xFFFF) as usize]) << 15)
-                                | (corner_ao(pad, b_index as isize, u, v) << 7)
-                                | LIGHT
-                        } else if level > 0
-                            && direction == Direction::PosY
-                            && !a_air
-                            && b_cull
-                            && lid(a_index)
-                        {
-                            (1 << 31)
-                                | LID_KEY_BIT
-                                | (u32::from(layer_of_kind[(a & 0xFFFF) as usize]) << 15)
-                                | (corner_ao(pad, b_index as isize, u, v) << 7)
-                                | LIGHT
+            // Build the slice's visibility bits and keys. `mask` is all
+            // zero here: the previous slice's merge consumed (and zeroed)
+            // every key it found, so rows without candidates need no
+            // clearing.
+            let mut row_seeds = 0u32;
+            for vi in 0..size {
+                let a_base = a_row + vi as isize * v;
+                if full_pass {
+                    // The full per-cell pass, culled branch included: the
+                    // seam rules read culled cells too. Off the seam
+                    // slices (a dense direction's ordinary slices) the
+                    // rules cannot fire — `skirt`/`lid` are position-
+                    // gated — so this equals the reference sweep.
+                    let mut row_bits = 0u32;
+                    let mut a_i = a_base;
+                    for ui in 0..size {
+                        let b_i = a_i + n;
+                        let a = pad[a_i as usize];
+                        let b = pad[b_i as usize];
+                        let a_air = a & (F_AIR << FLAGS_SHIFT) != 0;
+                        let b_cull = b & (F_OPAQUE_CULL << FLAGS_SHIFT) != 0;
+                        // Same state on both sides culls: opaque blocks
+                        // via b_cull, and non-opaque ones too — water,
+                        // glass and cutout leaves draw no faces between
+                        // equal neighbors (an ocean once emitted every
+                        // internal water face).
+                        let culled = a_air || b_cull || a == b;
+                        let key = if culled {
+                            if level > 0
+                                && side
+                                && !a_air
+                                && b_cull
+                                && skirt(pad, a_i as usize, direction)
+                            {
+                                (1 << 31)
+                                    | SKIRT_KEY_BIT
+                                    | (u32::from(layer_of_kind[(a & 0xFFFF) as usize]) << 15)
+                                    | (corner_ao(pad, b_i, u, v) << 7)
+                                    | LIGHT
+                            } else if level > 0
+                                && direction == Direction::PosY
+                                && !a_air
+                                && b_cull
+                                && lid(a_i as usize)
+                            {
+                                (1 << 31)
+                                    | LID_KEY_BIT
+                                    | (u32::from(layer_of_kind[(a & 0xFFFF) as usize]) << 15)
+                                    | (corner_ao(pad, b_i, u, v) << 7)
+                                    | LIGHT
+                            } else {
+                                0
+                            }
                         } else {
-                            0
+                            let layer = u32::from(layer_of_kind[(a & 0xFFFF) as usize]);
+                            let ao = corner_ao(pad, b_i, u, v);
+                            (1 << 31) | (layer << 15) | (ao << 7) | LIGHT
+                        };
+                        if key != 0 {
+                            mask[vi * size + ui] = key & key_keep;
+                            row_bits |= 1 << ui;
                         }
-                    } else {
+                        a_i += u;
+                    }
+                    bits[vi] = row_bits;
+                    row_seeds |= row_bits;
+                } else {
+                    // Candidates only: the boundary plane's set bits. A
+                    // differing pair is visible unless A is air or B culls
+                    // (equal pairs never made it here).
+                    let mut candidates = plane[vi];
+                    let mut row_bits = 0u32;
+                    while candidates != 0 {
+                        let ui = candidates.trailing_zeros() as usize;
+                        candidates &= candidates - 1;
+                        let a_i = a_base + ui as isize * u;
+                        let b_i = a_i + n;
+                        let a = pad[a_i as usize];
+                        let b = pad[b_i as usize];
+                        if a & (F_AIR << FLAGS_SHIFT) != 0
+                            || b & (F_OPAQUE_CULL << FLAGS_SHIFT) != 0
+                        {
+                            continue;
+                        }
                         let layer = u32::from(layer_of_kind[(a & 0xFFFF) as usize]);
-                        let ao = corner_ao(pad, b_index as isize, u, v);
-                        (1 << 31) | (layer << 15) | (ao << 7) | LIGHT
-                    };
-                    mask[(vi * CUBE_SIZE as isize + ui) as usize] = key;
+                        let ao = corner_ao(pad, b_i, u, v);
+                        let key = (1 << 31) | (layer << 15) | (ao << 7) | LIGHT;
+                        mask[vi * size + ui] = key & key_keep;
+                        row_bits |= 1 << ui;
+                    }
+                    bits[vi] = row_bits;
+                    row_seeds |= row_bits;
                 }
             }
 
-            // Greedy merge: extend along u first, then along v. At
-            // level >= 1 the extents stop at the octant plane (mask
-            // indices [0, half) and [half, size) are the two world halves
-            // whatever the stride signs — see the module docs).
-            for v0 in 0..size {
-                for u0 in 0..size {
-                    let key = mask[v0 * size + u0];
-                    if key == 0 {
-                        continue;
-                    }
-                    let u_limit = if level > 0 && u0 < half { half } else { size };
-                    let mut w = 1usize;
-                    while u0 + w < u_limit && mask[v0 * size + u0 + w] == key {
-                        w += 1;
-                    }
-                    let v_limit = if level > 0 && v0 < half { half } else { size };
-                    let mut h = 1usize;
-                    'extend: while v0 + h < v_limit {
-                        let row = (v0 + h) * size;
-                        for ui in u0..u0 + w {
-                            if mask[row + ui] != key {
-                                break 'extend;
+            // Greedy merge over the set bits only: extend along u first,
+            // then along v. At level >= 1 the extents stop at the octant
+            // plane (mask indices [0, half) and [half, size) are the two
+            // world halves whatever the stride signs — see the module
+            // docs). Seeds walk (v0, u0) ascending exactly like the
+            // reference's double loop; a consumed cell's bit may still be
+            // set, so the mask is re-checked.
+            if row_seeds != 0 {
+                output
+                    .faces
+                    .reserve(bits.iter().map(|b| b.count_ones() as usize).sum());
+                for v0 in 0..size {
+                    let mut row_bits = bits[v0];
+                    while row_bits != 0 {
+                        let u0 = row_bits.trailing_zeros() as usize;
+                        row_bits &= row_bits - 1;
+                        let key = mask[v0 * size + u0];
+                        if key == 0 {
+                            continue; // consumed by an earlier rectangle
+                        }
+                        let u_limit = if level > 0 && u0 < half { half } else { size };
+                        let mut w = 1usize;
+                        while u0 + w < u_limit && mask[v0 * size + u0 + w] == key {
+                            w += 1;
+                        }
+                        let v_limit = if level > 0 && v0 < half { half } else { size };
+                        let mut h = 1usize;
+                        'extend: while v0 + h < v_limit {
+                            let row = (v0 + h) * size;
+                            for ui in u0..u0 + w {
+                                if mask[row + ui] != key {
+                                    break 'extend;
+                                }
+                            }
+                            h += 1;
+                        }
+                        for vv in v0..v0 + h {
+                            for uu in u0..u0 + w {
+                                mask[vv * size + uu] = 0;
                             }
                         }
-                        h += 1;
-                    }
-                    for vv in v0..v0 + h {
-                        for uu in u0..u0 + w {
-                            mask[vv * size + uu] = 0;
-                        }
-                    }
 
-                    // Owner block: the mask corner (u0, v0) of this slice.
-                    let owner = (a_row + u0 as isize * u + v0 as isize * v) as usize;
-                    let x = (owner % PAD) as u32 - 1;
-                    let z = ((owner / PAD_Z) % PAD) as u32 - 1;
-                    let y = (owner / PAD_Y) as u32 - 1;
-                    let ao8 = (key >> 7) & 0xFF;
-                    output.faces.push(pack(&FaceFields {
-                        x,
-                        y,
-                        z,
-                        width: w as u32,
-                        height: h as u32,
-                        direction,
-                        // 15 bits: bit 30 of the key is SKIRT_KEY_BIT, not
-                        // part of the layer (reading 16 bits gave skirt faces
-                        // layer + 32768: the texture array clamped it, the
-                        // 2.9 per-layer color buffer read out of bounds).
-                        layer: (key >> 15) & LAYER_KEY_MASK,
-                        ao: [ao8 & 3, (ao8 >> 2) & 3, (ao8 >> 4) & 3, (ao8 >> 6) & 3],
-                        light: key & 0xF,
-                    }));
-                    output.skirts += u32::from(key & SKIRT_KEY_BIT != 0);
-                    output.lids += u32::from(key & LID_KEY_BIT != 0);
+                        // Owner block: the mask corner (u0, v0) of this
+                        // slice, decoded by the affine cell map.
+                        let (x, y, z) = cell_of(k as u32, v0 as u32, u0 as u32);
+                        let ao8 = (key >> 7) & 0xFF;
+                        output.faces.push(pack(&FaceFields {
+                            x,
+                            y,
+                            z,
+                            width: w as u32,
+                            height: h as u32,
+                            direction,
+                            // 15 bits: bit 30 of the key is SKIRT_KEY_BIT,
+                            // not part of the layer (reading 16 bits gave
+                            // skirt faces layer + 32768: the texture array
+                            // clamped it, the 2.9 per-layer color buffer
+                            // read out of bounds).
+                            layer: (key >> 15) & LAYER_KEY_MASK,
+                            ao: [ao8 & 3, (ao8 >> 2) & 3, (ao8 >> 4) & 3, (ao8 >> 6) & 3],
+                            light: key & 0xF,
+                        }));
+                        output.skirts += u32::from(key & SKIRT_KEY_BIT != 0);
+                        output.lids += u32::from(key & LID_KEY_BIT != 0);
+                    }
                 }
             }
         }
@@ -188,9 +336,195 @@ pub(crate) fn mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u8) 
     output
 }
 
+/// Pairs examined before the density abort may fire. Four rows' worth:
+/// enough that a locally noisy start cannot flip a sparse volume, few
+/// enough that a dense one wastes almost nothing.
+const DENSE_MIN_PAIRS: u32 = 128;
+
+/// Fills the boundary planes: one walk per axis over the padded array,
+/// comparing every consecutive cell pair along that axis (the pairs the
+/// two directions of the axis test) and setting, for each differing pair
+/// at slice `k`, the candidate bit in both directions' layouts — the
+/// positive-u direction's bit is the world-axis cell, the negative-u
+/// direction's is its mirror (its u axis walks the world axis backwards;
+/// see `cell_of`). Returns, per axis, whether the walk aborted as
+/// **dense**: once at least [`DENSE_MIN_PAIRS`] pairs have been examined,
+/// an axis whose differing pairs outnumber the equal ones stops building
+/// planes and its directions fall back to the per-cell sweep — on noise
+/// (a checkerboard: every pair differs) the planes cost more than the
+/// cell tests they could ever save, while terrain stays at a few percent
+/// and never trips this. Cube-size agnostic below 33 (a row must fit a
+/// u32).
+///
+/// Every row is folded first (`fold |= a ^ b`, branch-free and
+/// vectorizable) so uniform stretches — terrain interiors, uniform
+/// cubes — never reach the per-pair bit extraction, which is itself
+/// branchless: a mostly-uniform row with a few unpredictable boundaries
+/// would otherwise pay a mispredict per cell.
+// Each walk writes one differing pair into two differently-shaped plane
+// layouts at scattered indices; range loops spell that out best.
+#[allow(clippy::needless_range_loop)]
+fn build_differ_planes(
+    pad: &[u32],
+    differ: &mut [[[u32; CUBE_SIZE as usize]; CUBE_SIZE as usize]; 6],
+) -> [bool; 3] {
+    let size = CUBE_SIZE as usize;
+    let last = size - 1;
+    let mut dense = [false; 3];
+
+    // Pair j along an axis compares cube cells (j - 1, j); j = 0 touches
+    // the left shell and j = size the right one. A positive direction's
+    // slice k reads pair k + 1 (A = cube k, B = cube k + 1); a negative
+    // direction's reads pair k (B = cube k - 1, the shell at k = 0). The
+    // padded array is x-major, so every walk's pairs run as contiguous
+    // x rows.
+    //
+    // x axis: serves +X (vi = y, ui = last - z) and -X (vi = y, ui = z).
+    // A row's 33 pairs (shells included) read run[j] vs run[j + 1] from
+    // one contiguous 34-word run starting at the left shell. The shells
+    // are tested apart from the interior: on terrain the shells differ
+    // wherever the row is below the surface while the interior stays
+    // uniform, and a combined fold would push every such row through the
+    // per-pair pass for nothing.
+    let mut pairs = 0u32;
+    let mut diffs = 0u32;
+    'x: for y in 0..size {
+        for z in 0..size {
+            let run = &pad[ORIGIN + PAD_Y * y + PAD_Z * z - 1..][..size + 2];
+            let bit_posx = 1u32 << (last - z);
+            let bit_negx = 1u32 << z;
+            let mut d = 0u64; // 33 pairs need more than a u32
+            if run[0] != run[1] {
+                d |= 1; // left shell, pair j = 0
+            }
+            if run[size + 1] != run[size] {
+                d |= 1 << size; // right shell, pair j = size
+            }
+            let mut d_int = 0u64; // interior pairs j = 1..=size - 1
+            let mut fold = 0u32;
+            for t in 1..size {
+                fold |= run[t + 1] ^ run[t];
+            }
+            if fold != 0 {
+                for t in 1..size {
+                    if run[t + 1] != run[t] {
+                        d_int |= 1 << t;
+                    }
+                }
+            }
+            d |= d_int;
+            // Density counts the interior only: the shell rows of a
+            // boundary (a uniform cube facing air) are 100% dense by
+            // design, and two planes of them say nothing about the
+            // volume.
+            pairs += size as u32 - 1;
+            diffs += d_int.count_ones();
+            if pairs >= DENSE_MIN_PAIRS && diffs * 2 > pairs {
+                dense[0] = true;
+                break 'x;
+            }
+            while d != 0 {
+                let t = d.trailing_zeros() as usize;
+                d &= d - 1;
+                if t >= 1 {
+                    differ[0][t - 1][y] |= bit_posx;
+                }
+                if t < size {
+                    differ[1][t][y] |= bit_negx;
+                }
+            }
+        }
+    }
+    // y axis: serves +Y (vi = x, ui = z) and -Y (vi = z, ui = x). Cube
+    // (0, j, z) and its pair below, both contiguous in x. The -Y plane
+    // takes the row's differ pattern word-wise (its layout is [k][z]
+    // with bit x); the +Y plane is transposed, so its bits scatter.
+    let mut pairs = 0u32;
+    let mut diffs = 0u32;
+    'y: for j in 0..=size {
+        let interior_j = j >= 1 && j < size; // shell rows never count (above)
+        let plane = ORIGIN + j * PAD_Y;
+        for z in 0..size {
+            let top = plane + PAD_Z * z;
+            let below = top - PAD_Y;
+            let mut fold = 0u32;
+            for x in 0..size {
+                fold |= pad[top + x] ^ pad[below + x];
+            }
+            if fold == 0 {
+                continue;
+            }
+            let mut bits = 0u32;
+            for x in 0..size {
+                bits |= u32::from(pad[top + x] != pad[below + x]) << x;
+            }
+            if interior_j {
+                pairs += size as u32;
+                diffs += bits.count_ones();
+                if pairs >= DENSE_MIN_PAIRS && diffs * 2 > pairs {
+                    dense[1] = true;
+                    break 'y;
+                }
+            }
+            if j < size {
+                differ[3][j][z] = bits;
+            }
+            let bit_posy = 1u32 << z;
+            while bits != 0 {
+                let x = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if j >= 1 {
+                    differ[2][j - 1][x] |= bit_posy;
+                }
+            }
+        }
+    }
+    // z axis: serves +Z (vi = y, ui = x) and -Z (vi = y, ui = last - x).
+    // Cube (0, y, j) and its pair behind, both contiguous in x. The +Z
+    // plane takes the pattern word-wise, the -Z plane its bit-mirror.
+    let mut pairs = 0u32;
+    let mut diffs = 0u32;
+    'z: for j in 0..=size {
+        let interior_j = j >= 1 && j < size; // shell rows never count (above)
+        let plane = ORIGIN + j * PAD_Z;
+        for y in 0..size {
+            let top = plane + PAD_Y * y;
+            let below = top - PAD_Z;
+            let mut fold = 0u32;
+            for x in 0..size {
+                fold |= pad[top + x] ^ pad[below + x];
+            }
+            if fold == 0 {
+                continue;
+            }
+            let mut bits = 0u32;
+            for x in 0..size {
+                bits |= u32::from(pad[top + x] != pad[below + x]) << x;
+            }
+            if interior_j {
+                pairs += size as u32;
+                diffs += bits.count_ones();
+                if pairs >= DENSE_MIN_PAIRS && diffs * 2 > pairs {
+                    dense[2] = true;
+                    break 'z;
+                }
+            }
+            if j >= 1 {
+                differ[4][j - 1][y] = bits;
+            }
+            if j < size {
+                // Mirror bit x to bit last - x (reverse_bits alone only
+                // maps correctly at size 32).
+                differ[5][j][y] = bits.reverse_bits() >> (32 - size as u32);
+            }
+        }
+    }
+    dense
+}
+
 /// The texture layer field of a face key: bits 15..30, below
 /// SKIRT_KEY_BIT in `super::seams`.
-const LAYER_KEY_MASK: u32 = 0x7FFF;
+pub(crate) const LAYER_KEY_MASK: u32 = 0x7FFF;
 
 /// Light is always 15 until lighting exists.
 pub(crate) const LIGHT: u32 = 15;
@@ -874,5 +1208,181 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Task 2.13 B: the bitmask sweep must equal the verbatim pre-2.13
+    /// sweep bit for bit at EVERY level — same PackedFace list, order
+    /// included, plus ranges, skirts and lids. 2,100 seeded cases over
+    /// mixed opaque / water / glass / leaves cubes with random neighbor
+    /// patterns (missing, uniform, noisy) at levels 0..=3, so the octant
+    /// splits, skirts and lids all fire.
+    #[test]
+    fn bitmask_sweep_matches_the_reference_at_every_level() {
+        let (_, appearance, blocks) = setup();
+        let states = [
+            BlockStateId::AIR,
+            blocks.stone,
+            blocks.dirt,
+            blocks.glass,
+            blocks.water,
+            blocks.leaves,
+        ];
+        let mut rng = XorShift64(0x2a13_0d15_eed5_1713);
+        for case in 0..2100u64 {
+            let fill = |seed: u64| {
+                Cube::from_fn(move |p| {
+                    let mut h = seed ^ (p.index() as u64).wrapping_mul(0x9e37_79b9);
+                    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                    h ^= h >> 31;
+                    states[(h % 100) as usize % states.len()]
+                })
+            };
+            let center = Arc::new(fill(case.wrapping_mul(0x5173_171d) ^ rng.next()));
+            let mut input = MeshInput::isolated_at_level(
+                Arc::clone(&center),
+                (case % 4) as u8, // levels 0..=3
+            );
+            for i in 0..26 {
+                let roll = rng.next() % 4;
+                if roll == 0 {
+                    continue; // missing neighbor
+                }
+                let cube = if roll == 1 {
+                    Cube::filled(match rng.next() % 4 {
+                        0 => blocks.stone,
+                        1 => blocks.water,
+                        2 => blocks.glass,
+                        _ => BlockStateId::AIR,
+                    })
+                } else {
+                    fill(rng.next())
+                };
+                input.neighbors[i] = Some(Arc::new(cube));
+            }
+            let padded = build_padded(&input, &appearance);
+            let got = mesh_padded(&padded, &appearance, input.level);
+            let expected =
+                crate::mesh::oracle::reference_mesh_padded(&padded, &appearance, input.level);
+            assert!(
+                got.faces == expected.faces,
+                "case {case} (level {}): face list drifted",
+                input.level
+            );
+            assert_eq!(got.ranges, expected.ranges, "case {case}: ranges drifted");
+            assert_eq!(got.skirts, expected.skirts, "case {case}: skirts drifted");
+            assert_eq!(got.lids, expected.lids, "case {case}: lids drifted");
+        }
+    }
+
+    /// Task 2.13 B follow-up: the noisy corpus above now mostly lands in
+    /// the dense per-cell fallback (random fills differ everywhere), so
+    /// the sparse candidate path — the one real terrain takes — needs its
+    /// own oracle coverage, seam slices and all. Smooth heightmap cubes
+    /// (a few percent of pairs differ) at levels 0..=3 with mixed
+    /// neighbor kinds, checked bit for bit like the noisy corpus.
+    #[test]
+    fn sparse_terrain_matches_the_reference_with_seams() {
+        let (_, appearance, blocks) = setup();
+        let height_at = |x: u8, z: u8, seed: u64| -> u8 {
+            let mut h = seed ^ (u64::from(x) << 8) ^ (u64::from(z) << 16);
+            h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            h ^= h >> 31;
+            // Smooth-ish: base gradient plus a wobble, 4..=29 like the
+            // bench's terrain_like.
+            (4 + (x / 3) * 2 + (z / 4) + (h % 3) as u8).clamp(4, 29)
+        };
+        let mut rng = XorShift64(0x00c0_ffee_2026);
+        for case in 0..600u64 {
+            let seed = case.wrapping_mul(0x2f13_171d) ^ rng.next();
+            let center = Arc::new(Cube::from_fn(move |p| {
+                let height = height_at(p.x, p.z, seed);
+                if p.y > height {
+                    BlockStateId::AIR
+                } else if p.y == height {
+                    blocks.grass_block
+                } else if p.y + 3 >= height {
+                    blocks.dirt
+                } else {
+                    blocks.stone
+                }
+            }));
+            // Neighboring terrain offset by one seed step: same shape,
+            // heights shifted a little — so octant planes and cube
+            // borders see real steps (skirts, lids).
+            let neighbor_cube = |seed: u64| {
+                Arc::new(Cube::from_fn(move |p| {
+                    let height = height_at(p.x, p.z, seed);
+                    if p.y > height {
+                        BlockStateId::AIR
+                    } else if p.y + 3 >= height {
+                        blocks.dirt
+                    } else {
+                        blocks.stone
+                    }
+                }))
+            };
+            let mut input = MeshInput::isolated_at_level(
+                Arc::clone(&center),
+                (case % 4) as u8, // levels 0..=3
+            );
+            for i in 0..26 {
+                let roll = rng.next() % 4;
+                if roll == 0 {
+                    continue; // missing neighbor: skirts into it
+                }
+                let cube = if roll == 1 {
+                    Arc::new(Cube::filled(blocks.stone))
+                } else {
+                    neighbor_cube(seed ^ rng.next())
+                };
+                input.neighbors[i] = Some(cube);
+            }
+            let padded = build_padded(&input, &appearance);
+            let got = mesh_padded(&padded, &appearance, input.level);
+            let expected =
+                crate::mesh::oracle::reference_mesh_padded(&padded, &appearance, input.level);
+            assert!(
+                got.faces == expected.faces,
+                "case {case} (level {}): sparse-path face list drifted",
+                input.level
+            );
+            assert_eq!(got.ranges, expected.ranges, "case {case}: ranges drifted");
+            assert_eq!(got.skirts, expected.skirts, "case {case}: skirts drifted");
+            assert_eq!(got.lids, expected.lids, "case {case}: lids drifted");
+        }
+    }
+
+    /// The affine owner decode: every direction's (x, y, z) matches the
+    /// index arithmetic the reference uses, over a slice-full of seeds.
+    /// (Covered implicitly by the case test above, but this pins the map
+    /// itself for every direction at a glance.)
+    #[test]
+    fn affine_cell_map_matches_the_reference_index_decode() {
+        let (_, appearance, blocks) = setup();
+        let cube = Cube::from_fn(|p| {
+            let mut h = (p.index() as u64).wrapping_mul(0x9e37_79b9);
+            h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            h ^= h >> 31;
+            match h % 12 {
+                0..=3 => blocks.stone,
+                4 => blocks.glass,
+                5 => blocks.water,
+                _ => BlockStateId::AIR,
+            }
+        });
+        let air = Arc::new(Cube::default());
+        let mut input = MeshInput::isolated(Arc::new(cube));
+        for i in 0..26 {
+            input.neighbors[i] = Some(Arc::clone(&air));
+        }
+        let padded = build_padded(&input, &appearance);
+        let got = mesh_padded(&padded, &appearance, 0);
+        let expected = crate::mesh::oracle::reference_mesh_padded(&padded, &appearance, 0);
+        // Byte equality of the packed faces is the claim; the owners ride
+        // in word 0.
+        for (g, e) in got.faces.iter().zip(&expected.faces) {
+            assert_eq!(g.0, e.0);
+        }
+        assert_eq!(got.faces.len(), expected.faces.len());
     }
 }

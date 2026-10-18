@@ -86,6 +86,28 @@ pub fn visible_directions(rel_min: Vec3, rel_max: Vec3) -> [bool; 6] {
     ]
 }
 
+/// The squared distance from the camera (the origin) to the closest point
+/// of the camera-relative AABB `[rel_min, rel_max]` — the metric behind
+/// the direction-split rule (task 2.13 C): cubes farther than
+/// `direction_split_radius` draw all their faces in one command. Mirrored
+/// by `cube_far` in shaders/cull.wgsl — both sides must compute the same
+/// clamps, multiplies and adds so the CPU bound covers every GPU emission.
+pub fn aabb_distance_squared(rel_min: Vec3, rel_max: Vec3) -> f32 {
+    let cx = rel_min.x.max(0.0).min(rel_max.x);
+    let cy = rel_min.y.max(0.0).min(rel_max.y);
+    let cz = rel_min.z.max(0.0).min(rel_max.z);
+    // Explicit multiplies and adds, left to right — no dot(), which a
+    // backend may contract into fused multiply-adds while the Rust side
+    // would not; the CPU bound and the cull shader must verdict identically.
+    cx * cx + cy * cy + cz * cz
+}
+
+/// The direction-split radius in blocks: `radius_cubes` cubes of
+/// `CUBE_SIZE` (task 2.13 C's `RenderSettings::direction_split_radius`).
+pub fn direction_split_blocks(radius_cubes: u32) -> f32 {
+    radius_cubes as f32 * CUBE_SIZE as f32
+}
+
 /// The camera split behind the one origin formula: `camera_cube` is
 /// `floor(camera / CUBE_SIZE)` per axis and `camera_frac` is
 /// `camera − camera_cube · CUBE_SIZE`, computed in f64 and then rounded to
@@ -215,6 +237,35 @@ mod tests {
         assert_eq!(
             visible_directions(Vec3::new(-1.0, -1.0, 2.0), Vec3::new(1.0, 1.0, 6.0)),
             [true, true, true, true, false, true]
+        );
+    }
+
+    /// The distance metric behind the direction-split rule: zero inside
+    /// the box, the closest face/edge/corner distance squared outside.
+    #[test]
+    fn aabb_distance_squared_is_zero_inside_and_planar_outside() {
+        use super::aabb_distance_squared;
+        // Contains the camera.
+        assert_eq!(
+            aabb_distance_squared(Vec3::new(-1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, 1.0)),
+            0.0
+        );
+        // Touching the camera: still zero.
+        assert_eq!(aabb_distance_squared(Vec3::ZERO, Vec3::splat(1.0)), 0.0);
+        // One axis out: planar distance.
+        assert_eq!(
+            aabb_distance_squared(Vec3::new(2.0, -1.0, -1.0), Vec3::new(4.0, 1.0, 1.0)),
+            4.0
+        );
+        // Corner: 1 + 4 + 16.
+        assert_eq!(
+            aabb_distance_squared(Vec3::new(1.0, 2.0, 4.0), Vec3::splat(9.0)),
+            21.0
+        );
+        // Straddles two axes, out on the third.
+        assert_eq!(
+            aabb_distance_squared(Vec3::new(-1.0, -1.0, 5.0), Vec3::new(1.0, 1.0, 8.0)),
+            25.0
         );
     }
 

@@ -243,7 +243,9 @@ fn margin_rows(camera: &Camera) -> u32 {
     let clamp_row = |row: f64| row.clamp(0.0, f64::from(HEIGHT));
     let horizon = clamp_row(row_of(0.0));
     let fade = clamp_row(row_of((0.25f64).asin()));
-    // Task 2.10: lod_levels 6 puts the outermost ring ~16 km out.
+    // Task 2.10: the outermost ring sits ~16 km out. Task 2.13 E keeps
+    // that reach with different numbers (16 cubes x 32 blocks x 2^5
+    // instead of 8 x 32 x 2^6), so the extent is unchanged.
     let ring_extent = 8.0 * 256.0 * 8.0 + 512.0;
     let edge = clamp_row(row_of(((camera.position.y - 76.0) / ring_extent).atan()));
     ((fade - horizon).max(edge - horizon) + 8.0)

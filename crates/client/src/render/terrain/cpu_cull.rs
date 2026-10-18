@@ -7,6 +7,8 @@
 //! direction skip, whose bound the mode replaces with the static
 //! per-page totals).
 
+use std::ops::Range;
+
 use glam::Vec3;
 
 use crate::camera::Camera;
@@ -18,7 +20,10 @@ use crate::render::settings::RenderSettings;
 use super::TerrainPass;
 use super::pages::CubeMesh;
 use super::pipelines::{CMD_BYTES, FACE_BYTES};
-use super::space::{Frustum, camera_split, cube_origin, cube_size, visible_directions};
+use super::space::{
+    Frustum, aabb_distance_squared, camera_split, cube_origin, cube_size, direction_split_blocks,
+    visible_directions,
+};
 use super::stats::{CullStats, TerrainStats};
 
 /// The culling basis of the frame (task 2.12): the camera split and
@@ -28,6 +33,60 @@ pub(super) struct CullBasis {
     pub(super) camera_cube: glam::IVec3,
     pub(super) camera_frac: Vec3,
     pub(super) frustum: Frustum,
+}
+
+/// The indirect commands one visible cube contributes (task 2.13 C),
+/// pure so the far/near rule can be unit-tested without a GPU. Beyond
+/// `split_radius_blocks` from the camera the cube's whole face range
+/// draws in one command — back-face culling drops exactly the faces
+/// direction skipping dropped, so the pixels cannot change. Nearer cubes
+/// keep one command per non-empty, non-skipped direction (skipped only
+/// when not exploding: a slid cube can straddle the camera). Returns the
+/// face count the commands issue.
+// The eight parameters are one cube's draw context; a bundling struct
+// would only be unpacked again here.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn push_cube_commands(
+    out: &mut Vec<wgpu::util::DrawIndirectArgs>,
+    face_start: u32,
+    ranges: &[Range<u32>; 6],
+    slot: u32,
+    rel_min: Vec3,
+    rel_max: Vec3,
+    exploding: bool,
+    split_radius_blocks: f32,
+) -> u32 {
+    let radius_squared = split_radius_blocks * split_radius_blocks;
+    if aabb_distance_squared(rel_min, rel_max) > radius_squared {
+        // Far: one command over the cube's whole, direction-contiguous
+        // face range.
+        let total: u32 = ranges.iter().map(|r| r.len() as u32).sum();
+        if total == 0 {
+            return 0;
+        }
+        out.push(wgpu::util::DrawIndirectArgs {
+            vertex_count: total * 6,
+            instance_count: 1,
+            first_vertex: face_start * 6,
+            first_instance: slot,
+        });
+        return total;
+    }
+    let dirs = visible_directions(rel_min, rel_max);
+    let mut faces = 0u32;
+    for (dir, dir_range) in ranges.iter().enumerate() {
+        if dir_range.is_empty() || (!exploding && !dirs[dir]) {
+            continue;
+        }
+        out.push(wgpu::util::DrawIndirectArgs {
+            vertex_count: dir_range.len() as u32 * 6,
+            instance_count: 1,
+            first_vertex: (face_start + dir_range.start) * 6,
+            first_instance: slot,
+        });
+        faces += dir_range.len() as u32;
+    }
+    faces
 }
 
 impl TerrainPass {
@@ -145,26 +204,25 @@ impl TerrainPass {
         let mut faces = 0u64;
         let mut level_drawn = [0u32; 7];
         let mut level_faces = [0u32; 7];
+        let split_radius_blocks = direction_split_blocks(settings.direction_split_radius);
         for (key, rel_min, mesh) in &visible {
             let Some((page, alloc_range)) = mesh.alloc.as_ref() else {
                 continue;
             };
-            let dirs = visible_directions(*rel_min, *rel_min + cube_size(key.level));
             let level_index = (key.level as usize).min(6);
             level_drawn[level_index] += 1;
-            for (dir, dir_range) in mesh.ranges.iter().enumerate() {
-                if dir_range.is_empty() || (!exploding && !dirs[dir]) {
-                    continue;
-                }
-                per_page[*page].push(wgpu::util::DrawIndirectArgs {
-                    vertex_count: dir_range.len() as u32 * 6,
-                    instance_count: 1,
-                    first_vertex: (alloc_range.start + dir_range.start) * 6,
-                    first_instance: mesh.slot.expect("a drawn cube holds a meta slot"),
-                });
-                faces += dir_range.len() as u64;
-                level_faces[level_index] += dir_range.len() as u32;
-            }
+            let issued = push_cube_commands(
+                &mut per_page[*page],
+                alloc_range.start,
+                &mesh.ranges,
+                mesh.slot.expect("a drawn cube holds a meta slot"),
+                *rel_min,
+                *rel_min + cube_size(key.level),
+                exploding,
+                split_radius_blocks,
+            );
+            faces += u64::from(issued);
+            level_faces[level_index] += issued;
         }
         let mut commands: Vec<wgpu::util::DrawIndirectArgs> = Vec::new();
         // (page, command count) for every page that draws this frame.
@@ -240,5 +298,117 @@ impl TerrainPass {
 
         stats.draw_calls = draw_calls;
         self.stats = stats;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ranges_of(counts: [u32; 6]) -> [Range<u32>; 6] {
+        let mut start = 0u32;
+        std::array::from_fn(|d| {
+            let range = start..start + counts[d];
+            start += counts[d];
+            range
+        })
+    }
+
+    fn args_of(cmd: &wgpu::util::DrawIndirectArgs) -> (u32, u32, u32) {
+        (cmd.vertex_count, cmd.first_vertex, cmd.first_instance)
+    }
+
+    /// Task 2.13 C's rule: a far cube gets ONE command covering its whole
+    /// (direction-contiguous) face range; a near cube gets one per
+    /// non-empty, non-skipped direction.
+    #[test]
+    fn far_cube_gets_one_command_near_cube_gets_per_direction() {
+        let ranges = ranges_of([3, 0, 5, 2, 0, 4]);
+        // Far: the whole cube sits 200 blocks out on +X (the split radius
+        // is 128 blocks).
+        let far_min = Vec3::new(200.0, -16.0, -16.0);
+        let far_max = far_min + Vec3::splat(32.0);
+        let mut commands = Vec::new();
+        let faces = push_cube_commands(
+            &mut commands,
+            100,
+            &ranges,
+            7,
+            far_min,
+            far_max,
+            false,
+            128.0,
+        );
+        assert_eq!(commands.len(), 1, "one command for the far cube");
+        assert_eq!(args_of(&commands[0]), (14 * 6, 100 * 6, 7));
+        assert_eq!(faces, 14);
+
+        // Near, in the (+, +, +) octant of the camera: only the
+        // camera-facing directions — and only their non-empty ranges
+        // (-X is empty here, so -Y at offset 8 and -Z at 10 remain).
+        let near_min = Vec3::new(16.0, 16.0, 16.0);
+        let near_max = near_min + Vec3::splat(32.0);
+        let mut commands = Vec::new();
+        let faces = push_cube_commands(
+            &mut commands,
+            100,
+            &ranges,
+            7,
+            near_min,
+            near_max,
+            false,
+            128.0,
+        );
+        assert_eq!(
+            commands.iter().map(args_of).collect::<Vec<_>>(),
+            vec![(2 * 6, 108 * 6, 7), (4 * 6, 110 * 6, 7)]
+        );
+        assert_eq!(faces, 6);
+
+        // A cube straddling the camera is near even at radius 0 (distance
+        // zero): all six non-empty directions.
+        let mut commands = Vec::new();
+        push_cube_commands(
+            &mut commands,
+            0,
+            &ranges,
+            0,
+            Vec3::splat(-16.0),
+            Vec3::splat(16.0),
+            false,
+            0.0,
+        );
+        assert_eq!(commands.len(), 4, "the non-empty directions only");
+
+        // At radius 0 anything strictly outside the camera is far: one
+        // command even for the straddling-ish cube one block out.
+        let mut commands = Vec::new();
+        let faces = push_cube_commands(
+            &mut commands,
+            50,
+            &ranges,
+            3,
+            Vec3::new(1.0, -16.0, -16.0),
+            Vec3::new(33.0, 16.0, 16.0),
+            false,
+            0.0,
+        );
+        assert_eq!(commands.len(), 1);
+        assert_eq!(faces, 14);
+
+        // Exploding keeps per-direction emission for near cubes (a slid
+        // cube can straddle the camera; the direction test is off).
+        let mut commands = Vec::new();
+        push_cube_commands(
+            &mut commands,
+            100,
+            &ranges,
+            7,
+            near_min,
+            near_max,
+            true,
+            128.0,
+        );
+        assert_eq!(commands.len(), 4, "every non-empty direction");
     }
 }

@@ -131,7 +131,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         world_dir: world_dir(preset),
         worldgen: preset,
         ..ServerConfig::default()
-    };
+    }
+    .clamped();
     // The far-look view distances, read off the config before it moves
     // into the server (task 2.9); the debug hooks attach after the spawn.
     let view_config = config.clone();

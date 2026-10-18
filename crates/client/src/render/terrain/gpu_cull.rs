@@ -14,6 +14,7 @@ use crate::render::settings::RenderSettings;
 use super::TerrainPass;
 use super::layout::{CullParams, cull_debug_words};
 use super::pipelines::{CMD_BYTES, FACE_BYTES};
+use super::space::direction_split_blocks;
 use super::stats::{CullStats, STATS_BYTES, TerrainStats};
 
 impl TerrainPass {
@@ -90,8 +91,12 @@ impl TerrainPass {
         let page_bounds = if settings.explode > 0 {
             self.book.page_dir_counts.clone()
         } else {
-            self.book
-                .frustum_page_bounds(basis.camera_cube, basis.camera_frac, &basis.frustum)
+            self.book.frustum_page_bounds(
+                basis.camera_cube,
+                basis.camera_frac,
+                &basis.frustum,
+                direction_split_blocks(settings.direction_split_radius),
+            )
         };
         let mut region_base = Vec::with_capacity(page_bounds.len());
         let mut bound_total = 0u32;
@@ -130,6 +135,12 @@ impl TerrainPass {
                     CUBE_SIZE as u32,
                 ],
                 debug: cull_debug_words(settings),
+                split: [
+                    direction_split_blocks(settings.direction_split_radius),
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
             }),
         );
         gpu.queue.write_buffer(

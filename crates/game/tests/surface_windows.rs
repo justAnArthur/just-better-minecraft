@@ -422,15 +422,38 @@ fn valley_cliff_is_full_lod0_near_the_camera() {
     //    comes from the depth buffer (reverse-Z: distance = NEAR / d).
     //    Farther tinted pixels are legitimate ring terrain and are only
     //    counted for the report.
+    let (near_tinted, far_tinted) = tinted_within(&gpu, &mut win, &camera, 200.0, "valley");
+    println!(
+        "tint check: {near_tinted} tinted pixels within 200 blocks (must be 0), \
+         {far_tinted} farther ring pixels (legitimate)"
+    );
+    assert_eq!(
+        near_tinted, 0,
+        "{near_tinted} pixels of terrain within 200 blocks are drawn by a LOD ring; \
+         images in target/surface/"
+    );
+}
+
+/// Renders `camera` twice (tint off, then on) and counts the pixels whose
+/// color changed — terrain a LOD ring draws — split at `limit` blocks of
+/// Euclidean distance (via the depth buffer; sky-depth edges count as
+/// far). Saves both images under `target/surface/<tag>_*.png`.
+fn tinted_within(
+    gpu: &Gpu,
+    win: &mut WindowClient,
+    camera: &Camera,
+    limit: f64,
+    tag: &str,
+) -> (usize, usize) {
     win.rig.renderer.set_fog(false);
     win.rig.renderer.set_lod_tint(false);
-    let plain = win.render(&gpu, &camera);
+    let plain = win.render(gpu, camera);
     win.rig.renderer.set_lod_tint(true);
-    let tinted = win.render(&gpu, &camera);
-    let depths = win.rig.read_depth(&gpu);
+    let tinted = win.render(gpu, camera);
+    let depths = win.rig.read_depth(gpu);
     std::fs::create_dir_all("target/surface").ok();
-    let _ = plain.save("target/surface/valley_plain.png");
-    let _ = tinted.save("target/surface/valley_tinted.png");
+    let _ = plain.save(format!("target/surface/{tag}_plain.png"));
+    let _ = tinted.save(format!("target/surface/{tag}_tinted.png"));
     let mut near_tinted = 0usize;
     let mut far_tinted = 0usize;
     let inv_view_proj = camera.view_proj().inverse();
@@ -455,21 +478,92 @@ fn valley_cliff_is_full_lod0_near_the_camera() {
             let view = view / view.w;
             let world = camera.position
                 + DVec3::new(f64::from(view.x), f64::from(view.y), f64::from(view.z));
-            if (world - camera.position).length() <= 200.0 {
+            if (world - camera.position).length() <= limit {
                 near_tinted += 1;
             } else {
                 far_tinted += 1;
             }
         }
     }
+    (near_tinted, far_tinted)
+}
+
+/// Task 2.13 E: at the shipped defaults (view_radius 16 — LOD0 to 512
+/// blocks, lod_view_radius 16 / lod_levels 5 — L1 from 1024) no tinted
+/// (non-LOD0) pixel may sit closer than 480 blocks below the horizon,
+/// the 2.10 200-block rule scaled to the new radius. The valley+cliff
+/// site again: the hardest case, tall relief right at the camera.
+#[test]
+fn valley_cliff_lod0_reaches_480_blocks_at_the_new_defaults() {
+    let start = Instant::now();
+    let Some(gpu) = jbm_client::testing::screenshot::gpu_or_skip() else {
+        return;
+    };
+
+    let mut registry = jbm_core::block::BlockRegistry::new();
+    let blocks = jbm_core::block::builtin::Blocks::register(&mut registry);
+    let nav = Generator::with_preset(DEFAULT_SEED, blocks, Preset::Overworld);
+    let site = find_valley_cliff(&nav);
+
+    // The shipped defaults plus real threads.
+    let config = ServerConfig {
+        gen_threads: 4,
+        ..ServerConfig::default()
+    };
+    assert_eq!(
+        (
+            config.view_radius,
+            config.lod_view_radius,
+            config.lod_levels
+        ),
+        (16, 16, 5),
+        "the task 2.13 E defaults"
+    );
+    let mut server = Server::with_config(config);
+    let (mut client, server_end) = jbm_core::link::in_process_pair();
+    server.add_connection(server_end);
+    client
+        .send(ClientMsg::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            name: "valley16".to_owned(),
+        })
+        .unwrap();
+    let mut win = WindowClient::new(&gpu);
+
+    join_and_teleport(
+        &mut server,
+        &mut win,
+        &mut client,
+        &gpu,
+        site.valley,
+        start + TEST_TIMEOUT,
+    );
+
+    const EYE: f64 = 1.62;
+    let eye = site.valley + DVec3::new(0.0, EYE, 0.0);
+    let mut camera = Camera::new(eye, 70.0_f32.to_radians(), WIDTH as f32 / HEIGHT as f32);
+    let d = site.wall_top - eye;
+    camera.set_yaw(f32::atan2(d.x as f32, -d.z as f32));
+    camera.set_pitch(f32::atan2(d.y as f32, d.x.hypot(d.z) as f32));
+
+    settle(
+        &mut server,
+        &mut win,
+        &mut client,
+        &gpu,
+        &camera,
+        start + TEST_TIMEOUT,
+    );
+
+    let (near_tinted, far_tinted) = tinted_within(&gpu, &mut win, &camera, 480.0, "valley16");
     println!(
-        "tint check: {near_tinted} tinted pixels within 200 blocks (must be 0), \
+        "tint check (defaults): {near_tinted} tinted pixels within 480 blocks (must be 0), \
          {far_tinted} farther ring pixels (legitimate)"
     );
     assert_eq!(
         near_tinted, 0,
-        "{near_tinted} pixels of terrain within 200 blocks are drawn by a LOD ring; \
-         images in target/surface/"
+        "{near_tinted} pixels of terrain within 480 blocks are drawn by a LOD ring at the \
+         new defaults; images in target/surface/"
     );
 }
 
@@ -489,6 +583,7 @@ fn coast_defect_pixels(
     let config = ServerConfig {
         gen_threads: 4,
         max_column_cubes: cap,
+        camera_window_radius: 4,
         ..ServerConfig::default()
     };
     let mut server = Server::with_config(config);
@@ -691,6 +786,7 @@ fn surface_window_measurements() {
             let config = ServerConfig {
                 gen_threads: 4,
                 max_column_cubes: cap,
+                camera_window_radius: 4,
                 ..ServerConfig::default()
             };
             let mut server = Server::with_config(config);

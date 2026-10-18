@@ -189,6 +189,7 @@ fn world_section(
             2..=16,
         );
         if applied {
+            world.lod_view_radius = clamped_ring_radius(world.view_radius, world.lod_view_radius);
             (hooks.set_view_radius)(world.view_radius, world.lod_view_radius);
             let (lod0, furthest) = jbm_core::lod::ring_radii(
                 world.view_radius,
@@ -201,6 +202,14 @@ fn world_section(
             ui.monospace(format!("{label}: {value}"));
         }
     });
+}
+
+/// Task 2.13 E's floor for the World sliders: a drag that left
+/// `lod_view_radius` below `view_radius / 2 + 1` would put L1 inside
+/// the LOD0 disk, so the value rises to the floor — the same clamp the
+/// server applies, mirrored so the slider shows what will stream.
+pub(crate) fn clamped_ring_radius(view_radius: u32, lod_view_radius: u32) -> u32 {
+    lod_view_radius.max(jbm_core::lod::min_lod_view_radius(view_radius))
 }
 
 /// One integer drag with its label; reports whether the value changed
@@ -250,5 +259,20 @@ mod tests {
         let rows = per_level_rows(&levels);
         assert_eq!(rows[0], ["L0", "120", "61", "30000"]);
         assert_eq!(rows[1], ["L1", "40", "3", "400"]);
+    }
+
+    /// Task 2.13 E: the ring-radius slider can never leave L1 inside
+    /// the LOD0 disk — the floor the server also enforces.
+    #[test]
+    fn ring_radius_slider_never_starts_l1_inside_lod0() {
+        // The shipped defaults already satisfy the floor.
+        assert_eq!(clamped_ring_radius(16, 16), 16);
+        // A low drag rises to view_radius / 2 + 1.
+        assert_eq!(clamped_ring_radius(16, 2), 9);
+        assert_eq!(clamped_ring_radius(8, 4), 5);
+        // The slider's 2..=16 top is not enough at view_radius 32.
+        assert_eq!(clamped_ring_radius(32, 16), 17);
+        // Higher values pass through untouched.
+        assert_eq!(clamped_ring_radius(4, 16), 16);
     }
 }

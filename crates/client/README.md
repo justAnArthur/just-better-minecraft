@@ -70,13 +70,13 @@ coordinates and cfg-gated off under the crate's own `cube16` passthrough;
   (construction and bind groups), `cpu_cull.rs` / `gpu_cull.rs` (the draw
   paths).
 - `render::settings::RenderSettings` — the frame-level settings (fog,
-  level tint, far-look radii, draw-path flags, the task 2.12 debug
-  views) the renderer owns and passes to `TerrainPass::draw`;
-  `from_env()` is the one read of the `JBM_NO_FOG` / `JBM_LOD_TINT` /
-  `JBM_GPU_CULL` / `JBM_NO_MDI` / `JBM_WIREFRAME` / `JBM_WIREFRAME_ONLY`
-  / `JBM_CHUNK_BORDERS` / `JBM_EXPLODE` / `JBM_LEVELS` /
-  `JBM_FREEZE_CULL` variables, done by the app at startup (the F3 panel
-  edits the same fields live).
+  level tint, far-look radii, the direction-split radius, draw-path
+  flags, the task 2.12 debug views) the renderer owns and passes to
+  `TerrainPass::draw`; `from_env()` is the one read of the `JBM_NO_FOG` /
+  `JBM_LOD_TINT` / `JBM_GPU_CULL` / `JBM_NO_MDI` / `JBM_WIREFRAME` /
+  `JBM_WIREFRAME_ONLY` / `JBM_CHUNK_BORDERS` / `JBM_EXPLODE` /
+  `JBM_LEVELS` / `JBM_FREEZE_CULL` / `JBM_DIRECTION_SPLIT` variables,
+  done by the app at startup (the F3 panel edits the same fields live).
 - `render::hiz::HizPyramid` — the hierarchical-Z depth pyramid the GPU
   cull tests occlusion against.
 - `render::suballoc::Suballocator` — the CPU-side free-list suballocator
@@ -201,14 +201,29 @@ occlude; cutout and air do not.
 The mesher first builds a padded `(CUBE_SIZE + 2)³` array (center via
 `Cube::iter()`, which is ~3× faster than per-block `get`; neighbor shells
 via bounded loops — uniform neighbors fill, non-uniform use `get_index` on
-just the border cells). Per direction and slice, coplanar faces with identical
-(texture layer, AO pattern, light) merge into maximal rectangles: extend
-along u first, then along v. Faces never span outside the cube. Output is
-grouped by direction (`ranges`) so 2.2 can skip back-facing directions.
+just the border cells). Three walks over that array (one per axis,
+contiguous row streams, each pair feeding both directions of its axis)
+then build per-direction **boundary planes**: per slice and row, a `u32`
+of the u cells whose A/B pair differs — the only possible faces. Only
+those candidates compute keys (air/cull tests, layer, AO); the greedy
+merge runs over the set bits instead of scanning all 1024 mask entries
+per slice. Each row is folded first (`fold |= a ^ b`) so uniform
+stretches never reach the per-pair pass. A volume too noisy for the
+planes to pay off — the interior pair-density rises above half while
+walking, e.g. a checkerboard — aborts the build for that axis and its two
+directions sweep per-cell like the pre-2.13 mesher instead; shell rows
+never count toward that density (a boundary is dense by design). Per
+direction and slice, coplanar faces with identical (texture layer, AO
+pattern, light) merge into maximal rectangles: extend along u first,
+then along v. Faces never span outside the cube. Output is grouped by
+direction (`ranges`) so 2.2 can skip back-facing directions, and is
+bit-for-bit the pre-2.13 sweep at every level (oracle tests).
 
-**Bench medians (Apple M5 Pro, idle, single-threaded):** `terrain_like`
-221 µs (target ≤ 300 µs), `checkerboard` 697 µs,
-`uniform_stone_air_neighbors` 219 µs, `padded_build` 20 µs.
+**Bench medians (Apple M5 Pro, single-threaded, machine load 5–11,
+interleaved against the pre-2.13 mesher):** `terrain_like` 78 µs
+(pre-2.13: 259–311 µs), `checkerboard` 769–792 µs (pre-2.13: 815–835 µs),
+`uniform_stone_air_neighbors` 50 µs (243–279 µs), `padded_build` 22 µs
+(unchanged).
 
 ### Worker pool
 
@@ -408,7 +423,10 @@ invisible:
   `RenderSettings::from_env()` read; the renderer-owned settings hand
   them to the terrain pass every frame (`Renderer::set_view_distance`
   changes them). Defaults match the `ServerConfig` defaults
-  (`DEFAULT_LOD0_RING_RADIUS`, `DEFAULT_FURTHEST_RING_RADIUS`).
+  (`DEFAULT_LOD0_RING_RADIUS`, `DEFAULT_FURTHEST_RING_RADIUS` — since
+  task 2.13 E a 512-block LOD0 disk and a 16 km furthest ring; the
+  panel's ring-radius slider clamps to `lod_view_radius ≥
+  view_radius / 2 + 1` so L1 always starts beyond LOD0).
 - **Test hooks:** `Renderer::set_fog(bool)` (also `JBM_NO_FOG=1`, read
   once by the app through `RenderSettings::from_env`) switches the fog
   off entirely so screenshot tests can isolate geometry from fog; the
@@ -603,16 +621,32 @@ is a later optimization.
 
 **Drawing** (cpu-cull and fallback): CPU frustum culling tests each
 camera-relative cube AABB (from the same origin formula) against 5
-planes, then, in sorted `CubePos` order, one indirect command is emitted
-per visible cube **and face direction** with a non-empty range, skipping
-back-facing directions (`visible_directions`: +X is skipped when the
-whole cube is at `rel_min.x ≥ 0` — every +X face plane is then at or
-beyond the camera's x and faces away — and symmetrically for −X, ±Y,
-±Z; back-face culling discarded those faces anyway, so the image is
-unchanged; the GPU path ports the same rule). Each command carries
-`first_vertex = (page range start + direction range start) · 6` and
-`first_instance = slot`; `vertex_index` includes `first_vertex` for
-non-indexed draws, so `faces[vertex / 6]` still indexes page-local faces.
+planes, then, in sorted `CubePos` order, `push_cube_commands`
+(cpu_cull.rs, pure and unit-tested) emits per cube either
+
+- **far beyond `direction_split_radius`** (a `RenderSettings` field, 4
+  cubes = 128 blocks by default, `JBM_DIRECTION_SPLIT=<cubes>`): ONE
+  command over the cube's whole face range — the per-direction ranges
+  are contiguous in the page, so the whole range is one span. The
+  rasterizer's back-face culling then drops exactly the faces the
+  direction rule would have skipped, so the image cannot change; only
+  the issued-face counters grow (they count vertex work issued, not
+  fragments), and the GPU path's `cube_far` (cull.wgsl) reaches the
+  same verdict with the same clamps, multiplies and adds (no `dot()`,
+  which a backend may fuse while the Rust side would not — the CPU
+  region bound must cover every GPU emission),
+- **near**: one command per non-empty range among the directions
+  `visible_directions` keeps (+X is skipped when the whole cube is at
+  `rel_min.x ≥ 0` — every +X face plane is then at or beyond the
+  camera's x and faces away — and symmetrically for −X, ±Y, ±Z; the
+  explode view skips the test: a slid cube can straddle the camera).
+
+Each command carries `first_vertex = (page range start + direction
+range start) · 6` and `first_instance = slot`; `vertex_index` includes
+`first_vertex` for non-indexed draws, so `faces[vertex / 6]` still
+indexes page-local faces. Measured on the far_metrics baseline
+(task 2.13): commands per frame fell 35–49 % across the four pinned
+cameras (spawn/mountain at 8 and 16 cubes).
 
 MDI is used when the adapter reports `DownlevelFlags::INDIRECT_EXECUTION`
 and the device was created with `Features::INDIRECT_FIRST_INSTANCE`
@@ -810,6 +844,7 @@ its startup environment variable:
 | levels | `JBM_LEVELS=0,1,3` | the shown-level mask; a hidden level leaves a hole (enforced in the cull, both CPU and GPU) |
 | freeze culling | `JBM_FREEZE_CULL=1` | the cull keeps the frustum and position captured at switch-on (a `FreezeParams` uniform, binding 7, on the gpu path too — which also skips Hi-Z occlusion there, the pyramid holding the real view's depth); the frozen frustum draws as lines |
 | fog | `JBM_NO_FOG=1` | distance fog off |
+| direction split | `JBM_DIRECTION_SPLIT=<cubes>` | beyond this radius (default 4 cubes) a cube draws all its face directions in one command; 0 is one command everywhere |
 | prefer gpu cull / force cpu cull / force fallback | `JBM_GPU_CULL=1` / `JBM_NO_MDI=1` | the path flags are re-read from the settings every draw, so the panel switches paths live |
 
 The **World** section's sliders steer the server's view radii through

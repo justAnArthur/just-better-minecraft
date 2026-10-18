@@ -700,12 +700,12 @@ impl TerrainPass {
     /// Command-region slots encoded across both phases for `camera`,
     /// including the zero-count tails (the metrics example): twice the
     /// CPU frustum bound the frame draws with.
-    pub fn region_command_slots(&self, camera: &Camera) -> u64 {
+    pub fn region_command_slots(&self, camera: &Camera, split_radius_blocks: f32) -> u64 {
         let (camera_cube, camera_frac) = camera_split(camera.position);
         let frustum = Frustum::from_view_proj(&camera.view_proj());
         let total: u32 = self
             .book
-            .frustum_page_bounds(camera_cube, camera_frac, &frustum)
+            .frustum_page_bounds(camera_cube, camera_frac, &frustum, split_radius_blocks)
             .iter()
             .sum();
         u64::from(total) * 2

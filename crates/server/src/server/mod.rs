@@ -284,6 +284,9 @@ impl Server {
     /// the **stored** seed feeds the generator on reopen, and any storage
     /// error surfaces to the caller.
     pub fn try_with_config(config: ServerConfig) -> Result<Self, StorageError> {
+        // Task 2.13 E's ring-radius floor: an override that left L1
+        // inside LOD0 clamps up with a one-line warning.
+        let config = config.clamped();
         let mut registry = jbm_core::block::BlockRegistry::new();
         let blocks = jbm_core::block::builtin::Blocks::register(&mut registry);
         let storage = match &config.world_dir {

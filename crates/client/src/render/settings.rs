@@ -75,6 +75,13 @@ pub struct RenderSettings {
     /// camera moves freely, so what draws no longer follows the view; on
     /// via `JBM_FREEZE_CULL=1`.
     pub freeze_cull: bool,
+    /// The direction-split radius, in cubes (task 2.13 C): cubes whose
+    /// AABB is farther than this from the camera draw all their face
+    /// directions in one indirect command — back-face culling drops the
+    /// same faces direction skipping dropped, so the image cannot change.
+    /// Near cubes keep one command per visible direction. 0 draws one
+    /// command everywhere; `JBM_DIRECTION_SPLIT=<cubes>` seeds it.
+    pub direction_split_radius: u32,
 }
 
 impl Default for RenderSettings {
@@ -92,9 +99,17 @@ impl Default for RenderSettings {
             explode: 0,
             level_mask: ALL_LEVELS,
             freeze_cull: false,
+            direction_split_radius: DEFAULT_DIRECTION_SPLIT_RADIUS,
         }
     }
 }
+
+/// The default direction-split radius (task 2.13 C), in cubes: measured
+/// against the far_metrics baseline (spawn at 16 cubes holds ~7k LOD0
+/// cubes issuing ~2.4k commands, nearly all beyond 4 cubes) it collapses
+/// the far bulk to one command per cube while the near band — where a
+/// cube can straddle the camera — keeps its per-direction skipping.
+pub const DEFAULT_DIRECTION_SPLIT_RADIUS: u32 = 4;
 
 impl RenderSettings {
     /// Reads the rendering environment variables: `JBM_NO_FOG`,
@@ -112,6 +127,10 @@ impl RenderSettings {
             .unwrap_or(0)
             .min(8);
         let level_mask = level_mask_from_list(&std::env::var("JBM_LEVELS").unwrap_or_default());
+        let direction_split = std::env::var("JBM_DIRECTION_SPLIT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(DEFAULT_DIRECTION_SPLIT_RADIUS);
         RenderSettings::from_flags(
             DebugFlags {
                 no_fog: flag("JBM_NO_FOG"),
@@ -125,11 +144,17 @@ impl RenderSettings {
             },
             explode,
             level_mask,
+            direction_split,
         )
     }
 
     /// The environment mapping, pure so it can be unit-tested.
-    fn from_flags(flags: DebugFlags, explode: u32, level_mask: u8) -> RenderSettings {
+    fn from_flags(
+        flags: DebugFlags,
+        explode: u32,
+        level_mask: u8,
+        direction_split_radius: u32,
+    ) -> RenderSettings {
         RenderSettings {
             fog: !flags.no_fog,
             lod_tint: flags.lod_tint,
@@ -141,6 +166,7 @@ impl RenderSettings {
             explode,
             level_mask,
             freeze_cull: flags.freeze_cull,
+            direction_split_radius,
             ..RenderSettings::default()
         }
     }
@@ -212,6 +238,10 @@ mod tests {
         assert_eq!(settings.explode, 0);
         assert!(!settings.freeze_cull);
         assert_eq!(
+            settings.direction_split_radius, DEFAULT_DIRECTION_SPLIT_RADIUS,
+            "4 cubes by default"
+        );
+        assert_eq!(
             settings.far_radii,
             [DEFAULT_LOD0_RING_RADIUS, DEFAULT_FURTHEST_RING_RADIUS]
         );
@@ -220,22 +250,25 @@ mod tests {
     #[test]
     fn env_flags_map_to_settings() {
         // Nothing set: the defaults.
-        let settings = RenderSettings::from_flags(flags(), 0, ALL_LEVELS);
+        let settings =
+            RenderSettings::from_flags(flags(), 0, ALL_LEVELS, DEFAULT_DIRECTION_SPLIT_RADIUS);
         assert_eq!(settings, RenderSettings::default());
         // Each variable flips exactly its own field.
         let mut f = flags();
         f.no_fog = true;
-        let settings = RenderSettings::from_flags(f, 0, ALL_LEVELS);
+        let settings = RenderSettings::from_flags(f, 0, ALL_LEVELS, DEFAULT_DIRECTION_SPLIT_RADIUS);
         assert!(!settings.fog);
         assert!(!settings.lod_tint);
         assert!(!settings.prefer_gpu_cull);
         assert!(!settings.force_fallback);
         let mut f = flags();
         f.lod_tint = true;
-        assert!(RenderSettings::from_flags(f, 0, ALL_LEVELS).lod_tint);
+        assert!(
+            RenderSettings::from_flags(f, 0, ALL_LEVELS, DEFAULT_DIRECTION_SPLIT_RADIUS).lod_tint
+        );
         let mut f = flags();
         f.prefer_gpu_cull = true;
-        let settings = RenderSettings::from_flags(f, 0, ALL_LEVELS);
+        let settings = RenderSettings::from_flags(f, 0, ALL_LEVELS, DEFAULT_DIRECTION_SPLIT_RADIUS);
         assert!(settings.prefer_gpu_cull);
         assert!(!settings.force_fallback);
         // JBM_NO_MDI forces the fallback (the same path a missing-MDI
@@ -243,7 +276,7 @@ mod tests {
         let mut f = flags();
         f.no_mdi = true;
         f.prefer_gpu_cull = true;
-        let settings = RenderSettings::from_flags(f, 0, ALL_LEVELS);
+        let settings = RenderSettings::from_flags(f, 0, ALL_LEVELS, DEFAULT_DIRECTION_SPLIT_RADIUS);
         assert!(settings.force_fallback);
         assert!(settings.prefer_gpu_cull, "the flags are independent");
     }
@@ -254,21 +287,28 @@ mod tests {
     fn debug_env_flags_map_to_settings() {
         let mut f = flags();
         f.wireframe = true;
-        let settings = RenderSettings::from_flags(f, 0, ALL_LEVELS);
+        let settings = RenderSettings::from_flags(f, 0, ALL_LEVELS, DEFAULT_DIRECTION_SPLIT_RADIUS);
         assert!(settings.wireframe);
         assert!(!settings.wireframe_only);
         let mut f = flags();
         f.wireframe_only = true;
-        let settings = RenderSettings::from_flags(f, 0, ALL_LEVELS);
+        let settings = RenderSettings::from_flags(f, 0, ALL_LEVELS, DEFAULT_DIRECTION_SPLIT_RADIUS);
         assert!(settings.wireframe, "wireframe-only implies wireframe");
         assert!(settings.wireframe_only);
         let mut f = flags();
         f.chunk_borders = true;
-        assert!(RenderSettings::from_flags(f, 0, ALL_LEVELS).chunk_borders);
+        assert!(
+            RenderSettings::from_flags(f, 0, ALL_LEVELS, DEFAULT_DIRECTION_SPLIT_RADIUS)
+                .chunk_borders
+        );
         let mut f = flags();
         f.freeze_cull = true;
-        assert!(RenderSettings::from_flags(f, 0, ALL_LEVELS).freeze_cull);
-        let settings = RenderSettings::from_flags(flags(), 4, ALL_LEVELS);
+        assert!(
+            RenderSettings::from_flags(f, 0, ALL_LEVELS, DEFAULT_DIRECTION_SPLIT_RADIUS)
+                .freeze_cull
+        );
+        let settings =
+            RenderSettings::from_flags(flags(), 4, ALL_LEVELS, DEFAULT_DIRECTION_SPLIT_RADIUS);
         assert_eq!(settings.explode, 4);
     }
 

@@ -8,15 +8,16 @@ use jbm_core::coords::CUBE_SIZE;
 use jbm_core::cube::Cube;
 
 use crate::mesh::appearance::BlockAppearance;
-use crate::mesh::face::{DIRECTIONS, FaceFields, pack};
-use crate::mesh::greedy::{LIGHT, MASK_LEN, corner_ao, stride};
+use crate::mesh::face::{DIRECTIONS, Direction, FaceFields, pack};
+use crate::mesh::greedy::{LAYER_KEY_MASK, LIGHT, MASK_LEN, corner_ao, stride};
 use crate::mesh::input::{
     F_AIR, F_OPAQUE_CULL, FLAGS_SHIFT, MeshInput, MeshOutput, ORIGIN, PAD, PAD_Y, PAD_Z,
 };
+use crate::mesh::seams::{LID_KEY_BIT, SKIRT_KEY_BIT, lid, skirt};
 
 /// A deliberately independent reference mesher: one face per block,
 /// reading cubes directly instead of any padded array.
-pub(crate) fn naive_unit_faces(
+pub fn naive_unit_faces(
     input: &MeshInput,
     appearance: &BlockAppearance,
 ) -> Vec<(u32, u32, u32, u8, u16, [u32; 4])> {
@@ -102,10 +103,147 @@ pub(crate) fn naive_unit_faces(
     out
 }
 
+/// The pre-2.13 greedy sweep, copied verbatim from what `greedy.rs`
+/// shipped before the bitmask rewrite: the per-cell mask build over every
+/// (u, v) cell of every slice. Task 2.13 B keeps it as the oracle the
+/// bitmask sweep must equal bit for bit at **every** level — same
+/// `PackedFace` list, order included, plus `skirts`, `lids` and `ranges`.
+pub fn reference_mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u8) -> MeshOutput {
+    let mut output = MeshOutput {
+        faces: Vec::new(),
+        ranges: std::array::from_fn(|_| 0u32..0),
+        skirts: 0,
+        lids: 0,
+    };
+    let size = CUBE_SIZE as usize;
+    let half = size / 2;
+    let mut mask = [0u32; MASK_LEN];
+
+    for (dir_index, &direction) in DIRECTIONS.iter().enumerate() {
+        let n = stride(direction.normal());
+        let u = stride(direction.u_axis());
+        let v = stride(direction.v_axis());
+        let n_axis = n.abs();
+        let last = CUBE_SIZE as isize - 1;
+        let u_shift = if u < 0 { -last * u } else { 0 };
+        let v_shift = if v < 0 { -last * v } else { 0 };
+        let corner = ORIGIN as isize + u_shift + v_shift;
+
+        let mut layer_of_kind = vec![0u16; appearance.len() + 1];
+        for state in 0..appearance.len() {
+            layer_of_kind[state + 1] = appearance.get(BlockStateId(state as u32)).layers[dir_index];
+        }
+
+        let side = matches!(
+            direction,
+            Direction::PosX | Direction::NegX | Direction::PosZ | Direction::NegZ
+        );
+
+        let start = output.faces.len() as u32;
+        for k in 0..CUBE_SIZE as isize {
+            let a_row = corner + k * n_axis;
+            let b_row = a_row + n;
+
+            // Build the mask of face keys for this slice.
+            for vi in 0..CUBE_SIZE as isize {
+                for ui in 0..CUBE_SIZE as isize {
+                    let a_index = (a_row + ui * u + vi * v) as usize;
+                    let b_index = (b_row + ui * u + vi * v) as usize;
+                    let a = pad[a_index];
+                    let b = pad[b_index];
+                    let a_air = a & (F_AIR << FLAGS_SHIFT) != 0;
+                    let b_cull = b & (F_OPAQUE_CULL << FLAGS_SHIFT) != 0;
+                    let culled = a_air || b_cull || a == b;
+                    let key = if culled {
+                        if level > 0 && side && !a_air && b_cull && skirt(pad, a_index, direction) {
+                            (1 << 31)
+                                | SKIRT_KEY_BIT
+                                | (u32::from(layer_of_kind[(a & 0xFFFF) as usize]) << 15)
+                                | (corner_ao(pad, b_index as isize, u, v) << 7)
+                                | LIGHT
+                        } else if level > 0
+                            && direction == Direction::PosY
+                            && !a_air
+                            && b_cull
+                            && lid(a_index)
+                        {
+                            (1 << 31)
+                                | LID_KEY_BIT
+                                | (u32::from(layer_of_kind[(a & 0xFFFF) as usize]) << 15)
+                                | (corner_ao(pad, b_index as isize, u, v) << 7)
+                                | LIGHT
+                        } else {
+                            0
+                        }
+                    } else {
+                        let layer = u32::from(layer_of_kind[(a & 0xFFFF) as usize]);
+                        let ao = corner_ao(pad, b_index as isize, u, v);
+                        (1 << 31) | (layer << 15) | (ao << 7) | LIGHT
+                    };
+                    mask[(vi * CUBE_SIZE as isize + ui) as usize] = key;
+                }
+            }
+
+            // Greedy merge: extend along u first, then along v.
+            for v0 in 0..size {
+                for u0 in 0..size {
+                    let key = mask[v0 * size + u0];
+                    if key == 0 {
+                        continue;
+                    }
+                    let u_limit = if level > 0 && u0 < half { half } else { size };
+                    let mut w = 1usize;
+                    while u0 + w < u_limit && mask[v0 * size + u0 + w] == key {
+                        w += 1;
+                    }
+                    let v_limit = if level > 0 && v0 < half { half } else { size };
+                    let mut h = 1usize;
+                    'extend: while v0 + h < v_limit {
+                        let row = (v0 + h) * size;
+                        for ui in u0..u0 + w {
+                            if mask[row + ui] != key {
+                                break 'extend;
+                            }
+                        }
+                        h += 1;
+                    }
+                    for vv in v0..v0 + h {
+                        for uu in u0..u0 + w {
+                            mask[vv * size + uu] = 0;
+                        }
+                    }
+
+                    // Owner block: the mask corner (u0, v0) of this slice.
+                    let owner = (a_row + u0 as isize * u + v0 as isize * v) as usize;
+                    let x = (owner % PAD) as u32 - 1;
+                    let z = ((owner / PAD_Z) % PAD) as u32 - 1;
+                    let y = (owner / PAD_Y) as u32 - 1;
+                    let ao8 = (key >> 7) & 0xFF;
+                    output.faces.push(pack(&FaceFields {
+                        x,
+                        y,
+                        z,
+                        width: w as u32,
+                        height: h as u32,
+                        direction,
+                        layer: (key >> 15) & LAYER_KEY_MASK,
+                        ao: [ao8 & 3, (ao8 >> 2) & 3, (ao8 >> 4) & 3, (ao8 >> 6) & 3],
+                        light: key & 0xF,
+                    }));
+                    output.skirts += u32::from(key & SKIRT_KEY_BIT != 0);
+                    output.lids += u32::from(key & LID_KEY_BIT != 0);
+                }
+            }
+        }
+        output.ranges[dir_index] = start..output.faces.len() as u32;
+    }
+    output
+}
+
 /// The original greedy sweep, copied verbatim (modulo the skirts
 /// counter): no octant splits, no skirts, no lids. Level 0 output must
 /// match it byte for byte.
-pub(crate) fn legacy_mesh_padded(pad: &[u32], appearance: &BlockAppearance) -> MeshOutput {
+pub fn legacy_mesh_padded(pad: &[u32], appearance: &BlockAppearance) -> MeshOutput {
     let mut output = MeshOutput {
         faces: Vec::new(),
         ranges: std::array::from_fn(|_| 0u32..0),

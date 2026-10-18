@@ -148,10 +148,11 @@ pub const FOG_END_FRACTION: f32 = 0.98;
 pub const AO_SOFTEN: [f32; 4] = [1.0, 0.6, 0.45, 0.3];
 
 /// Default view distances for the far look, matching the `ServerConfig`
-/// defaults (`view_radius` 8, `lod_levels` 6, `lod_view_radius` 8): the
-/// LOD0 ring radius and the furthest (level-6) ring radius, in blocks.
-pub const DEFAULT_LOD0_RING_RADIUS: f32 = 8.0 * CUBE_SIZE as f32;
-pub const DEFAULT_FURTHEST_RING_RADIUS: f32 = 8.0 * CUBE_SIZE as f32 * 64.0;
+/// defaults (task 2.13 E: `view_radius` 16, `lod_levels` 5,
+/// `lod_view_radius` 16): the LOD0 ring radius (512 blocks) and the
+/// furthest (level-5) ring radius (16 km), in blocks.
+pub const DEFAULT_LOD0_RING_RADIUS: f32 = 16.0 * CUBE_SIZE as f32;
+pub const DEFAULT_FURTHEST_RING_RADIUS: f32 = 16.0 * CUBE_SIZE as f32 * 32.0;
 
 /// The `far` words of [`TerrainUniforms`] from the radii and fog flag.
 pub(super) fn far_uniform_words(far_radii: [f32; 2], fog: bool) -> [f32; 4] {
@@ -183,6 +184,10 @@ pub struct CullParams {
     /// freeze (cull against the frozen view in the `freeze` uniform —
     /// binding 7 — instead of the live camera). z, w spare.
     pub debug: [u32; 4],
+    /// The direction-split radius in blocks (task 2.13 C): x = the
+    /// radius; cubes whose camera-relative AABB is farther than this
+    /// draw their whole face range in one command. y, z, w spare.
+    pub split: [f32; 4],
 }
 
 /// The freeze-cull view captured when the debug view switches on (group 1,
@@ -288,12 +293,15 @@ mod tests {
 
     #[test]
     fn cull_params_layout_matches_wgsl() {
-        assert_eq!(std::mem::size_of::<CullParams>(), 80);
+        // The WGSL mirror (cull.wgsl) is vec4i + vec4f + 3 × vec4u +
+        // vec4f = 96 bytes, every field 16-byte aligned.
+        assert_eq!(std::mem::size_of::<CullParams>(), 96);
         assert_eq!(std::mem::offset_of!(CullParams, camera_cube), 0);
         assert_eq!(std::mem::offset_of!(CullParams, camera_frac), 16);
         assert_eq!(std::mem::offset_of!(CullParams, screen), 32);
         assert_eq!(std::mem::offset_of!(CullParams, regions), 48);
         assert_eq!(std::mem::offset_of!(CullParams, debug), 64);
+        assert_eq!(std::mem::offset_of!(CullParams, split), 80);
     }
 
     #[test]
@@ -378,12 +386,12 @@ mod tests {
             [64.0, 1280.0, 0.0, 0.0]
         );
         // The defaults follow the ServerConfig defaults' shape at any cube
-        // size: 8 cubes for the LOD0 ring, and the level-6 disk (64x
-        // coarser) for the furthest.
-        assert_eq!(DEFAULT_LOD0_RING_RADIUS, 8.0 * CUBE_SIZE as f32);
+        // size: 16 cubes for the LOD0 ring, and the level-5 disk (32x
+        // coarser) for the furthest (task 2.13 E).
+        assert_eq!(DEFAULT_LOD0_RING_RADIUS, 16.0 * CUBE_SIZE as f32);
         assert_eq!(
             DEFAULT_FURTHEST_RING_RADIUS,
-            DEFAULT_LOD0_RING_RADIUS * 64.0
+            DEFAULT_LOD0_RING_RADIUS * 32.0
         );
     }
 

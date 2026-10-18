@@ -15,13 +15,40 @@ pub mod pool;
 pub mod seams;
 
 /// Test-only reference meshers the greedy output is checked against.
-#[cfg(test)]
-pub(crate) mod oracle;
+/// Compiled into integration tests too (the `testing` feature) so the
+/// game's tests can pin the sweep against real generated cubes.
+#[cfg(any(test, feature = "testing"))]
+pub mod oracle;
 
 pub use input::{MeshInput, MeshOutput, build_padded, neighbor_index};
 
 use appearance::BlockAppearance;
 use greedy::mesh_padded;
+
+/// Task 2.13 A's quad-split study: mesh `input` with merge-key fields
+/// dropped and return the face count. `ignore_ao` clears the AO byte from
+/// the merge key, `ignore_layer` the texture-layer field, so quads merge
+/// across them; the counts against the real mesher show what AO and the
+/// per-direction layers cost in triangles. Test/bench only.
+#[cfg(any(test, feature = "testing"))]
+pub fn mesh_split_study(
+    input: &MeshInput,
+    appearance: &BlockAppearance,
+    ignore_ao: bool,
+    ignore_layer: bool,
+) -> usize {
+    let mut keep = u32::MAX;
+    if ignore_ao {
+        keep &= !greedy::KEY_AO_BITS;
+    }
+    if ignore_layer {
+        keep &= !greedy::KEY_LAYER_BITS;
+    }
+    let padded = build_padded(input, appearance);
+    greedy::sweep_key_masked(&padded, appearance, input.level, keep)
+        .faces
+        .len()
+}
 
 /// Meshes one cube. See the README for the face rule and AO rule.
 pub fn mesh(input: &MeshInput, appearance: &BlockAppearance) -> MeshOutput {
