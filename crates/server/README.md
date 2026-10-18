@@ -515,9 +515,10 @@ authoritative `PlayerState` position):
   span** of every near column beyond the window (at most
   `max_column_cubes` cubes, nearest the camera first). Beyond
   `camera_window_radius` — out to `R` — a column desires **only its
-  surface span** `[floor(min_h / 32) − 1, floor(max_h / 32)]` (the same
-  widened-below span, trimmed to `max_column_cubes`), and nothing until
-  the span lands: far columns at the player's depth are invisible in a
+  surface span** `[floor(min_h / 32) − 1, floor((max_h + 1) / 32)]`
+  (widened one cube below, up to the cube holding the air above the top
+  block, trimmed to `max_column_cubes`), and nothing until the span
+  lands: far columns at the player's depth are invisible in a
   cave-less world, and at view radius 16 the full ±V window over the
   disk was ~4× the cubes the spans need. The level-1 ring mirrors the
   rule with its sampled spans; coarser rings keep plain windows (no
@@ -525,6 +526,18 @@ authoritative `PlayerState` position):
   center moves or a span lands, sorted nearest-first by
   `dx² + dy² + dz²` with ties broken by `(x, y, z)` — the same order the
   pre-2.10 list had.
+- **Span padding** (task 2.13 fix): the client mesher culls every face
+  toward a missing neighbour cube, so span-only columns must hold every
+  cube a visible face looks into. The spans the plans read are padded:
+  `min_h`/`max_h` are unioned with the four edge neighbours' known spans
+  (`SurfaceSpans::lod0_padded`/`l1_padded`; cliff side faces), the top
+  is raised to `SEA_LEVEL` on presets with a sea (the water surface,
+  not the seabed), and the `+ 1` above keeps the cube over a top block on
+  a cube's top row (the sea at y = 63). Without them far oceans showed
+  their sand and cliffs had holes. The desired and keep rules read the
+  same padded spans, so they cannot disagree. `tests/far_faces.rs`
+  settles a real server and asserts no sent cube loses a visible face to
+  an unsent one.
 - **Surface spans** (`spans`): per LOD0 cube column, the exact min/max
   surface height over its 32² block columns, read from the generator's
   cached per-column heights (`Generator::column_surface_bounds`); per

@@ -86,14 +86,28 @@ impl SurfaceSpans {
 
     /// The exact surface bounds of LOD0 cube column `(cx, cz)`, when
     /// already computed.
+    #[cfg(test)]
     pub(crate) fn lod0(&self, cx: i32, cz: i32) -> Option<(i64, i64)> {
         self.lod0.get(&(cx, cz)).copied()
     }
 
     /// The sampled surface bounds of level-1 column `(cx, cz)`, when
     /// already computed.
+    #[cfg(test)]
     pub(crate) fn l1(&self, cx: i32, cz: i32) -> Option<(i64, i64)> {
         self.l1.get(&(cx, cz)).copied()
+    }
+
+    /// [`SurfaceSpans::lod0`] widened by the four edge neighbours' known
+    /// spans: the height range whose faces this column's cubes border.
+    /// See [`padded`].
+    pub(crate) fn lod0_padded(&self, cx: i32, cz: i32) -> Option<(i64, i64)> {
+        padded(&self.lod0, cx, cz)
+    }
+
+    /// [`SurfaceSpans::l1`] widened like [`SurfaceSpans::lod0_padded`].
+    pub(crate) fn l1_padded(&self, cx: i32, cz: i32) -> Option<(i64, i64)> {
+        padded(&self.l1, cx, cz)
     }
 
     /// Queues every column of the LOD0 keep square `(2r+3)²` and the
@@ -164,7 +178,10 @@ impl SurfaceSpans {
                 (0, cx, cz) if lod0_left > 0 => {
                     self.queued.remove(&job);
                     if !self.lod0.contains_key(&(cx, cz)) {
-                        let bounds = generator.column_surface_bounds(cx, cz);
+                        let bounds = with_sea(
+                            generator.column_surface_bounds(cx, cz),
+                            generator.sea_level(),
+                        );
                         if self.lod0.len() >= LOD0_CAP {
                             self.lod0.clear();
                         }
@@ -177,7 +194,8 @@ impl SurfaceSpans {
                 (1, cx, cz) if l1_left > 0 => {
                     self.queued.remove(&job);
                     if !self.l1.contains_key(&(cx, cz)) {
-                        let bounds = l1_sampled_bounds(generator, cx, cz);
+                        let bounds =
+                            with_sea(l1_sampled_bounds(generator, cx, cz), generator.sea_level());
                         if self.l1.len() >= L1_CAP {
                             self.l1.clear();
                         }
@@ -198,6 +216,38 @@ impl SurfaceSpans {
     /// Queued span jobs remaining (test/diagnostic).
     pub(crate) fn pending(&self) -> usize {
         self.queue.len()
+    }
+}
+
+/// Column `(cx, cz)`'s span unioned with its four edge neighbours' spans
+/// (`None` when its own is unknown; unknown neighbours are skipped and the
+/// version bump of their landing rebuilds the lists). The mesher treats a
+/// missing neighbour cube as opaque, so a span-only column next to a
+/// cliff must also hold the cubes beside the neighbour's surface, or the
+/// cliff's side faces are culled against nothing (task 2.13 "broken
+/// chunks"). Faces are axis-aligned: edge neighbours suffice.
+fn padded(map: &HashMap<(i32, i32), (i64, i64)>, cx: i32, cz: i32) -> Option<(i64, i64)> {
+    let (mut lo, mut hi) = *map.get(&(cx, cz))?;
+    for (nx, nz) in [(cx - 1, cz), (cx + 1, cz), (cx, cz - 1), (cx, cz + 1)] {
+        if let Some(&(nlo, nhi)) = map.get(&(nx, nz)) {
+            lo = lo.min(nlo);
+            hi = hi.max(nhi);
+        }
+    }
+    Some((lo, hi))
+}
+
+/// Raises a span's top to the sea surface: `surface_height` is the top
+/// SOLID block, so an ocean column's span would end at its seabed. Beyond
+/// the camera window radius (task 2.13 D) a column streams only its span
+/// cubes, and the mesher culls every face toward a missing cube — so the
+/// sea's top face needs the cube above the water streamed too
+/// (`span_cubes` adds it from this raised top). Worlds without a sea keep
+/// the span unchanged.
+fn with_sea((min, max): (i64, i64), sea_level: Option<i64>) -> (i64, i64) {
+    match sea_level {
+        Some(sea) => (min, max.max(sea)),
+        None => (min, max),
     }
 }
 
@@ -226,10 +276,12 @@ fn l1_sampled_bounds(generator: &Generator, cx: i32, cz: i32) -> (i64, i64) {
 
 #[cfg(test)]
 mod tests {
-    use super::SurfaceSpans;
-    use crate::terrain::Generator;
+    use super::{SurfaceSpans, padded};
+    use crate::terrain::{Generator, SEA_LEVEL};
+    use crate::worldgen::Preset;
     use jbm_core::block::{BlockRegistry, builtin};
     use jbm_core::coords::CUBE_SIZE;
+    use std::collections::HashMap;
 
     fn generator() -> Generator {
         let mut registry = BlockRegistry::new();
@@ -283,7 +335,8 @@ mod tests {
                 brute.1 = brute.1.max(h);
             }
         }
-        assert_eq!((lo, hi), brute);
+        // The top is raised to the sea surface (see `with_sea`).
+        assert_eq!((lo, hi), (brute.0, brute.1.max(SEA_LEVEL)));
 
         // L1 bounds cover the sampled points and stay sane (the overworld
         // relief); they are sampled, so only containment of the samples
@@ -297,6 +350,57 @@ mod tests {
         spans.poll(&generator);
         assert_eq!(spans.version(), before);
         assert_eq!(spans.pending(), 0);
+    }
+
+    /// Task 2.13 regression ("sand in the ocean"): an ocean column's spans
+    /// reach the sea surface, not just its seabed, so far columns
+    /// (span-only streaming) get the water and the cube above it. A
+    /// sea-less world's spans stay the bare surface bounds.
+    #[test]
+    fn ocean_spans_reach_the_sea_surface() {
+        let generator = generator();
+        // The first LOD0 column along +x whose whole surface is under the
+        // sea (its bare bounds top out below `SEA_LEVEL`).
+        let cx = (0..4000)
+            .find(|&cx| generator.column_surface_bounds(cx, 0).1 < SEA_LEVEL)
+            .expect("an ocean column on the overworld");
+        let mut spans = SurfaceSpans::new();
+        spans.ensure_around((cx, 0), 0, 1);
+        while spans.pending() > 0 {
+            spans.poll(&generator);
+        }
+        let (lo, hi) = spans.lod0(cx, 0).unwrap();
+        assert_eq!(lo, generator.column_surface_bounds(cx, 0).0);
+        assert_eq!(hi, SEA_LEVEL, "LOD0 span reaches the sea surface");
+        let (_, l1hi) = spans.l1(cx.div_euclid(2), 0).unwrap();
+        assert!(l1hi >= SEA_LEVEL, "L1 span reaches the sea surface");
+
+        // Classic has no sea: the span is the bare surface bounds.
+        let mut registry = BlockRegistry::new();
+        let blocks = builtin::Blocks::register(&mut registry);
+        let classic = Generator::with_preset(7, blocks, Preset::Classic);
+        let mut spans = SurfaceSpans::new();
+        spans.ensure_around((cx, 0), 0, 1);
+        while spans.pending() > 0 {
+            spans.poll(&classic);
+        }
+        assert_eq!(
+            spans.lod0(cx, 0).unwrap(),
+            classic.column_surface_bounds(cx, 0)
+        );
+    }
+
+    /// A padded span is the union with the known edge neighbours (not the
+    /// diagonals); an unknown own span stays unknown.
+    #[test]
+    fn padded_spans_union_the_edge_neighbours() {
+        let mut map = HashMap::new();
+        map.insert((0, 0), (60, 70));
+        map.insert((1, 0), (100, 140));
+        map.insert((0, -1), (20, 65));
+        map.insert((1, 1), (-50, 500));
+        assert_eq!(padded(&map, 0, 0), Some((20, 140)));
+        assert_eq!(padded(&map, 5, 5), None);
     }
 
     /// Moving the center queues only the new strip, nearest-first.

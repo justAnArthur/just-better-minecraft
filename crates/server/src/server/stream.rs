@@ -334,7 +334,7 @@ fn lod0_keeps(
     if dx * dx + dz * dz > keep_r * keep_r {
         return false;
     }
-    let span = spans.lod0(pos.x, pos.z);
+    let span = spans.lod0_padded(pos.x, pos.z);
     span_dy_keeps(
         span,
         i64::from(jbm_core::coords::CUBE_SIZE),
@@ -374,7 +374,7 @@ fn lod_level_keeps(
     if level != 1 {
         return false;
     }
-    let span = spans.l1(pos.x, pos.z);
+    let span = spans.l1_padded(pos.x, pos.z);
     if dx * dx + dz * dz <= i64::from(window_r) * i64::from(window_r) {
         // Near column: also keep the span extras beyond the window.
         let side = i64::from(jbm_core::coords::CUBE_SIZE) * 2;
@@ -456,7 +456,7 @@ fn stream_player(
         }
         player.desired =
             desired_offsets_surface(r, v, cap, i64::from(center.y), window_r, |dx, dz| {
-                spans.lod0(center.x + dx, center.z + dz)
+                spans.lod0_padded(center.x + dx, center.z + dz)
             });
         player.desired_version = spans.version();
         player.cursor = 0;
@@ -618,7 +618,7 @@ fn stream_player_lod(
             cap,
             l1_center.map_or(0, |c| i64::from(c.y)),
             window_r,
-            |dx, dz| l1_center.and_then(|c| spans.l1(c.x + dx, c.z + dz)),
+            |dx, dz| l1_center.and_then(|c| spans.l1_padded(c.x + dx, c.z + dz)),
         );
         player.lod_walk_version = spans.version();
         player.lod_cursor = 0;

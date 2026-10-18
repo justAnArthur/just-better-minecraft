@@ -175,6 +175,12 @@ impl Generator {
         }
     }
 
+    /// The sea level water fills up to (the top water block's y), or
+    /// `None` for a sea-less world.
+    pub fn sea_level(&self) -> Option<i64> {
+        self.sea_level
+    }
+
     /// Test hook: `generate` calls so far.
     pub fn generate_calls(&self) -> u64 {
         self.generate_calls.load(Ordering::Relaxed)

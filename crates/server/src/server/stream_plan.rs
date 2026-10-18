@@ -66,12 +66,15 @@ pub(crate) fn in_keep(pos: CubePos, center: CubePos, r: u32, v: u32) -> bool {
 pub(crate) type LodWalkEntry = (u8, Offset);
 
 /// The vertical cube indices a column's surface spans, from its surface
-/// height bounds: `[floor(min / side) - 1, floor(max / side)]` — widened by
-/// one cube below so the surface cube's −Y neighbour is there for meshing
-/// and skirts. `side` is the cube side in blocks at the level in question
-/// (`CUBE_SIZE · 2^level`).
+/// height bounds: `[floor(min / side) - 1, floor((max + 1) / side)]` —
+/// widened by one cube below so the surface cube's −Y neighbour is there
+/// for meshing and skirts, and up to the cube holding the air block above
+/// the top surface block. The mesher culls faces toward a missing cube,
+/// so without that cube a top block on a cube's top row (the sea surface
+/// at y = 63 always is) loses its top face. `side` is the cube side in
+/// blocks at the level in question (`CUBE_SIZE · 2^level`).
 pub(crate) fn span_cubes(span: (i64, i64), side: i64) -> (i64, i64) {
-    (span.0.div_euclid(side) - 1, span.1.div_euclid(side))
+    (span.0.div_euclid(side) - 1, (span.1 + 1).div_euclid(side))
 }
 
 /// The `dy` offsets a column adds to the desired set beyond the camera
@@ -478,7 +481,7 @@ mod tests {
     }
 
     /// A column's span cubes are the surface height bounds in cube units,
-    /// widened one cube below.
+    /// widened one cube below and up to the cube above the top block.
     #[test]
     fn span_cubes_floor_and_widen_below() {
         let side = i64::from(CUBE_SIZE);
@@ -486,10 +489,14 @@ mod tests {
         assert_eq!(span_cubes((100, 300), side), (100 / side - 1, 300 / side));
         // Exactly on a cube boundary: the boundary cube is the top.
         assert_eq!(span_cubes((64, 64), side), (2 - 1, 2));
+        // A top block on a cube's top row (the sea surface, y = 63) adds
+        // the cube above, which holds the air its top face looks into.
+        assert_eq!(span_cubes((40, 63), side), (0, 2));
+        assert_eq!(span_cubes((40, 62), side), (0, 1));
         // Negative heights (unbanded test graphs) floor toward -inf.
         assert_eq!(
             span_cubes((-5, 30), side),
-            ((-5i64).div_euclid(side) - 1, 30i64.div_euclid(side))
+            ((-5i64).div_euclid(side) - 1, 31i64.div_euclid(side))
         );
         assert!((-5i64).div_euclid(side) < 0);
     }
