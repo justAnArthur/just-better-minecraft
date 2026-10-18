@@ -70,6 +70,9 @@ struct CullParams {
     // Task 2.12 debug views. x = shown-level mask (bit L = level L
     // draws); y = flags: bit 0 explode, bit 1 freeze; z, w spare.
     debug: vec4u,
+    // The direction-split radius in blocks (task 2.13 C): x = the radius;
+    // y, z, w spare.
+    split: vec4f,
 }
 
 // The freeze-cull view (task 2.12), mirrored by `FreezeParams` in
@@ -232,12 +235,32 @@ fn dir_visible(dirs: VisibleDirs, d: u32) -> bool {
     }
 }
 
+// The direction-split rule (task 2.13 C): beyond `split.x` blocks the
+// cube's whole, direction-contiguous face range draws in ONE command —
+// back-face culling drops exactly the faces direction skipping dropped,
+// so the pixels cannot change. The distance is to the closest point of
+// the camera-relative AABB (the camera sits at the origin), computed
+// with explicit multiplies and adds left to right — no dot(), which a
+// backend may contract into fused multiply-adds while the Rust side
+// (`aabb_distance_squared` in space.rs) would not; the CPU bound and
+// this shader must verdict identically.
+fn cube_far(rel_min: vec3f, rel_max: vec3f) -> bool {
+    let cx = min(max(0.0, rel_min.x), rel_max.x);
+    let cy = min(max(0.0, rel_min.y), rel_max.y);
+    let cz = min(max(0.0, rel_min.z), rel_max.z);
+    let r2 = params.split.x * params.split.x;
+    return cx * cx + cy * cy + cz * cz > r2;
+}
+
 // Appends one command per non-empty, non-skipped direction into this
-// phase's region for the cube's page. idx is bounds-checked against the
-// command capacity: the CPU's frustum bound (region_base) is provably
-// large enough for this shader's identical-math emission, so a drop here
-// is a bound bug — it is counted in region_overflow for the tests to
-// catch instead of corrupting memory.
+// phase's region for the cube's page — or, beyond the direction-split
+// radius, one command over the cube's whole face range (the ranges are
+// direction-contiguous, so the whole range is one span). idx is
+// bounds-checked against the command capacity: the CPU's frustum bound
+// (region_base) is provably large enough for this shader's
+// identical-math emission, so a drop here is a bound bug — it is
+// counted in region_overflow for the tests to catch instead of
+// corrupting memory.
 fn emit(m: CubeMeta, slot: u32, phase_base: u32, rel_min: vec3f, rel_max: vec3f) {
     // A fully masked drawn cube emits nothing (the coverage rule: all
     // eight octants are replaced by ready children).
@@ -252,6 +275,25 @@ fn emit(m: CubeMeta, slot: u32, phase_base: u32, rel_min: vec3f, rel_max: vec3f)
     let page = u32(m.pos_page.w);
     let dirs = visible_dirs(rel_min, rel_max);
     let start = m.start_flags.x;
+    if (cube_far(rel_min, rel_max)) {
+        var total = 0u;
+        for (var d = 0u; d < 6u; d++) {
+            total = total + m.dirs[d / 2u][(d % 2u) * 2u + 1u];
+        }
+        if (total == 0u) {
+            return;
+        }
+        let idx = phase_base + region_base[page] + atomicAdd(&region_counter[page], 1u);
+        if (idx < params.regions.z) {
+            commands[idx] = DrawCmd(total * 6u, 1u, start * 6u, slot);
+        } else {
+            atomicAdd(&stats[STAT_REGION_OVERFLOW], 1u);
+        }
+        atomicAdd(&stats[STAT_COMMANDS], 1u);
+        atomicAdd(&stats[STAT_FACES], total);
+        atomicAdd(&stats[stat_level_faces(level)], total);
+        return;
+    }
     for (var d = 0u; d < 6u; d++) {
         let off = m.dirs[d / 2u][(d % 2u) * 2u];
         let cnt = m.dirs[d / 2u][(d % 2u) * 2u + 1u];

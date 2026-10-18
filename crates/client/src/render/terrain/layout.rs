@@ -183,6 +183,10 @@ pub struct CullParams {
     /// freeze (cull against the frozen view in the `freeze` uniform —
     /// binding 7 — instead of the live camera). z, w spare.
     pub debug: [u32; 4],
+    /// The direction-split radius in blocks (task 2.13 C): x = the
+    /// radius; cubes whose camera-relative AABB is farther than this
+    /// draw their whole face range in one command. y, z, w spare.
+    pub split: [f32; 4],
 }
 
 /// The freeze-cull view captured when the debug view switches on (group 1,
@@ -288,12 +292,15 @@ mod tests {
 
     #[test]
     fn cull_params_layout_matches_wgsl() {
-        assert_eq!(std::mem::size_of::<CullParams>(), 80);
+        // The WGSL mirror (cull.wgsl) is vec4i + vec4f + 3 × vec4u +
+        // vec4f = 96 bytes, every field 16-byte aligned.
+        assert_eq!(std::mem::size_of::<CullParams>(), 96);
         assert_eq!(std::mem::offset_of!(CullParams, camera_cube), 0);
         assert_eq!(std::mem::offset_of!(CullParams, camera_frac), 16);
         assert_eq!(std::mem::offset_of!(CullParams, screen), 32);
         assert_eq!(std::mem::offset_of!(CullParams, regions), 48);
         assert_eq!(std::mem::offset_of!(CullParams, debug), 64);
+        assert_eq!(std::mem::offset_of!(CullParams, split), 80);
     }
 
     #[test]

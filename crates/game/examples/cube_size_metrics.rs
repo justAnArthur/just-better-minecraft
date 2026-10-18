@@ -128,7 +128,7 @@ fn measure_path(label: &str, frames: &mut Frames, terrain: &mut TerrainPass, cam
     if terrain.path() == TerrainPath::GpuCull {
         row(
             &format!("{label} {} region slots (2 phases)", terrain.path_name()),
-            terrain.region_command_slots(camera),
+            terrain.region_command_slots(camera, 4.0 * CUBE_SIZE as f32),
         );
     }
     row(

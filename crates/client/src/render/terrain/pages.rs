@@ -11,7 +11,7 @@ use glam::{IVec3, Vec3};
 use crate::lod::CubeKey;
 use crate::render::suballoc::Suballocator;
 
-use super::space::{Frustum, cube_origin, cube_size, visible_directions};
+use super::space::{Frustum, aabb_distance_squared, cube_origin, cube_size, visible_directions};
 
 /// One cube's uploaded mesh. Empty meshes keep an entry (so the world
 /// knows the cube is meshed) but allocate no page range and hold no meta
@@ -204,11 +204,13 @@ impl MeshBookkeeping {
     /// function counted. The shader's capacity clamp plus the
     /// `region_overflow` counter (asserted zero by the tests) guard the
     /// day that drifts.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn frustum_page_bounds(
         &self,
         camera_cube: IVec3,
         camera_frac: Vec3,
         frustum: &Frustum,
+        split_radius_blocks: f32,
     ) -> Vec<u32> {
         let mut bounds = vec![0u32; self.page_dir_counts.len()];
         for (key, mesh) in &self.meshes {
@@ -226,13 +228,21 @@ impl MeshBookkeeping {
             if !frustum.intersects_aabb(min, max) {
                 continue;
             }
-            let dirs = visible_directions(min, max);
-            let kept = mesh
-                .ranges
-                .iter()
-                .enumerate()
-                .filter(|(d, range)| !range.is_empty() && dirs[*d])
-                .count() as u32;
+            // The direction-split rule (task 2.13 C): beyond the radius a
+            // cube emits ONE command over its whole face range, whatever
+            // directions the frustum-facing test would keep — the same
+            // verdict the cull shader reaches with the same math.
+            let radius_squared = split_radius_blocks * split_radius_blocks;
+            let kept = if aabb_distance_squared(min, max) > radius_squared {
+                u32::from(mesh.ranges.iter().any(|r| !r.is_empty()))
+            } else {
+                let dirs = visible_directions(min, max);
+                mesh.ranges
+                    .iter()
+                    .enumerate()
+                    .filter(|(d, range)| !range.is_empty() && dirs[*d])
+                    .count() as u32
+            };
             bounds[*page] += kept;
         }
         bounds
@@ -320,7 +330,7 @@ mod tests {
         // The cube containing the camera: all six directions, in any
         // frustum. Page 1.
         book.commit(key(0, 0, 0, 0), 1, 54..72, six_ranges(), None, 0, true, 0);
-        let bounds = book.frustum_page_bounds(cube, frac, &frustum);
+        let bounds = book.frustum_page_bounds(cube, frac, &frustum, 1.0e9);
         assert_eq!(bounds, vec![3, 6]);
         assert!(
             bounds
@@ -337,8 +347,12 @@ mod tests {
         // cube keeps its six.
         let mut turned = Camera::new(DVec3::splat(16.0), 70.0_f32.to_radians(), 1.0);
         turned.set_yaw(std::f32::consts::PI);
-        let bounds =
-            book.frustum_page_bounds(cube, frac, &Frustum::from_view_proj(&turned.view_proj()));
+        let bounds = book.frustum_page_bounds(
+            cube,
+            frac,
+            &Frustum::from_view_proj(&turned.view_proj()),
+            1.0e9,
+        );
         assert_eq!(bounds, vec![0, 11]);
 
         // An empty direction range is never counted, even when visible.
@@ -348,8 +362,12 @@ mod tests {
         let mut book = MeshBookkeeping::default();
         book.page_added();
         book.commit(key(0, 0, 0, 0), 0, 0..6, sparse, None, 0, true, 0);
-        let bounds =
-            book.frustum_page_bounds(cube, frac, &Frustum::from_view_proj(&cam.view_proj()));
+        let bounds = book.frustum_page_bounds(
+            cube,
+            frac,
+            &Frustum::from_view_proj(&cam.view_proj()),
+            1.0e9,
+        );
         assert_eq!(bounds, vec![4], "only the four non-empty directions count");
     }
 

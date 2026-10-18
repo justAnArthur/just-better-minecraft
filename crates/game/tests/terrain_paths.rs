@@ -367,6 +367,70 @@ fn edit_spawn_paths_render_pixel_identical() {
     render_all_paths(&gpu, &meshes, &camera, "edit_spawn");
 }
 
+/// Task 2.13 C: the direction-split radius. A camera flying from 400
+/// blocks out to 15 blocks above spawn crosses the default radius (4
+/// cubes = 128 blocks) every run; cubes flip between one-command and
+/// per-direction emission frame to frame, and the gpu-cull and cpu-cull
+/// images must stay pixel-identical throughout (back-face culling drops
+/// exactly what direction skipping dropped).
+#[test]
+#[cfg(not(feature = "cube16"))] // streamed shape and cameras are 32³-only
+fn crossing_the_direction_split_radius_pops_nothing() {
+    let Some(gpu) = gpu_or_skip() else {
+        return;
+    };
+    let mut server = HeadlessServer::with_config(server_config());
+    let (world, meshes, spawn) = streamed_scene(&mut server, &[]);
+    drop(world);
+
+    let target = OffscreenTarget::new(&gpu.device, 256, 256);
+    let depth = DepthTarget::new(&gpu.device, 256, 256);
+    let mut renderer = Renderer::new(&gpu, target.format());
+    renderer.set_viewport(256, 256);
+    assert_eq!(
+        renderer.settings().direction_split_radius,
+        4,
+        "the default radius this test crosses"
+    );
+    let (layers, _) = builtin_textures();
+    let textures = BlockTextures::new(&gpu, &layers).expect("texture array");
+    let mut terrain = TerrainPass::new(&gpu, target.format(), renderer.uniform_layout(), &textures);
+    for (pos, mesh) in &meshes {
+        terrain.upload(&gpu, *pos, mesh);
+    }
+    if !terrain.gpu_cull_available() {
+        println!("skipping: adapter lacks the gpu-cull path");
+        return;
+    }
+    terrain.set_prefer_gpu_cull(true);
+    assert_eq!(terrain.path(), TerrainPath::GpuCull);
+
+    for index in 0..40 {
+        // A straight descent onto spawn: 400 -> 15 blocks over the frames,
+        // crossing 128 blocks (and every nearer band) midway.
+        let s = index as f64 / 39.0;
+        let eye = spawn + DVec3::new(-200.0 * (1.0 - s), 400.0 - 385.0 * s, -200.0 * (1.0 - s));
+        let mut camera = Camera::new(eye, 70.0_f32.to_radians(), 1.0);
+        camera.set_yaw(std::f64::consts::FRAC_PI_4 as f32);
+        camera.set_pitch(-0.4);
+        let gpu_image = render_frame(&gpu, &mut renderer, &target, &depth, &mut terrain, &camera);
+        let stats = terrain.read_cull_stats_blocking(&gpu);
+        assert_eq!(
+            stats.region_overflow, 0,
+            "frame {index}: the CPU frustum bound must cover every GPU emission"
+        );
+        terrain.set_force_cpu_cull(true);
+        let cpu_image = render_frame(&gpu, &mut renderer, &target, &depth, &mut terrain, &camera);
+        terrain.set_force_cpu_cull(false);
+        assert_identical(
+            &gpu_image,
+            &cpu_image,
+            &format!("frame {index}: crossing the direction-split radius changed the image"),
+        );
+    }
+    println!("direction-split crossing: 40 frames identical across the paths");
+}
+
 /// The 60-frame camera path through the spawn region: turning on the spot
 /// above spawn, flying forward and down into the carved room, looking
 /// around inside it, and rising back out.
