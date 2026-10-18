@@ -1010,7 +1010,18 @@ impl ApplicationHandler for App {
             }
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                // Closed mid-flight: still print what the autopilot has,
+                // marked partial, so an early close is not silent.
+                if let Some(autofly) = self.autofly.take() {
+                    println!(
+                        "autofly: stopped early at {:.0} of {:.0} blocks",
+                        autofly.flown, autofly.distance
+                    );
+                    print_frame_time_summary(&self.frame_times);
+                }
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => {
                 // Ignore 0x0 while minimized.
                 if size.width > 0 && size.height > 0 {
