@@ -40,6 +40,33 @@ pub(crate) fn stride(axis: [i32; 3]) -> isize {
 /// rectangles never cross an octant plane (see the module docs) and faces
 /// covered by the skirt or lid rules are emitted with their key bit set.
 pub(crate) fn mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u8) -> MeshOutput {
+    sweep(pad, appearance, level, u32::MAX)
+}
+
+/// [`mesh_padded`] with merge-key bits masked out: every face key is
+/// ANDed with `key_keep` before merging, so dropping the AO byte or the
+/// layer field lets quads merge across them. Test-only measurement hook
+/// (task 2.13 A's quad-split study); the packed layer/AO fields of the
+/// result are garbage — only the face count is meaningful.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn sweep_key_masked(
+    pad: &[u32],
+    appearance: &BlockAppearance,
+    level: u8,
+    key_keep: u32,
+) -> MeshOutput {
+    sweep(pad, appearance, level, key_keep)
+}
+
+/// The mask of merge-key bits the AO byte occupies (bits 7..15).
+#[cfg(any(test, feature = "testing"))]
+pub(crate) const KEY_AO_BITS: u32 = 0xFF << 7;
+/// The mask of merge-key bits the texture layer occupies (bits 15..30,
+/// below the skirt bit).
+#[cfg(any(test, feature = "testing"))]
+pub(crate) const KEY_LAYER_BITS: u32 = 0x7FFF << 15;
+
+fn sweep(pad: &[u32], appearance: &BlockAppearance, level: u8, key_keep: u32) -> MeshOutput {
     let mut output = MeshOutput {
         faces: Vec::new(),
         ranges: std::array::from_fn(|_| 0u32..0),
@@ -121,7 +148,7 @@ pub(crate) fn mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u8) 
                         let ao = corner_ao(pad, b_index as isize, u, v);
                         (1 << 31) | (layer << 15) | (ao << 7) | LIGHT
                     };
-                    mask[(vi * CUBE_SIZE as isize + ui) as usize] = key;
+                    mask[(vi * CUBE_SIZE as isize + ui) as usize] = key & key_keep;
                 }
             }
 

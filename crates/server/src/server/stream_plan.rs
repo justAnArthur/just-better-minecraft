@@ -241,11 +241,16 @@ pub(crate) fn lod_walk_surface(
 }
 
 /// The level-`level` cube (level >= 1) containing the LOD0 cube `lod0`:
-/// `div_euclid(2^(level-1))` per axis, so negative coordinates nest
-/// exactly.
+/// `div_euclid(2^level)` per axis — `CubeKey::parent` applied `level`
+/// times, each halving — so negative coordinates nest exactly. (Task
+/// 2.13's far_metrics caught this dividing by only `2^(level-1)`: the
+/// level-1 ring then streamed around the raw LOD0 center, which near the
+/// origin still overlapped the parents the client's coverage rule needs
+/// but anywhere farther left LOD0 coverage-dead with a coarse level
+/// drawing right next to the player.)
 pub(crate) fn level_center(lod0: CubePos, level: u8) -> CubePos {
     debug_assert!(level >= 1);
-    let shift = 1i32 << (level - 1);
+    let shift = 1i32 << level;
     CubePos {
         x: lod0.x.div_euclid(shift),
         y: lod0.y.div_euclid(shift),
@@ -358,13 +363,13 @@ mod tests {
     fn level_centers_nest_at_negative_coordinates() {
         use super::level_center;
         let lod0 = CubePos { x: -7, y: 3, z: -5 };
-        assert_eq!(level_center(lod0, 1), lod0);
-        assert_eq!(level_center(lod0, 2), CubePos { x: -4, y: 1, z: -3 });
-        assert_eq!(level_center(lod0, 3), CubePos { x: -2, y: 0, z: -2 });
+        assert_eq!(level_center(lod0, 1), CubePos { x: -4, y: 1, z: -3 });
+        assert_eq!(level_center(lod0, 2), CubePos { x: -2, y: 0, z: -2 });
+        assert_eq!(level_center(lod0, 3), CubePos { x: -1, y: 0, z: -1 });
         // Every level-n cube maps back onto its LOD0 children.
         for level in 1..=4u8 {
             let center = level_center(lod0, level);
-            let back = 1i32 << (level - 1);
+            let back = 1i32 << level;
             assert!(center.x * back <= lod0.x && lod0.x < (center.x + 1) * back);
             assert!(center.y * back <= lod0.y && lod0.y < (center.y + 1) * back);
             assert!(center.z * back <= lod0.z && lod0.z < (center.z + 1) * back);

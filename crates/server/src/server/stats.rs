@@ -190,6 +190,17 @@ impl Server {
         self.world.len()
     }
 
+    /// Approximate heap bytes of the resident LOD0 world cubes: each
+    /// `Cube`'s [`Cube::heap_bytes`] plus the `Cube` struct itself (the
+    /// map entry overhead is excluded). Diagnostic; task 2.13's
+    /// `far_metrics` reports it next to the pyramid's `lod_heap_bytes`.
+    pub fn world_heap_bytes(&self) -> usize {
+        self.world
+            .values()
+            .map(|cube| cube.heap_bytes() + std::mem::size_of::<jbm_core::cube::Cube>())
+            .sum()
+    }
+
     /// The level-`level` LOD cube at `pos`, when the pyramid holds one
     /// (levels are 1-based; `lod_levels` bounds the top).
     pub fn lod_cube(&self, level: u8, pos: CubePos) -> Option<&jbm_core::cube::Cube> {
