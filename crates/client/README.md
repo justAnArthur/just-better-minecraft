@@ -802,7 +802,7 @@ its startup environment variable:
 
 | View | Env var | Effect |
 |---|---|---|
-| wireframe | `JBM_WIREFRAME=1` | dark lines along every triangle edge, about 1.5 px wide at any distance (fragment shader, barycentrics with `fwidth` — no `POLYGON_MODE_LINE`) |
+| wireframe | `JBM_WIREFRAME=1` | dark lines along every triangle edge, about 1 px wide at any distance (fragment shader, barycentrics with `fwidth` — no `POLYGON_MODE_LINE`) |
 | wireframe only | `JBM_WIREFRAME_ONLY=1` | the edges over a flat near-black background; no textures, shade, tint or fog |
 | chunk borders | `JBM_CHUNK_BORDERS=1` | line boxes around resident cubes within 3 cubes per level (`render/lines.rs`, depth-tested), colored by the level-tint palette |
 | exploded | `JBM_EXPLODE=<gap 0..8>` | the vertex shader shifts every cube by `gap ×` its cube-grid offset; while nonzero **frustum culling is skipped on every path** (the moved cubes sit outside every conservative bound — the CPU region bound falls back to the static per-page totals) |

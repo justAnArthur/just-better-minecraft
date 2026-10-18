@@ -377,11 +377,11 @@ fn vs_main(
 }
 
 // The wireframe debug view's edge test (task 2.12): coverage in 0..1 of
-// the triangle's edges, about 1.5 pixels wide whatever the distance or
+// the triangle's edges, about one pixel wide whatever the distance or
 // the triangle's size, antialiased over one pixel. Screen-space
 // derivatives, so it must run in uniform control flow: fs_main calls it
 // only behind the uniform debug flags, before anything can discard.
-const WIRE_PIXELS: f32 = 1.5;
+const WIRE_PIXELS: f32 = 0.5;
 
 fn wireframe_edge(in: VsOut) -> f32 {
     let pixels = in.bary / max(fwidth(in.bary), vec3f(1e-6));
@@ -444,7 +444,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     // Wireframe (task 2.12): dark lines over the shaded terrain, drawn
     // last so they read through fog.
     if (terrain.debug.x > 0.5) {
-        color = mix(color, vec3f(0.05), edge);
+        color = mix(color, vec3f(0.05), 0.7 * edge);
     }
     return vec4f(color, 1.0);
 }

@@ -211,10 +211,14 @@ fn wireframe_edges_over_untouched_interiors() {
             (x0.min(x1) as i32 + 6, y0.min(y1) as i32 + 6),
             (x0.max(x1) as i32 - 6, y0.max(y1) as i32 - 6),
         );
-        // The edge color 0.05 linear lands at sRGB ~63 per channel.
+        // An edge pixel is clearly darker than the plain render there (the
+        // lines are thin and blend 70% toward 0.05 linear, so antialiased
+        // pixels never reach a fixed dark level).
         let is_dark = |image: &RgbaImage, x: i32, y: i32| {
-            let p = image.get_pixel(x as u32, y as u32);
-            u32::from(p[0]).min(u32::from(p[1])).min(u32::from(p[2])) < 90
+            let sum = |p: &image::Rgba<u8>| p.0[..3].iter().map(|&c| i32::from(c)).sum::<i32>();
+            let wired = sum(image.get_pixel(x as u32, y as u32));
+            let base = sum(plain.get_pixel(x as u32, y as u32));
+            base - wired > 30
         };
         let mut dark = 0;
         for y in lo.1..=hi.1 {
