@@ -383,7 +383,7 @@ without physics; the next tick's streaming observes the new center.
 | --- | --- | --- |
 | `seed: u64` | `DEFAULT_SEED` | terrain seed |
 | `streaming: bool` | `true` | cube streaming on/off |
-| `view_radius: u32` | 8 | horizontal radius, cubes |
+| `view_radius: u32` | 16 | horizontal radius, cubes (task 2.13 E: LOD0 to ~512 blocks) |
 | `vertical_radius: u32` | 4 | vertical radius, cubes |
 | `send_budget_per_tick: usize` | 64 | CubeData per player per tick |
 | `gen_threads: usize` | `available_parallelism() - 2`, min 1 | 0 = inline mode |
@@ -391,7 +391,8 @@ without physics; the next tick's streaming observes the new center.
 | `max_in_flight: usize` | 512 | queued + generating + uncollected |
 | `world_dir: Option<PathBuf>` | `None` | persistence; `None` = today's behavior |
 | `save_interval: Duration` | 5 s | snapshot cadence for the save thread |
-| `lod_levels: u8` | 6 | top LOD level kept; 0 disables the pyramid |
+| `lod_levels: u8` | 5 | top LOD level kept; 0 disables the pyramid (rings 1..16 km since task 2.13 E) |
+| `lod_view_radius: u32` | 16 | horizontal radius of every ring, in that ring's cubes; clamped to `view_radius / 2 + 1` or above by `ServerConfig::clamped` (task 2.13 E) so L1 starts beyond LOD0 |
 | `max_column_cubes: usize` | 16 | most cubes desired per column beyond the camera window, nearest first; 0 reproduces the fixed camera-only windows |
 | `camera_window_radius: u32` | 4 | the camera window applies only within this horizontal radius (cubes); beyond it a column streams only its surface span (task 2.13 D) |
 
@@ -458,7 +459,14 @@ r = 8, v = 3: 1407 disk vs 1064 annulus cubes, +32%). Since task 2.10
 the level-1 disk also unions each column's **surface span** (the same
 `max_column_cubes` cap as LOD0; coarser levels need none — see "Cube
 streaming"), so a flying camera's level-1 window miss does not leave the
-surface below to level 2+.
+surface below to level 2+. Since task 2.13 D the level-1 camera window
+applies only within `camera_window_radius`; far level-1 columns keep
+only their sampled span. And since task 2.13 E the defaults put every
+ring beyond LOD0: `lod_view_radius` 16 (level *n* reaches
+`lod_view_radius · 32 · 2^n` blocks — 1 km at L1 through 16 km at L5)
+with the `lod_view_radius ≥ view_radius / 2 + 1` floor (`ServerConfig::
+clamped`, `Server::set_view_radius` and the panel all enforce it) so L1
+never starts inside the LOD0 disk.
 
 - **Order.** One merged walk over `(level, offset)`, precomputed once
   from the config: sorted by the offset's squared distance in level

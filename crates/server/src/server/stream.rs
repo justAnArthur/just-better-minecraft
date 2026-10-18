@@ -39,6 +39,16 @@ impl Server {
     pub fn set_view_radius(&mut self, view_radius: u32, lod_view_radius: u32) {
         self.config.view_radius = view_radius.clamp(2, 32);
         self.config.lod_view_radius = lod_view_radius.clamp(2, 16);
+        // Task 2.13 E's floor, live: keep L1 beyond the LOD0 disk (the
+        // same clamp and warning ServerConfig::clamped prints).
+        let min = ServerConfig::min_lod_view_radius(self.config.view_radius);
+        if self.config.lod_view_radius < min {
+            eprintln!(
+                "jbm: lod_view_radius {} would leave L1 inside LOD0 (view_radius {}); using {min}",
+                self.config.lod_view_radius, self.config.view_radius
+            );
+            self.config.lod_view_radius = min;
+        }
         let (r, v, cap, window_r) = (
             self.config.view_radius,
             self.config.vertical_radius,

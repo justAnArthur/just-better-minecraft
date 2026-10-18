@@ -23,16 +23,20 @@ on the pre-2.8 terrain pins `ServerConfig { worldgen: Preset::Classic }`
 goldens and height assumptions keep their meaning; `lod_fly` alone uses
 the new `Overworld`, as the real-flight check.
 
-**Far-look wiring (task 2.9):** `main` derives a
-`jbm_client::app::ViewSetup` from its `ServerConfig` before the config
-moves into the server (its `view_radius`, `lod_view_radius` and
-`lod_levels`; the client turns them into block radii with
-`jbm_core::lod::ring_radii`, the same rule as `ServerConfig::ring_radii()`),
-and runs the client
-with `app::run_with_view`. The
-client cannot learn these from the link; its terrain pass scales the
-texture→flat fade and the distance-fog windows on them (see the client
-README, "The far look").
+**Far-look wiring (task 2.9, defaults since task 2.13 E):** `main`
+builds its `ServerConfig` (defaults: `view_radius` 16 — LOD0 full
+detail to ~512 blocks; `lod_view_radius` 16 and `lod_levels` 5 — rings
+at 1, 2, 4, 8 and 16 km, each twice the previous, so coarse levels
+start only beyond LOD0), passes it through `ServerConfig::clamped`
+(the `lod_view_radius ≥ view_radius / 2 + 1` floor that keeps L1
+outside LOD0), and derives a `jbm_client::app::ViewSetup` from it
+before the config moves into the server (its `view_radius`,
+`lod_view_radius` and `lod_levels`; the client turns them into block
+radii with `jbm_core::lod::ring_radii`, the same rule as
+`ServerConfig::ring_radii()`), and runs the client with
+`app::run_with_view`. The client cannot learn these from the link;
+its terrain pass scales the texture→flat fade and the distance-fog
+windows on them (see the client README, "The far look").
 
 **World persistence (task 2.3):** the server saves into `saves/default`
 under the current directory. `JBM_WORLD_DIR=<path>` overrides the
@@ -114,7 +118,7 @@ play on gpu-cull, run `JBM_GPU_CULL=1 cargo run -p jbm-game --release`
 
 **LOD rings (task 2.6).** `terrain_draw` adds `rings/cpu_cull` and
 `rings/gpu_cull`: the rings scene at game scale (default
-`lod_view_radius`, 6 levels since task 2.10) built in
+`lod_view_radius`, 5 levels since task 2.13 E) built in
 `benches/common/rings.rs` —
 levels 0–1 from the real generator (level 1 by the core downsampling
 rule over level-0 data), levels 2–5 sampled from the generator's

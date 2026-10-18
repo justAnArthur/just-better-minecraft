@@ -24,7 +24,9 @@ pub struct ServerConfig {
     pub worldgen: crate::worldgen::Preset,
     /// Whether cubes are streamed to players at all.
     pub streaming: bool,
-    /// Horizontal streaming radius, in cubes (`dx² + dz² ≤ r²`).
+    /// Horizontal streaming radius, in cubes (`dx² + dz² ≤ r²`). Task
+    /// 2.13 E raised the default 8 -> 16: LOD0 (full detail) reaches
+    /// ~512 blocks, and the coarse rings start only beyond it.
     pub view_radius: u32,
     /// Vertical streaming radius, in cubes (`|dy| ≤ v`).
     pub vertical_radius: u32,
@@ -43,13 +45,16 @@ pub struct ServerConfig {
     pub world_dir: Option<PathBuf>,
     /// How often dirty cubes are snapshotted to the save thread.
     pub save_interval: Duration,
-    /// Top LOD level the server keeps (6 keeps LOD1–LOD6: L5 cells are 32
-    /// blocks, L6 64, and the outer ring reaches ~16 km). `0` disables the
+    /// Top LOD level the server keeps (5 since task 2.13 E: each ring is
+    /// twice the previous — 1, 2, 4, 8, 16 km — with `lod_view_radius` 16;
+    /// the same ~16 km far reach the old 6 levels had). `0` disables the
     /// pyramid entirely: no allocation, no work per cube or edit.
     pub lod_levels: u8,
     /// Horizontal radius of every LOD ring, in cubes of that ring's level.
     /// Each level streams a full disk; the client draws the finest ready
-    /// level per octant.
+    /// level per octant. 16 since task 2.13 E: level *n* reaches
+    /// `lod_view_radius · 32 · 2^n` blocks (1 km at L1 … 16 km at L5), so
+    /// L1 starts beyond the 512-block LOD0 disk instead of inside it.
     pub lod_view_radius: u32,
     /// Vertical radius of every LOD ring, in cubes of that ring's level.
     pub lod_vertical_radius: u32,
@@ -84,7 +89,7 @@ impl Default for ServerConfig {
             seed: DEFAULT_SEED,
             worldgen: crate::worldgen::Preset::Overworld,
             streaming: true,
-            view_radius: 8,
+            view_radius: 16,
             vertical_radius: 4,
             send_budget_per_tick: 64,
             gen_threads: parallelism.saturating_sub(2).max(1),
@@ -92,8 +97,8 @@ impl Default for ServerConfig {
             max_in_flight: 512,
             world_dir: None,
             save_interval: Duration::from_secs(5),
-            lod_levels: 6,
-            lod_view_radius: 8,
+            lod_levels: 5,
+            lod_view_radius: 16,
             lod_vertical_radius: 3,
             lod_send_budget_per_tick: 32,
             lod_max_in_flight: 256,
@@ -104,6 +109,33 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
+    /// The ring-radius floor of task 2.13 E: `lod_view_radius` must reach
+    /// at least `view_radius / 2 + 1`, so level 1 (`lod_view_radius · 64`
+    /// blocks) starts beyond the LOD0 disk (`view_radius · 32` blocks) by
+    /// at least one L1 cube — otherwise L1 draws nothing and LOD0's edge
+    /// meets a hole. [`ServerConfig::clamped`] enforces it.
+    pub fn min_lod_view_radius(view_radius: u32) -> u32 {
+        jbm_core::lod::min_lod_view_radius(view_radius)
+    }
+
+    /// [`ServerConfig`] with the ring-radius floor enforced: raises
+    /// `lod_view_radius` to `view_radius / 2 + 1` with a one-line warning
+    /// when an override (environment, slider, test) left L1 inside LOD0.
+    /// The game and `Server::with_config` both build their config through
+    /// here, so the streamed rings and the client's far-look radii (which
+    /// the game copies before the server exists) can never disagree.
+    pub fn clamped(mut self) -> Self {
+        let min = Self::min_lod_view_radius(self.view_radius);
+        if self.lod_view_radius < min {
+            eprintln!(
+                "jbm: lod_view_radius {} would leave L1 inside LOD0 (view_radius {}); using {min}",
+                self.lod_view_radius, self.view_radius
+            );
+            self.lod_view_radius = min;
+        }
+        self
+    }
+
     /// Streaming off and no generation threads: a server that only speaks
     /// the handshake/ping/tick protocol. Tests and benches that assert
     /// exact message sequences use this so their meaning stays unchanged.
@@ -123,5 +155,62 @@ impl ServerConfig {
     /// the config, passes the radii along at startup.
     pub fn ring_radii(&self) -> (f32, f32) {
         jbm_core::lod::ring_radii(self.view_radius, self.lod_view_radius, self.lod_levels)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Task 2.13 E: the shipped defaults already satisfy the
+    /// ring-radius floor, so `clamped` leaves them alone; an override
+    /// that left L1 inside the LOD0 disk rises to the floor; nothing
+    /// above it moves.
+    #[test]
+    fn clamped_enforces_the_ring_radius_floor() {
+        let defaults = ServerConfig::default().clamped();
+        assert_eq!(
+            (
+                defaults.view_radius,
+                defaults.lod_view_radius,
+                defaults.lod_levels
+            ),
+            (16, 16, 5),
+            "the task 2.13 E defaults"
+        );
+
+        let low = ServerConfig {
+            view_radius: 16,
+            lod_view_radius: 8,
+            ..ServerConfig::default()
+        }
+        .clamped();
+        assert_eq!(low.lod_view_radius, 9, "16 / 2 + 1");
+        assert_eq!(low.view_radius, 16, "only the ring radius moves");
+
+        let high = ServerConfig {
+            view_radius: 8,
+            lod_view_radius: 16,
+            ..ServerConfig::default()
+        }
+        .clamped();
+        assert_eq!(high.lod_view_radius, 16, "above the floor is untouched");
+    }
+
+    /// The floor keeps level 1's ring (in blocks) strictly outside the
+    /// LOD0 disk at every slider combination — a full L1 cube beyond
+    /// at even view radii, half a cube at odd ones (integer division).
+    #[test]
+    fn floor_keeps_l1_beyond_lod0() {
+        for view_radius in 2..=32u32 {
+            let lod = ServerConfig::min_lod_view_radius(view_radius);
+            let cube = u64::try_from(jbm_core::coords::CUBE_SIZE).unwrap();
+            let lod0_blocks = u64::from(view_radius) * cube;
+            let l1_blocks = u64::from(lod) * cube * 2;
+            assert!(
+                l1_blocks > lod0_blocks,
+                "L1 at {l1_blocks} blocks is not beyond LOD0 at {lod0_blocks}"
+            );
+        }
     }
 }

@@ -36,6 +36,9 @@ fn streaming_config() -> ServerConfig {
         gen_budget_per_tick: 64,
         max_in_flight: 512,
         lod_levels: 4,
+        // Pinned since task 2.13 E: these tests ride the ring size, not
+        // the shipped defaults (whose view/lod radii both grew to 16).
+        lod_view_radius: 4,
         ..ServerConfig::default()
     }
 }

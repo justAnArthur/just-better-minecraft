@@ -11,7 +11,10 @@
 //! client's face-page bytes, and one frame's CPU cost (encode + GPU wait;
 //! timestamp queries are not enabled on the device, so there is no
 //! separate GPU-time number). Two cameras — spawn and a deterministic
-//! mountain top — each at `view_radius` 8 and 16 with the rings as today.
+//! mountain top. The baseline run pins the pre-2.13 rings
+//! (`view_radius` 8 and 16, `lod_view_radius` 8, `lod_levels` 6); the
+//! task 2.13 E `far_metrics_defaults` run measures the shipped
+//! defaults, and `far_shots` saves the tinted before/after PNGs.
 //! Everything the task's later steps are judged against comes from here.
 #![cfg(not(feature = "cube16"))]
 
@@ -228,22 +231,20 @@ fn settle(
     started.elapsed().as_secs_f64()
 }
 
-/// One measurement run: settle at `site` with `view_radius` cubes and
-/// print the table. `tag` names the rows.
+/// One measurement run: settle at `site` with `config` and print the
+/// table. `tag` names the rows.
 fn measure_site(
     gpu: &Gpu,
     nav: &Generator,
     site: DVec3,
-    view_radius: u32,
+    config: ServerConfig,
     tag: &str,
     deadline: Instant,
 ) {
-    println!("\n=== {tag}: view_radius {view_radius} (rings as today) ===");
-    let config = ServerConfig {
-        gen_threads: 4,
-        view_radius,
-        ..ServerConfig::default()
-    };
+    println!(
+        "\n=== {tag}: view_radius {} (lod_view_radius {}, lod_levels {}) ===",
+        config.view_radius, config.lod_view_radius, config.lod_levels
+    );
     let mut server = Server::with_config(config);
     let (mut client, server_end) = jbm_core::link::in_process_pair();
     server.add_connection(server_end);
@@ -439,8 +440,26 @@ fn measure_site(
     );
 }
 
+/// The pre-2.13 ring shape the task A baseline was measured with:
+/// `lod_view_radius` 8, `lod_levels` 6 ("the rings as today" then).
+/// Pinned so the baseline test keeps its meaning after task 2.13 E
+/// changed the defaults — with one caveat: at `view_radius` 16 the
+/// 2.13 E ring-radius floor clamps `lod_view_radius` 8 up to 9, so the
+/// vr16 baseline rows are no longer bit-reproducible; the recorded
+/// table (target/2.13-far-baseline2.txt) is the authority for those.
+fn baseline_rings(view_radius: u32) -> ServerConfig {
+    ServerConfig {
+        gen_threads: 4,
+        view_radius,
+        lod_view_radius: 8,
+        lod_levels: 6,
+        ..ServerConfig::default()
+    }
+}
+
 /// Task 2.13 A's baseline table: spawn and the mountain top, each at
-/// `view_radius` 8 and 16, rings as today. Ignored (slow, GPU): run with
+/// `view_radius` 8 and 16, the pre-2.13 rings (see [`baseline_rings`]).
+/// Ignored (slow, GPU): run with
 /// `cargo test -p jbm-game --test far_metrics -- --ignored --nocapture`.
 #[test]
 #[ignore = "slow real-server measurement; run with --ignored"]
@@ -461,7 +480,7 @@ fn far_metrics_baseline() {
             &gpu,
             &nav,
             spawn,
-            view_radius,
+            baseline_rings(view_radius),
             "spawn",
             start + TEST_TIMEOUT,
         );
@@ -471,7 +490,7 @@ fn far_metrics_baseline() {
             &gpu,
             &nav,
             mountain,
-            view_radius,
+            baseline_rings(view_radius),
             "mountain",
             start + TEST_TIMEOUT,
         );
@@ -480,4 +499,141 @@ fn far_metrics_baseline() {
         "\nfar_metrics done in {:.0} s",
         start.elapsed().as_secs_f64()
     );
+}
+
+/// Task 2.13 E: the same table at the shipped defaults — `view_radius`
+/// 16, `lod_view_radius` 16, `lod_levels` 5 (LOD0 to 512 blocks, rings
+/// at 1..16 km). Ignored (slow, GPU): run with
+/// `cargo test -p jbm-game --test far_metrics far_metrics_defaults -- --ignored --nocapture`.
+#[test]
+#[ignore = "slow real-server measurement; run with --ignored"]
+fn far_metrics_defaults() {
+    let start = Instant::now();
+    let Some(gpu) = jbm_client::testing::screenshot::gpu_or_skip() else {
+        return;
+    };
+    let mut registry = jbm_core::block::BlockRegistry::new();
+    let blocks = jbm_core::block::builtin::Blocks::register(&mut registry);
+    let nav = Generator::with_preset(DEFAULT_SEED, blocks, Preset::Overworld);
+    let spawn = DVec3::from(nav.spawn());
+    let mountain = mountain_top(&nav, 2048);
+    let defaults = ServerConfig {
+        gen_threads: 4,
+        ..ServerConfig::default()
+    };
+    assert_eq!(
+        (
+            defaults.view_radius,
+            defaults.lod_view_radius,
+            defaults.lod_levels
+        ),
+        (16, 16, 5),
+        "the task 2.13 E defaults"
+    );
+
+    for (site, tag) in [(spawn, "spawn"), (mountain, "mountain")] {
+        measure_site(
+            &gpu,
+            &nav,
+            site,
+            defaults.clone(),
+            tag,
+            start + TEST_TIMEOUT,
+        );
+    }
+    println!(
+        "\nfar_metrics (defaults) done in {:.0} s",
+        start.elapsed().as_secs_f64()
+    );
+}
+
+/// Task 2.13 E's deliverable shots: spawn and the mountain top, LOD tint
+/// on, at the pre-E defaults (`view_radius` 8, `lod_view_radius` 8,
+/// `lod_levels` 6) and at the shipped ones (16 / 16 / 5) — LOD0 visibly
+/// reaches about 4x the area after. Saved under `target/2.13-shots/`.
+/// Ignored (slow, GPU): run with
+/// `cargo test -p jbm-game --test far_metrics far_shots -- --ignored --nocapture`.
+#[test]
+#[ignore = "slow real-server measurement; run with --ignored"]
+fn far_shots() {
+    let start = Instant::now();
+    let Some(gpu) = jbm_client::testing::screenshot::gpu_or_skip() else {
+        return;
+    };
+    let mut registry = jbm_core::block::BlockRegistry::new();
+    let blocks = jbm_core::block::builtin::Blocks::register(&mut registry);
+    let nav = Generator::with_preset(DEFAULT_SEED, blocks, Preset::Overworld);
+    let spawn = DVec3::from(nav.spawn());
+    let mountain = mountain_top(&nav, 2048);
+    let before = ServerConfig {
+        gen_threads: 4,
+        view_radius: 8,
+        lod_view_radius: 8,
+        lod_levels: 6,
+        ..ServerConfig::default()
+    };
+    let after = ServerConfig {
+        gen_threads: 4,
+        ..ServerConfig::default()
+    };
+    let shot_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("target")
+        .join("2.13-shots");
+    std::fs::create_dir_all(&shot_dir).expect("shot dir");
+
+    for (site, tag) in [(spawn, "spawn"), (mountain, "mountain")] {
+        for (config, when) in [(before.clone(), "before"), (after.clone(), "after")] {
+            let mut server = Server::with_config(config);
+            let (mut client, server_end) = jbm_core::link::in_process_pair();
+            server.add_connection(server_end);
+            client
+                .send(ClientMsg::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    name: "far_shots".to_owned(),
+                })
+                .unwrap();
+            let mut win = MetricsClient::new(&gpu);
+            join_and_teleport(
+                &mut server,
+                &mut win,
+                &mut client,
+                &gpu,
+                site,
+                start + TEST_TIMEOUT,
+            );
+
+            const EYE: f64 = 1.62;
+            let mut camera = Camera::new(
+                site + DVec3::new(0.0, EYE, 0.0),
+                70.0_f32.to_radians(),
+                WIDTH as f32 / HEIGHT as f32,
+            );
+            let spawn_pos = DVec3::from(nav.spawn());
+            let to_spawn = spawn_pos - camera.position;
+            camera.set_yaw(f32::atan2(to_spawn.x as f32, -to_spawn.z as f32));
+            camera.set_pitch(-15.0_f32.to_radians());
+
+            settle(
+                &mut server,
+                &mut win,
+                &mut client,
+                &gpu,
+                &camera,
+                start + TEST_TIMEOUT,
+            );
+            win.renderer.set_fog(true);
+            win.renderer.set_lod_tint(true);
+            for _ in 0..WARMUP_FRAMES {
+                win.render_frame(&gpu, &camera);
+            }
+            win.render_frame(&gpu, &camera);
+            let image = win.target.read_rgba(&gpu);
+            let path = shot_dir.join(format!("{tag}_{when}.png"));
+            image
+                .save(&path)
+                .unwrap_or_else(|err| panic!("save {}: {err}", path.display()));
+            println!("saved {}", path.display());
+        }
+    }
 }

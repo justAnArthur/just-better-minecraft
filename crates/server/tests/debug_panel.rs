@@ -181,7 +181,10 @@ fn set_view_radius_clamps_both_radii() {
     server.set_view_radius(0, 0);
     assert_eq!(server.config_view_radius(), (2, 2));
     server.set_view_radius(u32::MAX, u32::MAX);
-    assert_eq!(server.config_view_radius(), (32, 16));
+    // Task 2.13 E: the ring-radius floor raises lod_view_radius past the
+    // slider's 2..=16 range when the view radius is 32 — L1 must start
+    // beyond the LOD0 disk (32 / 2 + 1 = 17).
+    assert_eq!(server.config_view_radius(), (32, 17));
     server.set_view_radius(8, 8);
     assert_eq!(server.config_view_radius(), (8, 8));
 }

@@ -68,6 +68,16 @@ pub fn ring_radii(view_radius: u32, lod_view_radius: u32, lod_levels: u8) -> (f3
     )
 }
 
+/// The ring-radius floor (task 2.13 E): `lod_view_radius` must reach at
+/// least `view_radius / 2 + 1`, so level 1 (`lod_view_radius · CUBE_SIZE
+/// · 2` blocks) starts beyond the LOD0 disk (`view_radius · CUBE_SIZE`)
+/// by at least one L1 cube — otherwise L1 draws nothing and LOD0's edge
+/// meets a hole. The server config, the game and the debug panel all
+/// clamp through this one rule.
+pub fn min_lod_view_radius(view_radius: u32) -> u32 {
+    view_radius / 2 + 1
+}
+
 /// A cube at a LOD level. Level 0 is the streamed world itself ("LOD0");
 /// a level-*n* cube at `pos` covers blocks `pos * CUBE_SIZE * 2^n` onwards
 /// and each of its cells is `2^n` blocks per side. One key type names
@@ -449,6 +459,26 @@ mod tests {
     const DIRT: BlockStateId = BlockStateId(2);
     const GRASS: BlockStateId = BlockStateId(3);
     const PLANKS: BlockStateId = BlockStateId(4);
+
+    /// Task 2.13 E: the floor keeps L1 beyond LOD0 at the defaults and at
+    /// every slider combination.
+    #[test]
+    fn min_lod_view_radius_keeps_l1_beyond_lod0() {
+        let cube = CUBE_SIZE as f32;
+        let check = |view: u32, lod: u32| {
+            let lod0 = view as f32 * cube;
+            let l1 = lod as f32 * cube * 2.0;
+            assert!(l1 > lod0, "L1 {l1} not beyond LOD0 {lod0}");
+        };
+        check(16, min_lod_view_radius(16));
+        for view in 2..=32u32 {
+            check(view, min_lod_view_radius(view));
+        }
+        // The floor itself is the smallest radius that satisfies it.
+        assert_eq!(min_lod_view_radius(16), 9);
+        assert_eq!(min_lod_view_radius(32), 17);
+        assert_eq!(min_lod_view_radius(8), 5);
+    }
 
     /// The one far-look radius rule (task 2.12): the LOD0 disk in blocks,
     /// and the outermost ring scaled by `2^lod_levels`. The shipped

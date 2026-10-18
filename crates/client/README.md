@@ -408,7 +408,10 @@ invisible:
   `RenderSettings::from_env()` read; the renderer-owned settings hand
   them to the terrain pass every frame (`Renderer::set_view_distance`
   changes them). Defaults match the `ServerConfig` defaults
-  (`DEFAULT_LOD0_RING_RADIUS`, `DEFAULT_FURTHEST_RING_RADIUS`).
+  (`DEFAULT_LOD0_RING_RADIUS`, `DEFAULT_FURTHEST_RING_RADIUS` — since
+  task 2.13 E a 512-block LOD0 disk and a 16 km furthest ring; the
+  panel's ring-radius slider clamps to `lod_view_radius ≥
+  view_radius / 2 + 1` so L1 always starts beyond LOD0).
 - **Test hooks:** `Renderer::set_fog(bool)` (also `JBM_NO_FOG=1`, read
   once by the app through `RenderSettings::from_env`) switches the fog
   off entirely so screenshot tests can isolate geometry from fog; the
