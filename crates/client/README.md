@@ -201,14 +201,29 @@ occlude; cutout and air do not.
 The mesher first builds a padded `(CUBE_SIZE + 2)³` array (center via
 `Cube::iter()`, which is ~3× faster than per-block `get`; neighbor shells
 via bounded loops — uniform neighbors fill, non-uniform use `get_index` on
-just the border cells). Per direction and slice, coplanar faces with identical
-(texture layer, AO pattern, light) merge into maximal rectangles: extend
-along u first, then along v. Faces never span outside the cube. Output is
-grouped by direction (`ranges`) so 2.2 can skip back-facing directions.
+just the border cells). Three walks over that array (one per axis,
+contiguous row streams, each pair feeding both directions of its axis)
+then build per-direction **boundary planes**: per slice and row, a `u32`
+of the u cells whose A/B pair differs — the only possible faces. Only
+those candidates compute keys (air/cull tests, layer, AO); the greedy
+merge runs over the set bits instead of scanning all 1024 mask entries
+per slice. Each row is folded first (`fold |= a ^ b`) so uniform
+stretches never reach the per-pair pass. A volume too noisy for the
+planes to pay off — the interior pair-density rises above half while
+walking, e.g. a checkerboard — aborts the build for that axis and its two
+directions sweep per-cell like the pre-2.13 mesher instead; shell rows
+never count toward that density (a boundary is dense by design). Per
+direction and slice, coplanar faces with identical (texture layer, AO
+pattern, light) merge into maximal rectangles: extend along u first,
+then along v. Faces never span outside the cube. Output is grouped by
+direction (`ranges`) so 2.2 can skip back-facing directions, and is
+bit-for-bit the pre-2.13 sweep at every level (oracle tests).
 
-**Bench medians (Apple M5 Pro, idle, single-threaded):** `terrain_like`
-221 µs (target ≤ 300 µs), `checkerboard` 697 µs,
-`uniform_stone_air_neighbors` 219 µs, `padded_build` 20 µs.
+**Bench medians (Apple M5 Pro, single-threaded, machine load 5–11,
+interleaved against the pre-2.13 mesher):** `terrain_like` 78 µs
+(pre-2.13: 259–311 µs), `checkerboard` 769–792 µs (pre-2.13: 815–835 µs),
+`uniform_stone_air_neighbors` 50 µs (243–279 µs), `padded_build` 22 µs
+(unchanged).
 
 ### Worker pool
 
