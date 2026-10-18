@@ -15,8 +15,10 @@ pub mod pool;
 pub mod seams;
 
 /// Test-only reference meshers the greedy output is checked against.
-#[cfg(test)]
-pub(crate) mod oracle;
+/// Compiled into integration tests too (the `testing` feature) so the
+/// game's tests can pin the sweep against real generated cubes.
+#[cfg(any(test, feature = "testing"))]
+pub mod oracle;
 
 pub use input::{MeshInput, MeshOutput, build_padded, neighbor_index};
 
