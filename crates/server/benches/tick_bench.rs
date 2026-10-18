@@ -87,10 +87,18 @@ fn bench(c: &mut Criterion) {
 
     group.bench_function("tick_streaming_idle", |b| {
         // One player fully loaded at R = 8, inline generation. Measures a
-        // tick with nothing left to send: the idle-player floor.
+        // tick with nothing left to send: the idle-player floor. Pinned to
+        // the pre-2.13 shape (task 2.13 D/E changed the defaults): R = 8
+        // with the camera window everywhere (`camera_window_radius` ≥ r)
+        // is the full ±V window this bench's expected count asserts, and
+        // the old ring shape keeps it comparable to the task's baseline.
         let mut server = Server::with_config(ServerConfig {
             worldgen: Preset::Classic, // keeps the pre-2.8 terrain comparable
             gen_threads: 0,
+            view_radius: 8,
+            lod_view_radius: 8,
+            lod_levels: 6,
+            camera_window_radius: 8,
             ..ServerConfig::default()
         });
         let (mut client, server_end) = in_process_pair();
