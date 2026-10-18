@@ -156,7 +156,7 @@ fn mean_color(image: &RgbaImage, (x, y): (f32, f32), r: i32) -> [f32; 3] {
     [sum[0] / n as f64, sum[1] / n as f64, sum[2] / n as f64].map(|v| v as f32)
 }
 
-/// Task 2.12's wireframe: dark edges along every greedy quad's border,
+/// Task 2.12's wireframe: dark edges along every triangle edge,
 /// the shaded terrain untouched between them; wireframe-only flattens
 /// everything to edges over near-black.
 #[test]
@@ -199,7 +199,7 @@ fn wireframe_edges_over_untouched_interiors() {
         );
         let plain = ctx.render(&camera);
 
-        // Wireframe on: dark lines along every greedy quad's border. The
+        // Wireframe on: dark lines along every triangle edge. The
         // mesher splits this plateau's top into several merged quads, so
         // the assertions are aggregate: lines exist, and somewhere a
         // 12x12 window of interior keeps the plain color exactly.

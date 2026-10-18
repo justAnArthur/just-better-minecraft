@@ -243,13 +243,11 @@ struct VsOut {
     @location(3) rel: vec3f,
     // The cube's LOD level (task 2.9), flat: far_color switches on it.
     @location(4) @interpolate(flat) level: u32,
-    // The quad-local corner position, 0..1 on each axis (task 2.12): the
-    // fragment shader's wireframe test measures the distance to the
-    // greedy quad's edges through it.
-    @location(5) quad: vec2f,
-    // The quad's size in blocks (width, height), flat (task 2.12): scales
-    // the quad-local fractions into block distances.
-    @location(6) @interpolate(flat) quad_size: vec2f,
+    // Barycentric coordinates within the triangle (task 2.12): one
+    // component is 1 at each of the triangle's corners. The wireframe
+    // view draws a fragment as edge where the smallest one is within a
+    // pixel or so of zero, measured in screen space (fwidth).
+    @location(5) bary: vec3f,
 };
 
 @vertex
@@ -357,8 +355,7 @@ fn vs_main(
         out.shade = 0.0;
         out.rel = vec3f(0.0);
         out.level = 0u;
-        out.quad = vec2f(0.0);
-        out.quad_size = vec2f(0.0);
+        out.bary = vec3f(1.0);
         return out;
     }
 
@@ -373,26 +370,23 @@ fn vs_main(
     out.shade = face_shade()[direction] * ao;
     out.rel = relative_expanded;
     out.level = level;
-    out.quad = c;
-    out.quad_size = vec2f(width, height) * scale;
+    out.bary = array<vec3f, 3>(
+        vec3f(1.0, 0.0, 0.0), vec3f(0.0, 1.0, 0.0), vec3f(0.0, 0.0, 1.0),
+    )[corner_index % 3u];
     return out;
 }
 
-// The wireframe debug view's edge test (task 2.12): the minimum block
-// distance from the fragment to its greedy quad's edges, against a
-// thickness that keeps a floor (0.08 blocks, visible on LOD0) and scales
-// with the quad span (2% of the larger side, so coarse LOD quads keep
-// visible lines). The quad-local varying is where it comes from: every
-// quad carries c in 0..1 and its (width, height) in blocks.
-fn near_quad_edge(in: VsOut) -> f32 {
-    let du = min(in.quad.x, 1.0 - in.quad.x) * in.quad_size.x;
-    let dv = min(in.quad.y, 1.0 - in.quad.y) * in.quad_size.y;
-    return min(du, dv);
-}
+// The wireframe debug view's edge test (task 2.12): coverage in 0..1 of
+// the triangle's edges, about 1.5 pixels wide whatever the distance or
+// the triangle's size, antialiased over one pixel. Screen-space
+// derivatives, so it must run in uniform control flow: fs_main calls it
+// only behind the uniform debug flags, before anything can discard.
+const WIRE_PIXELS: f32 = 1.5;
 
-fn wireframe_edge(in: VsOut) -> bool {
-    let thickness = max(0.08, 0.02 * max(in.quad_size.x, in.quad_size.y));
-    return near_quad_edge(in) < thickness;
+fn wireframe_edge(in: VsOut) -> f32 {
+    let pixels = in.bary / max(fwidth(in.bary), vec3f(1e-6));
+    let nearest = min(pixels.x, min(pixels.y, pixels.z));
+    return 1.0 - smoothstep(WIRE_PIXELS - 0.5, WIRE_PIXELS + 0.5, nearest);
 }
 
 @fragment
@@ -400,9 +394,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     // Wireframe-only (task 2.12): the edges over a flat background — no
     // textures, shade, tint or fog. Bright lines on near-black, so the
     // pure geometry reads at any distance.
+    var edge = 0.0;
+    if (terrain.debug.x > 0.5 || terrain.debug.y > 0.5) {
+        edge = wireframe_edge(in);
+    }
     if (terrain.debug.y > 0.5) {
-        let edge = wireframe_edge(in);
-        return vec4f(select(vec3f(0.04), vec3f(0.95), edge), 1.0);
+        return vec4f(mix(vec3f(0.04), vec3f(0.95), edge), 1.0);
     }
     // wgpu 30 follows the WGSL spec where the array layer is a separate
     // argument (not packed into coords.z). The sample must stay in uniform
@@ -446,8 +443,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     }
     // Wireframe (task 2.12): dark lines over the shaded terrain, drawn
     // last so they read through fog.
-    if (terrain.debug.x > 0.5 && wireframe_edge(in)) {
-        color = vec3f(0.05);
+    if (terrain.debug.x > 0.5) {
+        color = mix(color, vec3f(0.05), edge);
     }
     return vec4f(color, 1.0);
 }
