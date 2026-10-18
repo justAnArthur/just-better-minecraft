@@ -393,6 +393,7 @@ without physics; the next tick's streaming observes the new center.
 | `save_interval: Duration` | 5 s | snapshot cadence for the save thread |
 | `lod_levels: u8` | 6 | top LOD level kept; 0 disables the pyramid |
 | `max_column_cubes: usize` | 16 | most cubes desired per column beyond the camera window, nearest first; 0 reproduces the fixed camera-only windows |
+| `camera_window_radius: u32` | 4 | the camera window applies only within this horizontal radius (cubes); beyond it a column streams only its surface span (task 2.13 D) |
 
 `ServerConfig::protocol_only()` turns streaming off with no generation
 threads — what exact-message-sequence tests and benches use.
@@ -499,20 +500,21 @@ unsent (test/fly-test hook).
 For a player whose center cube is `c` (the cube containing their
 authoritative `PlayerState` position):
 
-- **Desired set:** every cube with `dx² + dz² ≤ R²` and `|dy| ≤ V`, plus
-  — since task 2.10 — the **surface span** of every column of the disk:
-  the cubes that contain the terrain surface over the column's footprint,
-  `[floor(min_h / 32) − 1, floor(max_h / 32)]` (widened one cube below so
-  the surface cube's −Y neighbour is there for meshing and skirts). On
-  the 2.8 mountains the fixed ±V window left cliff faces above or valley
-  floors below the camera to the coarse rings — the play-test's "flat
-  16-block wall in front of the player"; the span union puts LOD0 over
-  the whole near relief. Each column adds at most `max_column_cubes`
-  span cubes **beyond the camera window**, nearest the camera first, so
-  a cliff over a valley costs at most 16 cubes of that column (flat
-  terrain around the camera never adds any: its span sits inside the
-  window). The desired list (window ∪ spans) is rebuilt per player when
-  the center moves or a span lands, sorted nearest-first by
+- **Desired set:** within `camera_window_radius` (task 2.13 D, default 4
+  cubes) of the center: every cube with `dx² + dz² ≤ window_r²` and
+  `|dy| ≤ V` — the full camera window, so a digging or flying player
+  always has LOD0 around them — plus, since task 2.10, the **surface
+  span** of every near column beyond the window (at most
+  `max_column_cubes` cubes, nearest the camera first). Beyond
+  `camera_window_radius` — out to `R` — a column desires **only its
+  surface span** `[floor(min_h / 32) − 1, floor(max_h / 32)]` (the same
+  widened-below span, trimmed to `max_column_cubes`), and nothing until
+  the span lands: far columns at the player's depth are invisible in a
+  cave-less world, and at view radius 16 the full ±V window over the
+  disk was ~4× the cubes the spans need. The level-1 ring mirrors the
+  rule with its sampled spans; coarser rings keep plain windows (no
+  spans above level 1). The desired list is rebuilt per player when the
+  center moves or a span lands, sorted nearest-first by
   `dx² + dy² + dz²` with ties broken by `(x, y, z)` — the same order the
   pre-2.10 list had.
 - **Surface spans** (`spans`): per LOD0 cube column, the exact min/max
@@ -531,11 +533,16 @@ authoritative `PlayerState` position):
   columns (~0.7 ms) per tick, nearest column first, so no tick ever
   stalls on the ~150 ms a fresh view's 1225+361 columns would cost at
   once. `Server::span_stats` reports the counters.
-- **Keep set:** the same shape with `R + 1`, `V + 1` — and the span
-  extras trimmed to `max_column_cubes + 1` (the same +1 hysteresis in
-  window and cap the radii get). A cube is unloaded only when it leaves
-  the keep set — the band that stops a player standing on a border from
-  making cubes flap.
+- **Keep set:** the window part at `window_r + 1`/`V + 1`, every
+  keep-ring column's span trimmed to `max_column_cubes + 1` (the same +1
+  hysteresis), and — the band between `window_r` and `window_r + 1` keeps
+  both shapes, so a player walking along the boundary never flaps cubes
+  in and out. A cube is unloaded only when it leaves the keep set. The
+  world-eviction retain additionally keeps every cube any player has
+  been sent (the unload pass hands those back on the next center move):
+  dropping a sent cube here would strand the client's copy — the walk
+  skips sent cubes, so it would never re-stream, and the player would
+  freeze at its boundary under the unloaded-physics rule.
 
 Each tick: collect finished generation results (inline mode generates up
 to `gen_budget_per_tick` first), then per player, in join order:

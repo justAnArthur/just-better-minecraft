@@ -65,6 +65,16 @@ pub struct ServerConfig {
     /// around the camera is never affected (its span sits inside the
     /// window).
     pub max_column_cubes: usize,
+    /// The camera window radius (task 2.13 D), in cubes: the LOD0 and
+    /// level-1 vertical windows (`vertical_radius`, `lod_vertical_radius`)
+    /// apply only within this horizontal distance of the camera; beyond
+    /// it a column streams only its surface span (`max_column_cubes`
+    /// cubes nearest the camera, the extra cube below included). A
+    /// digging or flying player keeps the full window around them; far
+    /// columns at the player's depth are invisible in a cave-less world.
+    /// Coarser rings keep their plain windows (no spans above level 1;
+    /// their defaults already cover the shipped relief).
+    pub camera_window_radius: u32,
 }
 
 impl Default for ServerConfig {
@@ -88,6 +98,7 @@ impl Default for ServerConfig {
             lod_send_budget_per_tick: 32,
             lod_max_in_flight: 256,
             max_column_cubes: 16,
+            camera_window_radius: 4,
         }
     }
 }

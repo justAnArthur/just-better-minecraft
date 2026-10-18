@@ -107,6 +107,7 @@ pub(crate) fn column_extra_dys(
 /// keep-set form of the question, for unload and eviction checks: window
 /// `v`, span extras trimmed to `cap`, both one looser than the desired
 /// form (the same +1 hysteresis the radii get).
+#[cfg(test)]
 pub(crate) fn extra_dy_keeps(
     span: Option<(i64, i64)>,
     side: i64,
@@ -165,31 +166,91 @@ fn disk_columns(r: u32) -> Vec<(i32, i32)> {
     columns
 }
 
-/// The desired offsets with surface-following windows: every
-/// camera-window offset of [`desired_offsets`] plus, per column of the
-/// disk, the surface-span extras `span_of` supplies (the column's surface
-/// height bounds, `None` while that column's span has not been computed
-/// yet — window only until then), each column trimmed to `cap` extras
-/// nearest the camera. `center_y` is the center cube's absolute y; the
-/// span's cube indices are absolute too, so the extras land as offsets
-/// from it. The union is sorted exactly like the window-only list:
-/// nearest-first by `dx² + dy² + dz²`, ties by `(x, y, z)`.
+/// The `dy` offsets of a column's surface span — the whole span (widened
+/// one cube below), trimmed to `cap` cubes nearest the camera's `dy`
+/// (ties to the lower cube — deterministic). Task 2.13 D: beyond the
+/// camera window radius this is ALL a far column desires.
+pub(crate) fn column_span_dys(
+    span: Option<(i64, i64)>,
+    side: i64,
+    center_y: i64,
+    cap: usize,
+) -> Vec<i32> {
+    let Some(span) = span else {
+        return Vec::new();
+    };
+    let (lo, hi) = span_cubes(span, side);
+    let mut dys: Vec<i32> = (lo..=hi).map(|y| (y - center_y) as i32).collect();
+    if dys.len() > cap {
+        dys.sort_by_key(|&dy| (i64::from(dy).abs(), i64::from(dy)));
+        dys.truncate(cap);
+    }
+    dys
+}
+
+/// The keep-set form of [`column_span_dys`] (task 2.13 D): is `dy` one of
+/// the span cubes a far column would keep, at the loosened `cap` (the +1
+/// hysteresis the radii get)?
+pub(crate) fn span_dy_keeps(
+    span: Option<(i64, i64)>,
+    side: i64,
+    center_y: i64,
+    cap: usize,
+    dy: i32,
+) -> bool {
+    let Some(span) = span else {
+        return false;
+    };
+    let (lo, hi) = span_cubes(span, side);
+    let y = center_y + i64::from(dy);
+    if y < lo || y > hi {
+        return false;
+    }
+    let dys = (lo..=hi).map(|yy| yy - center_y);
+    let mut sorted: Vec<i64> = dys.collect();
+    sorted.sort_by_key(|&d| (d.abs(), d));
+    match sorted.iter().position(|&d| d == i64::from(dy)) {
+        Some(index) => index < cap,
+        None => false,
+    }
+}
+
+/// The desired offsets with surface-following windows and the task 2.13 D
+/// camera window radius: within `window_r` cubes horizontally a column
+/// desires the full camera window (`dy` in `±v`) plus its surface-span
+/// extras beyond the window (the 2.10 rule, trimmed to `cap` nearest);
+/// beyond `window_r` — far columns, whose depth band at the player's
+/// level no cave-less world can show — a column desires ONLY its surface
+/// span (the same widened-below span, `column_span_dys`, trimmed to
+/// `cap`), and nothing until the span is known. `window_r >= r` is the
+/// pre-2.13 shape. The union is sorted exactly like the window-only
+/// list: nearest-first by `dx² + dy² + dz²`, ties by `(x, y, z)`.
 pub(crate) fn desired_offsets_surface(
     r: u32,
     v: u32,
     cap: usize,
     center_y: i64,
+    window_r: u32,
     span_of: impl Fn(i32, i32) -> Option<(i64, i64)>,
 ) -> Vec<Offset> {
     let side = i64::from(jbm_core::coords::CUBE_SIZE);
-    let mut offsets = desired_offsets(r, v);
+    let window_r2 = u64::from(window_r) * u64::from(window_r);
+    let mut offsets = desired_offsets(window_r.min(r), v);
     for &(dx, dz) in &disk_columns(r) {
+        let near =
+            (i64::from(dx) * i64::from(dx) + i64::from(dz) * i64::from(dz)) as u64 <= window_r2;
         let span = span_of(dx, dz);
         if span.is_none() {
             continue;
         }
-        for dy in column_extra_dys(span, side, center_y, v, cap) {
-            offsets.push((dx, dy, dz));
+        if near {
+            for dy in column_extra_dys(span, side, center_y, v, cap) {
+                offsets.push((dx, dy, dz));
+            }
+        } else {
+            for dy in column_span_dys(span, side, center_y, cap) {
+                offsets.push((dx, dy, dz));
+            }
         }
     }
     offsets.sort_by_key(|&(x, y, z)| {
@@ -215,18 +276,34 @@ pub(crate) fn lod_walk_surface(
     v: u32,
     cap: usize,
     center1_y: i64,
+    window_r: u32,
     span1_of: impl Fn(i32, i32) -> Option<(i64, i64)>,
 ) -> Vec<LodWalkEntry> {
     let side = i64::from(jbm_core::coords::CUBE_SIZE) * 2;
+    let window_r2 = u64::from(window_r) * u64::from(window_r);
     let mut walk = Vec::new();
     for level in 1..=lod_levels {
         for &(dx, dz) in &disk_columns(r) {
-            for dy in -i64::from(v)..=i64::from(v) {
-                walk.push((level, (dx, dy as i32, dz)));
+            // Task 2.13 D: the camera window applies only within the
+            // camera window radius — level 1's far columns keep only
+            // their sampled span (coarser levels have no spans; their
+            // default windows already cover the whole shipped relief).
+            let near = level > 1
+                || (i64::from(dx) * i64::from(dx) + i64::from(dz) * i64::from(dz)) as u64
+                    <= window_r2;
+            if near {
+                for dy in -i64::from(v)..=i64::from(v) {
+                    walk.push((level, (dx, dy as i32, dz)));
+                }
             }
             if level == 1 {
                 let span = span1_of(dx, dz);
-                for dy in column_extra_dys(span, side, center1_y, v, cap) {
+                let dys = if near {
+                    column_extra_dys(span, side, center1_y, v, cap)
+                } else {
+                    column_span_dys(span, side, center1_y, cap)
+                };
+                for dy in dys {
                     walk.push((level, (dx, dy, dz)));
                 }
             }
@@ -480,7 +557,7 @@ mod tests {
         let span_of = |dx: i32, _dz: i32| {
             if dx == 1 { Some(cliff) } else { None }
         };
-        let offsets = desired_offsets_surface(r, v, cap, 0, span_of);
+        let offsets = desired_offsets_surface(r, v, cap, 0, r, span_of);
         // Sorted nearest-first with unique full keys.
         let d2 = |o: (i32, i32, i32)| {
             i64::from(o.0).pow(2) + i64::from(o.1).pow(2) + i64::from(o.2).pow(2)
@@ -512,7 +589,7 @@ mod tests {
         // A span inside the window adds nothing: flat land at cubes 0..1.
         let flat = |_: i32, _: i32| Some((0i64, side));
         assert_eq!(
-            desired_offsets_surface(r, v, cap, 0, flat).len(),
+            desired_offsets_surface(r, v, cap, 0, r, flat).len(),
             plain.len(),
             "a span inside the window must not change the desired set"
         );
@@ -520,7 +597,7 @@ mod tests {
         // the same cliff (span cubes 1..6, window cubes 7..9) gets the
         // span as offsets dy -7..-2 — the flying-over-a-valley case that
         // first exposed a relative/absolute mix-up.
-        let high = desired_offsets_surface(r, v, cap, 8, span_of);
+        let high = desired_offsets_surface(r, v, cap, 8, r, span_of);
         for dy in -7..=-2i32 {
             assert!(
                 high.contains(&(1, dy, 0)),
@@ -540,7 +617,7 @@ mod tests {
         let side = i64::from(CUBE_SIZE);
         let span = (side, side * 13); // heights 32..416: level-1 cubes -1..6
         let span1 = |_: i32, _: i32| Some(span);
-        let walk = lod_walk_surface(3, r, v, cap, 0, span1);
+        let walk = lod_walk_surface(3, r, v, cap, 0, r, span1);
         // Fully ordered like the window-only walk.
         let mut prev: Option<(i64, std::cmp::Reverse<u8>, i32, i32, i32)> = None;
         for &(level, (x, y, z)) in &walk {
@@ -570,5 +647,134 @@ mod tests {
             let count = walk.iter().filter(|&&(l, _)| l == level).count();
             assert_eq!(count, desired_offsets(r, v).len());
         }
+    }
+
+    /// Task 2.13 D: beyond the camera window radius a column desires only
+    /// its surface span (cap-trimmed, widened one cube below); within it
+    /// the full camera window plus extras, exactly the pre-2.13 shape.
+    #[test]
+    fn beyond_the_camera_window_radius_only_span_cubes_are_desired() {
+        let (r, v, cap) = (4u32, 3u32, 16usize);
+        let side = i64::from(CUBE_SIZE);
+        // Flat land whose surface sits at cube 9 (span cubes 8..9 —
+        // widened one below) over the whole disk.
+        let span = (side * 9, side * 9);
+        let flat = |_: i32, _: i32| Some(span);
+        let window_r = 2u32;
+        let offsets = desired_offsets_surface(r, v, cap, 0, window_r, flat);
+
+        // Within window_r: the full window (dy -v..=v), span inside it.
+        for dy in -3i32..=3 {
+            assert!(offsets.contains(&(1, dy, 0)), "near window dy {dy} missing");
+        }
+        // The near window columns are exactly the disk of window_r; check
+        // a column on the window_r boundary circle is near and one just
+        // outside (still inside r) is far.
+        assert!(
+            offsets.contains(&(2, 0, 0)),
+            "the window_r boundary column is near"
+        );
+        assert!(
+            !offsets.contains(&(3, 3, 0)),
+            "a far column's window cube must not be desired"
+        );
+        assert!(!offsets.contains(&(3, -3, 0)));
+        assert!(!offsets.contains(&(3, 3, 1)));
+        // ... but the far column's span cubes are: dy 8 and 9 (the widened
+        // span), trimmed to the cap of 16 — both fit.
+        for dy in [8i32, 9] {
+            assert!(offsets.contains(&(3, dy, 0)), "far span dy {dy} missing");
+            assert!(
+                offsets.contains(&(3, dy, 1)),
+                "far span dy {dy} missing (dz 1)"
+            );
+        }
+        // Nothing else of that far column.
+        assert!(!offsets.contains(&(3, 0, 0)));
+        assert!(!offsets.contains(&(3, 7, 0)));
+        assert!(!offsets.contains(&(3, 10, 0)));
+
+        // An unknown span desires nothing beyond the window columns: far
+        // columns wait for their span.
+        let none = |_: i32, _: i32| None;
+        let window_only = desired_offsets_surface(r, v, cap, 0, window_r, none);
+        let plain_window = desired_offsets(window_r, v);
+        assert_eq!(window_only, plain_window);
+
+        // The cap trims the far span to the nearest cubes: a tall cliff
+        // (span cubes 2..30) at cap 4 keeps dys 8..11 around camera 0...
+        // no — nearest four to 0 are 2, 3, 4, 5 (the span's own bottom).
+        let cliff = (side * 2, side * 30);
+        let cliffed = |dx: i32, _dz: i32| {
+            if dx == 3 { Some(cliff) } else { None }
+        };
+        let offsets = desired_offsets_surface(r, v, 2, 0, window_r, cliffed);
+        // The span widens one cube below: cubes 1..30, cap 2 keeps dys 1, 2.
+        for dy in 1..=2i32 {
+            assert!(
+                offsets.contains(&(3, dy, 0)),
+                "cap keeps the nearest span cubes"
+            );
+        }
+        assert!(!offsets.contains(&(3, 3, 0)), "beyond the cap");
+        assert!(!offsets.contains(&(3, 6, 0)), "beyond the cap");
+    }
+
+    /// Task 2.13 D: a player at any depth keeps the full camera window
+    /// around them — the digging case. A camera 100 blocks down (cube -4
+    /// at 32-block cubes) still desires dy -v..=v of the near columns.
+    #[test]
+    fn a_deep_camera_still_gets_the_full_window_near_it() {
+        let (r, v, cap) = (8u32, 4u32, 16usize);
+        let side = i64::from(CUBE_SIZE);
+        let span = (side * 9, side * 9); // surface far above the digger
+        let flat = |_: i32, _: i32| Some(span);
+        // Camera at cube -4 (about 100 blocks under the surface).
+        let offsets = desired_offsets_surface(r, v, cap, -4, 4, flat);
+        for dy in -4i32..=4 {
+            assert!(
+                offsets.contains(&(0, dy, 0)),
+                "the digging player's window dy {dy} missing"
+            );
+            assert!(
+                offsets.contains(&(3, dy, 0)),
+                "within window_r dy {dy} missing"
+            );
+        }
+        // The far columns carry the surface span as dys relative to the
+        // deep camera: 9 - (-4) = 13 (and 12, widened below).
+        assert!(offsets.contains(&(5, 12, 0)));
+        assert!(offsets.contains(&(5, 13, 0)));
+        assert!(!offsets.contains(&(5, 0, 0)));
+    }
+
+    /// Task 2.13 D: the level-1 walk mirrors the rule — near columns keep
+    /// the window, far columns only their span; coarser levels always do.
+    #[test]
+    fn lod_walk_far_columns_keep_only_their_span() {
+        let (r, v, cap) = (4u32, 3u32, 16usize);
+        let side = i64::from(CUBE_SIZE);
+        // Level-1 span cubes 4..5 (heights 256..383-ish), side 64.
+        let span = (side * 2 * 4, side * 2 * 4);
+        let span1 = |_: i32, _: i32| Some(span);
+        let walk = lod_walk_surface(2, r, v, cap, 0, 2, span1);
+        let level1: std::collections::HashSet<(i32, i32, i32)> = walk
+            .iter()
+            .filter(|&&(l, _)| l == 1)
+            .map(|&(_, o)| o)
+            .collect();
+        // Near column (0, 0): the full window.
+        for dy in -3i32..=3 {
+            assert!(level1.contains(&(0, dy, 0)), "near window dy {dy} missing");
+        }
+        // Far column (3, 0): only the span dys 3 and 4 (the level-1 side
+        // is 64 blocks; heights 256..256 span cubes 3..4, widened below).
+        assert!(level1.contains(&(3, 3, 0)));
+        assert!(level1.contains(&(3, 4, 0)));
+        assert!(!level1.contains(&(3, 0, 0)), "no far window at level 1");
+        assert!(!level1.contains(&(3, -3, 0)));
+        // Level 2 keeps its plain window everywhere.
+        let count = walk.iter().filter(|&&(l, _)| l == 2).count();
+        assert_eq!(count, desired_offsets(r, v).len());
     }
 }

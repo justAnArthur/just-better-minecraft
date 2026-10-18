@@ -489,6 +489,7 @@ fn coast_defect_pixels(
     let config = ServerConfig {
         gen_threads: 4,
         max_column_cubes: cap,
+        camera_window_radius: 4,
         ..ServerConfig::default()
     };
     let mut server = Server::with_config(config);
@@ -691,6 +692,7 @@ fn surface_window_measurements() {
             let config = ServerConfig {
                 gen_threads: 4,
                 max_column_cubes: cap,
+                camera_window_radius: 4,
                 ..ServerConfig::default()
             };
             let mut server = Server::with_config(config);
