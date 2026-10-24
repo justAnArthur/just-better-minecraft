@@ -7,10 +7,11 @@ use jbm_core::coords::BlockPos;
 
 use crate::camera::Camera;
 use crate::gpu::Gpu;
+use crate::render::composite::CompositePass;
 use crate::render::lines::{LineVertex, LinesPass};
 use crate::render::outline::OutlinePass;
 use crate::render::overlay::{OverlayRenderer, OverlayText};
-use crate::render::settings::RenderSettings;
+use crate::render::settings::{self, RenderSettings};
 use crate::render::terrain::TerrainPass;
 use crate::render::timing::{GpuTimer, GpuTimings};
 
@@ -353,6 +354,9 @@ pub struct Renderer {
     settings: RenderSettings,
     /// The pass timer (task 2.16), when the device has timestamp queries.
     timer: Option<GpuTimer>,
+    /// The render-scale upscale (task 2.16), used while the depth target
+    /// is smaller than the frame's target.
+    composite: CompositePass,
 }
 
 impl Renderer {
@@ -476,6 +480,7 @@ impl Renderer {
             msaa_color: None,
             settings,
             timer: GpuTimer::new(gpu),
+            composite: CompositePass::new(gpu, color_format),
         }
     }
 
@@ -597,6 +602,14 @@ impl Renderer {
         self.viewport
     }
 
+    /// The scene's pixel size for the viewport at the settings' render
+    /// scale (task 2.16): the size the depth target passed to `render`
+    /// must have. The app resizes its depth target to it; rigs that size
+    /// the depth to the target render natively.
+    pub fn scene_size(&self) -> (u32, u32) {
+        settings::scene_size(self.settings.render_scale, self.viewport)
+    }
+
     fn build_uniforms(&self, camera: &Camera) -> FrameUniforms {
         let view_proj = camera.view_proj();
         let hi = camera.position.as_vec3();
@@ -644,8 +657,12 @@ impl Renderer {
     /// and the target outline (`outline`, task 1.7), then the debug
     /// overlay — crosshair included — on top. With MSAA (task 2.15) the
     /// scene renders into the renderer's multisampled color target and
-    /// `frame.depth` (which must have the same sample count), resolved
-    /// into `frame.target` at the end of the pass.
+    /// `frame.depth` (which must have the same sample count), resolved at
+    /// the end of the pass. The scene renders at `frame.depth`'s size:
+    /// when that is smaller than `frame.target` (the render scale, task
+    /// 2.16) it resolves into a scene color texture that a composite pass
+    /// upscales into `frame.target`, the overlay drawing natively in the
+    /// same pass.
     pub fn render(&mut self, gpu: &Gpu, mut frame: FrameInputs<'_>) {
         let samples = self.settings.msaa_samples;
         assert_eq!(
@@ -670,9 +687,17 @@ impl Renderer {
         gpu.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
-        let scene_color = frame.target;
+        // Where the scene lands: the frame's target, or the scene color
+        // texture while the render scale shrinks the scene.
+        let target_size = frame.target.texture().size();
+        let scaled = frame.depth.size() != (target_size.width, target_size.height);
+        let scene_color = if scaled {
+            self.composite.scene_view(&gpu.device, frame.depth.size())
+        } else {
+            frame.target
+        };
         // The scene's color attachment: the multisampled target, or the
-        // frame's own target at 1×.
+        // scene's own color at 1×.
         let msaa = samples > 1;
         let scene_target = match &self.msaa_color {
             Some(color) if msaa => &color.view,
@@ -777,7 +802,34 @@ impl Renderer {
             }
         }
 
-        if let Some(text) = frame.overlay {
+        // The render scale's upscale, with the overlay on top at native
+        // resolution. It covers every pixel, so the target is cleared,
+        // never loaded.
+        if scaled {
+            if let Some(text) = frame.overlay {
+                self.overlay.prepare(gpu, self.viewport, text);
+            }
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("jbm composite pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: frame.target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: timer.and_then(|t| t.render_writes("composite")),
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.composite.record(&mut pass);
+            if frame.overlay.is_some() {
+                self.overlay.record(&mut pass, &self.uniform_bind_group);
+            }
+        } else if let Some(text) = frame.overlay {
             // The overlay draws at 1× on the resolved frame (as egui does
             // after it).
             self.overlay.prepare(gpu, self.viewport, text);

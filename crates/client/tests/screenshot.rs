@@ -6,6 +6,7 @@ use jbm_client::camera::Camera;
 use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::overlay::OverlayText;
 use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
+use jbm_client::render::settings::RenderSettings;
 use jbm_client::render::triangle;
 use jbm_client::testing::screenshot::{assert_matches_golden, gpu_or_skip};
 
@@ -71,6 +72,58 @@ fn debug_overlay_matches_golden() {
     overlay.push("FPS 60  16.67 ms");
     overlay.push("XYZ 0.00 80.00 0.00");
     render_and_compare("debug_overlay", &sky_camera(0.0), Some(overlay));
+}
+
+/// Task 2.16's render scale: a scene rendered at half the target's size
+/// and upscaled by the composite matches the native render (the
+/// cloudless sky is a smooth gradient, so the filter has nothing to
+/// lose), with the same orientation, and the overlay still draws over
+/// it at native resolution.
+#[test]
+fn half_scale_scene_upscales_to_the_native_frame() {
+    let Some(gpu) = gpu_or_skip() else {
+        return;
+    };
+    let mut overlay = OverlayText::new();
+    overlay.push("FPS 60  16.67 ms");
+    let render = |scene: u32| {
+        let target = OffscreenTarget::new(&gpu.device, 256, 256);
+        let depth = DepthTarget::new(&gpu.device, scene, scene);
+        // Without clouds: their detail is finer than half the pixels.
+        let settings = RenderSettings {
+            clouds: false,
+            ..RenderSettings::default()
+        };
+        let mut renderer = Renderer::with_settings(&gpu, target.format(), settings);
+        renderer.set_viewport(256, 256);
+        renderer.render(
+            &gpu,
+            FrameInputs {
+                target: &target.create_view(),
+                depth: &depth,
+                camera: &sky_camera(10.0),
+                terrain: None,
+                outline: None,
+                overlay: Some(&overlay),
+            },
+        );
+        target.read_rgba(&gpu)
+    };
+    let native = render(256);
+    let scaled = render(128);
+    let mut worst = 0u8;
+    let mut total = 0u64;
+    for (a, b) in native.pixels().zip(scaled.pixels()) {
+        for c in 0..3 {
+            let diff = a[c].abs_diff(b[c]);
+            worst = worst.max(diff);
+            total += u64::from(diff);
+        }
+    }
+    let mean = total as f64 / (256.0 * 256.0 * 3.0);
+    assert!(mean < 0.5, "mean channel difference {mean:.3}");
+    // The overlay's backdrop blends over a slightly different sky.
+    assert!(worst <= 4, "worst channel difference {worst}");
 }
 
 // ---------------------------------------------------------------------------
