@@ -166,12 +166,19 @@ impl MetricsClient {
         );
     }
 
-    /// Recreates the color and depth targets at `width`×`height`.
+    /// Recreates the color target at `width`×`height` and the depth
+    /// target at the renderer's scene size for it (the render scale,
+    /// task 2.16), as the app does.
     fn resize(&mut self, gpu: &Gpu, width: u32, height: u32) {
         self.target = OffscreenTarget::new(&gpu.device, width, height);
-        self.depth =
-            DepthTarget::with_samples(&gpu.device, width, height, self.renderer.msaa_samples());
         self.renderer.set_viewport(width, height);
+        let (scene_width, scene_height) = self.renderer.scene_size();
+        self.depth = DepthTarget::with_samples(
+            &gpu.device,
+            scene_width,
+            scene_height,
+            self.renderer.msaa_samples(),
+        );
     }
 
     fn pump_meshing(&mut self, gpu: &Gpu, camera: &Camera) {
@@ -801,13 +808,20 @@ fn p50_p95(samples: &mut [f64]) -> (f64, f64) {
     (at(0.5), at(0.95))
 }
 
-/// `JBM_PERF_RES=2560x1440,5120x2880` (the default): the target sizes.
-fn perf_resolutions() -> Vec<(u32, u32)> {
-    let list = std::env::var("JBM_PERF_RES").unwrap_or_else(|_| "2560x1440,5120x2880".into());
+/// `JBM_PERF_RES=2560x1440,5120x2880@1,5120x2880` (the default): the
+/// target sizes, each optionally at a fixed render scale (`@<scale>`;
+/// without one the settings' scale applies, auto by default).
+fn perf_resolutions() -> Vec<(u32, u32, Option<f32>)> {
+    let list =
+        std::env::var("JBM_PERF_RES").unwrap_or_else(|_| "2560x1440,5120x2880@1,5120x2880".into());
     list.split(',')
         .map(|item| {
-            let (w, h) = item.trim().split_once('x').expect("WxH");
-            (w.parse().expect("width"), h.parse().expect("height"))
+            let (size, scale) = match item.trim().split_once('@') {
+                Some((size, scale)) => (size, Some(scale.parse().expect("render scale"))),
+                None => (item.trim(), None),
+            };
+            let (w, h) = size.split_once('x').expect("WxH");
+            (w.parse().expect("width"), h.parse().expect("height"), scale)
         })
         .collect()
 }
@@ -815,7 +829,8 @@ fn perf_resolutions() -> Vec<(u32, u32)> {
 /// Task 2.16's perf harness: the user's view and the five look-review
 /// cameras on the default world, settled with the shipped server
 /// defaults, rendered offscreen without vsync at each resolution of
-/// `JBM_PERF_RES` (default 2560×1440 and 5120×2880). Per view and
+/// `JBM_PERF_RES` (default 2560×1440, and 5120×2880 natively and at the
+/// default render scale). Per view and
 /// resolution it prints the CPU time of `Renderer::render` (encode and
 /// submit; the frame's own CPU work) and the GPU time from pass
 /// timestamps (the frame span and each pass), p50 / p95 over
@@ -823,7 +838,8 @@ fn perf_resolutions() -> Vec<(u32, u32)> {
 /// Rendering settings come from the environment like the game's
 /// (`JBM_MSAA`, `JBM_GPU_CULL`, `JBM_NO_CLOUDS`, …), so a lever can be
 /// measured without a rebuild; `JBM_PERF_VIEWS=user,coast` limits the
-/// views. Run with
+/// views, and `JBM_PERF_SHOTS=1` saves each view and size's base frame
+/// under `target/perf-shots/` (to judge the render scale). Run with
 /// `cargo test --release -p jbm-game --test far_metrics perf_views -- --ignored --nocapture`.
 #[test]
 #[ignore = "slow real-server measurement; run with --ignored"]
@@ -914,9 +930,19 @@ fn perf_views() {
             .join("  ");
         println!("  resident/drawn cubes, resident faces: {levels}");
 
-        for &(width, height) in &resolutions {
+        for &(width, height, scale) in &resolutions {
+            let base = RenderSettings {
+                render_scale: scale.unwrap_or(settings.render_scale),
+                ..settings
+            };
+            win.renderer.set_settings(base);
             win.resize(&gpu, width, height);
             camera.aspect = width as f32 / height as f32;
+            let size = match scale {
+                Some(scale) => format!("{width}x{height}@{scale}"),
+                None => format!("{width}x{height}"),
+            };
+            let (scene_width, scene_height) = win.renderer.scene_size();
             // Variants take turns frame by frame, so background load on
             // the machine hits them alike.
             let mut samples: Vec<VariantSamples> = variants
@@ -925,7 +951,7 @@ fn perf_views() {
                 .collect();
             for frame in 0..(PERF_WARMUP + PERF_FRAMES) * variants.len() {
                 let index = frame % variants.len();
-                win.renderer.set_settings((variants[index].1)(settings));
+                win.renderer.set_settings((variants[index].1)(base));
                 let begin = Instant::now();
                 win.render_frame(&gpu, &camera);
                 let cpu_ms = begin.elapsed().as_secs_f64() * 1000.0;
@@ -934,15 +960,26 @@ fn perf_views() {
                     samples[index].push(cpu_ms, timings);
                 }
             }
-            win.renderer.set_settings(settings);
+            win.renderer.set_settings(base);
             win.render_frame(&gpu, &camera);
-            let cull = win.terrain.read_cull_stats_blocking(&gpu);
-            let stats = win.terrain.stats();
-            for sample in &mut samples {
+            if std::env::var_os("JBM_PERF_SHOTS").is_some_and(|v| v == "1") {
+                let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../target/perf-shots");
+                std::fs::create_dir_all(&dir).expect("shot dir");
+                let path = dir.join(format!("{tag}_{size}.png"));
+                win.target.read_rgba(&gpu).save(&path).expect("save shot");
+                println!("saved {}", path.display());
+            }
+            for (sample, &(_, variant)) in samples.iter_mut().zip(&variants) {
+                // Each variant's own counts: one more frame with it.
+                win.renderer.set_settings(variant(base));
+                win.render_frame(&gpu, &camera);
+                let cull = win.terrain.read_cull_stats_blocking(&gpu);
+                let stats = win.terrain.stats();
                 let summary = sample.summary();
                 let line = format!(
-                    "{tag:<11}{:>10} {:<10}{}  faces {:>8}  cmds {:>6}  draws {:>4}  occluded {:>5}",
-                    format!("{width}x{height}"),
+                    "{tag:<11}{size:>14} {:>10} {:<10}{}  faces {:>8}  cmds {:>6}  draws {:>4}  occluded {:>5}",
+                    format!("{scene_width}x{scene_height}"),
                     sample.name,
                     summary,
                     cull.faces,
@@ -974,7 +1011,7 @@ type Variant = (&'static str, fn(RenderSettings) -> RenderSettings);
 /// by default): live-switchable levers measured against the base in the
 /// same run, frame by frame.
 fn perf_variants() -> Vec<Variant> {
-    let all: [Variant; 8] = [
+    let all: [Variant; 9] = [
         ("base", |s| s),
         ("no_clouds", |s| RenderSettings { clouds: false, ..s }),
         ("no_water", |s| RenderSettings { water: false, ..s }),
@@ -995,6 +1032,13 @@ fn perf_variants() -> Vec<Variant> {
         ("cpu_cull", |s| RenderSettings {
             prefer_gpu_cull: false,
             force_cpu_cull: true,
+            ..s
+        }),
+        // Task 2.13's split radius: cubes beyond 4 cubes draw all their
+        // directions in one command (fewer commands, their back faces
+        // reach the vertex shader).
+        ("split_4", |s| RenderSettings {
+            direction_split_radius: 4,
             ..s
         }),
     ];
