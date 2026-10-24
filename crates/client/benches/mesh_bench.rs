@@ -9,7 +9,11 @@
 //! - `padded_build`: only the padded 34^3 build from 27 cubes.
 //! - `terrain_like_lod2`: the `terrain_like` cells meshed as a level-2
 //!   ring cube (octant splits, skirts, lids and — task 2.14 — partial
-//!   column tops).
+//!   column tops, a different one in nearly every column: the worst case
+//!   for merging).
+//! - `terrain_like_lod2_full_tops`: the same cube with every column top
+//!   full — the pre-2.14 workload, so the fill-height path's fixed cost
+//!   shows on its own.
 //!
 //! Suballoc case:
 //! - `churn_10k`: the seeded 10,000-operation alloc/free churn from the
@@ -168,6 +172,20 @@ fn bench(c: &mut Criterion) {
     });
     group.bench_function("terrain_like_lod2", |b| {
         b.iter(|| black_box(mesh::mesh(black_box(&lod2_input), black_box(&appearance))))
+    });
+    let lod2_full_input = MeshInput {
+        level: 2,
+        center: Arc::clone(&lod2_input.center),
+        neighbors: lod2_input.neighbors.clone(),
+        tops: MeshTops::default(),
+    };
+    group.bench_function("terrain_like_lod2_full_tops", |b| {
+        b.iter(|| {
+            black_box(mesh::mesh(
+                black_box(&lod2_full_input),
+                black_box(&appearance),
+            ))
+        })
     });
     group.bench_function("padded_build", |b| {
         b.iter(|| {
