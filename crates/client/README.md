@@ -483,6 +483,11 @@ fading into a soft haze.
   glow fades out with the gradient's own ground blend, so a pixel fully
   in the ground haze is exactly the ground color — the hole tests'
   sentinel override stays exact (`clouds: false` / `JBM_NO_CLOUDS=1`).
+  The sky pass runs **after** the terrain (a clear pass resets color and
+  depth first): its fullscreen triangle sits at the far plane (depth 0.0)
+  with an `Equal` depth test, so only pixels no terrain covered are
+  shaded and the cloud noise is never paid for under the terrain (a cave
+  frame drops from ~0.8 ms to ~0.35 ms in `terrain_draw`).
 - **Water** stays an opaque block in the opaque pass. A per-layer
   material buffer (terrain group binding 5, next to `layer_avg`;
   `texture_array::builtin_materials`, keyed by layer name — never by a
@@ -511,7 +516,7 @@ fading into a soft haze.
   texture fade is unchanged.
 - **MSAA 4×** (`RenderSettings::msaa_samples`, `JBM_MSAA=1|4`, default
   4, applied at startup and read-only in the panel). The renderer owns
-  a multisampled color target; sky, terrain, debug lines and the outline
+  a multisampled color target; terrain, sky, debug lines and the outline
   draw into it with the (equally multisampled) `DepthTarget`, then an
   empty pass resolves it into the frame target, and the overlay (and
   egui after it) draw at 1×. The Hi-Z fill reads the multisampled depth
@@ -822,8 +827,10 @@ end convergence (and the client-world-lies correction path) is proven by
 The depth buffer is `Depth32Float` cleared to **0.0** with a **`Greater`**
 compare; the projection maps the near plane (0.05) to depth 1.0 and has an
 **infinite far plane** (depth → 0.0). Most precision sits near the camera,
-which Stage 2's kilometre view distances need. Every pipeline must draw
-with `Greater`, never `Less`, and never clear depth to 1.0.
+which Stage 2's kilometre view distances need. Every geometry pipeline
+must draw with `Greater`, never `Less`, and never clear depth to 1.0. The
+one exception is the sky (task 2.15): it draws after the terrain at depth
+0.0 with `Equal`, filling exactly the pixels still at the cleared depth.
 
 ### Camera-relative rendering
 

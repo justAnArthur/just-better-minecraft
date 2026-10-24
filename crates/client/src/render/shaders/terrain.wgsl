@@ -437,8 +437,13 @@ fn wireframe_edge(in: VsOut) -> f32 {
 const AMBIENT_SUN_SIDE: f32 = 0.10;
 const SUN_AO: f32 = 0.5;
 
+// The face normal from the direction index (+X, -X, +Y, -Y, +Z, -Z, as
+// normals()), computed rather than indexed: a runtime index into a
+// function-local array costs a stack array per fragment on some backends.
 fn face_normal(dir: u32) -> vec3f {
-    return vec3f(normals()[dir]);
+    let axis = dir >> 1u;
+    let sign = 1.0 - 2.0 * f32(dir & 1u);
+    return vec3f(f32(axis == 0u), f32(axis == 1u), f32(axis == 2u)) * sign;
 }
 
 fn ambient(n: vec3f) -> vec3f {

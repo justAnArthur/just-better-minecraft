@@ -37,7 +37,9 @@ fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
         vec2f(-1.0, 3.0),
     );
     var out: VsOut;
-    out.pos = vec4f(p[i], 1.0, 1.0);
+    // At the far plane (0.0 in reverse-Z): the pipeline's Equal depth test
+    // passes only where the cleared depth is untouched (task 2.15).
+    out.pos = vec4f(p[i], 0.0, 1.0);
     out.ndc = p[i];
     return out;
 }

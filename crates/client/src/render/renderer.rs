@@ -444,7 +444,7 @@ impl Renderer {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
                 depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Greater),
+                depth_compare: Some(wgpu::CompareFunction::Equal),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -623,9 +623,9 @@ impl Renderer {
         }
     }
 
-    /// Draws one frame: the sky pass (which also clears depth to 0.0),
-    /// then the terrain pass, then the target outline (`outline`, task
-    /// 1.7), then the debug overlay — crosshair included — on top. With
+    /// Draws one frame: a clear (depth to 0.0), the terrain pass, the sky
+    /// pass over the pixels the terrain left uncovered, the debug lines,
+    /// the target outline (`outline`, task 1.7), then the debug overlay — crosshair included — on top. With
     /// MSAA (task 2.15) everything before the overlay renders into the
     /// renderer's multisampled color target and `frame.depth` (which must
     /// have the same sample count), resolved into `frame.target` before
@@ -667,11 +667,13 @@ impl Renderer {
                 label: Some("jbm frame"),
             });
 
-        // Sky pass: fullscreen triangle; also clears depth to 0.0 (far in
-        // reverse-Z) so later passes can depth-test against it.
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("jbm sky pass"),
+        // The clear: color, and depth to 0.0 (far in reverse-Z) so the
+        // terrain can depth-test against it. Without terrain the sky pass
+        // clears for itself.
+        let terrain_drawn = frame.terrain.is_some();
+        if let Some(terrain) = frame.terrain {
+            drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("jbm clear pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: scene_target,
                     depth_slice: None,
@@ -692,13 +694,7 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
-            });
-            pass.set_pipeline(&self.sky_pipeline);
-            pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-            pass.draw(0..3, 0..1);
-        }
-
-        if let Some(terrain) = frame.terrain {
+            }));
             // The frame settings (fog, level tint) ride along each draw:
             // the terrain pass bakes them into its per-frame uniform.
             terrain.draw(
@@ -710,6 +706,48 @@ impl Renderer {
                 &self.uniform_bind_group,
                 &self.settings,
             );
+        }
+
+        // Sky pass (task 2.15: after the terrain): a fullscreen triangle at
+        // the far plane, depth-tested Equal against the cleared depth, so
+        // it shades only the pixels no terrain covered — the clouds' noise
+        // is never evaluated under the terrain (a cave frame used to pay
+        // for a full screen of it).
+        {
+            let (color_load, depth_load) = if terrain_drawn {
+                (wgpu::LoadOp::Load, wgpu::LoadOp::Load)
+            } else {
+                (
+                    wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    wgpu::LoadOp::Clear(0.0),
+                )
+            };
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("jbm sky pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: scene_target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: color_load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: frame.depth.view(),
+                    depth_ops: Some(wgpu::Operations {
+                        load: depth_load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.sky_pipeline);
+            pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+            pass.draw(0..3, 0..1);
         }
 
         // The task 2.12 debug lines, over the terrain (depth-tested
