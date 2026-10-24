@@ -386,7 +386,10 @@ fn fly_1p5km_over_real_rings_shows_no_holes() {
     }
 
     // Settle the initial view: the queue stays clear for a full second.
-    let settle_deadline = Instant::now() + Duration::from_secs(60);
+    // At the 2.13 defaults (5 levels, ~25k LOD cubes) the first fill
+    // takes ~60-90 s on a loaded machine, the pre-2.14 code included, so
+    // 60 s timed out; the hole checks below are what this test pins.
+    let settle_deadline = Instant::now() + Duration::from_secs(180);
     let mut clear_ticks = 0;
     while clear_ticks < 20 {
         fly.frames_for_one_tick(&gpu, &camera);
