@@ -367,8 +367,8 @@ fn edit_spawn_paths_render_pixel_identical() {
 }
 
 /// Task 2.13 C: the direction-split radius. A camera flying from 400
-/// blocks out to 15 blocks above spawn crosses the default radius (4
-/// cubes = 128 blocks) every run; cubes flip between one-command and
+/// blocks out to 15 blocks above spawn crosses a radius of 4 cubes (128
+/// blocks) every run; cubes flip between one-command and
 /// per-direction emission frame to frame, and the gpu-cull and cpu-cull
 /// images must stay pixel-identical throughout (back-face culling drops
 /// exactly what direction skipping dropped).
@@ -386,11 +386,9 @@ fn crossing_the_direction_split_radius_pops_nothing() {
     let depth = DepthTarget::new(&gpu.device, 256, 256);
     let mut renderer = Renderer::new(&gpu, target.format());
     renderer.set_viewport(256, 256);
-    assert_eq!(
-        renderer.settings().direction_split_radius,
-        4,
-        "the default radius this test crosses"
-    );
+    // The radius this test crosses (the default is per-direction
+    // everywhere since task 2.16).
+    renderer.settings_mut().direction_split_radius = 4;
     let textures = BlockTextures::builtin(&gpu).expect("texture array");
     let mut terrain = TerrainPass::new(&gpu, target.format(), renderer.uniform_layout(), &textures);
     for (pos, mesh) in &meshes {

@@ -79,8 +79,9 @@ pub struct RenderSettings {
     /// AABB is farther than this from the camera draw all their face
     /// directions in one indirect command — back-face culling drops the
     /// same faces direction skipping dropped, so the image cannot change.
-    /// Near cubes keep one command per visible direction. 0 draws one
-    /// command everywhere; `JBM_DIRECTION_SPLIT=<cubes>` seeds it.
+    /// Nearer cubes keep one command per visible direction. 0 draws one
+    /// command everywhere, the default (`u32::MAX`) splits everywhere;
+    /// `JBM_DIRECTION_SPLIT=<cubes>` seeds it.
     pub direction_split_radius: u32,
     /// Sun and sky lighting (task 2.15): a fixed mid-morning sun plus a
     /// hemisphere ambient light every terrain fragment. Off restores the
@@ -198,12 +199,14 @@ fn msaa_from_env(value: Option<&str>) -> u32 {
     }
 }
 
-/// The default direction-split radius (task 2.13 C), in cubes: measured
-/// against the far_metrics baseline (spawn at 16 cubes holds ~7k LOD0
-/// cubes issuing ~2.4k commands, nearly all beyond 4 cubes) it collapses
-/// the far bulk to one command per cube while the near band — where a
-/// cube can straddle the camera — keeps its per-direction skipping.
-pub const DEFAULT_DIRECTION_SPLIT_RADIUS: u32 = 4;
+/// The default direction-split radius (task 2.13 C), in cubes: none —
+/// every cube draws one command per visible direction. Task 2.13 set 4
+/// cubes to collapse the far bulk to one command per cube; task 2.16
+/// measured the cost of that: the far cubes' back faces (~35 % of a
+/// 2 M-face view) then reach the vertex shader, which is the geometry
+/// floor of the frame. Splitting everywhere roughly doubles the commands
+/// (~3.5 k → ~6.6 k, +0.2 ms CPU) and takes 0.3–0.7 ms off the GPU.
+pub const DEFAULT_DIRECTION_SPLIT_RADIUS: u32 = u32::MAX;
 
 impl RenderSettings {
     /// Reads the rendering environment variables: `JBM_NO_FOG`,
@@ -367,7 +370,7 @@ mod tests {
         assert!(!settings.freeze_cull);
         assert_eq!(
             settings.direction_split_radius, DEFAULT_DIRECTION_SPLIT_RADIUS,
-            "4 cubes by default"
+            "per-direction everywhere by default"
         );
         assert_eq!(
             settings.far_radii,
