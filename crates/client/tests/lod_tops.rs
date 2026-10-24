@@ -227,5 +227,8 @@ fn a_step_between_two_partial_tops_leaves_no_hole() {
     };
     let image = render(&open, &camera, sky).expect("adapter found above");
     let holes = image.pixels().filter(|p| is_sentinel(p)).count();
-    assert!(holes > 20, "removing the step must open a hole ({holes} px)");
+    assert!(
+        holes > 20,
+        "removing the step must open a hole ({holes} px)"
+    );
 }
