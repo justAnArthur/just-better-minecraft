@@ -11,7 +11,9 @@
 //! end. Without the feature the timer is never created and every pass
 //! runs untimed.
 //!
-//! Each ring slot has its own query set, and a frame's queries are
+//! Each ring slot has its own range of one query set (Metal caps the
+//! counter sample buffers a process can hold, so a query set per slot
+//! ran out with a dozen renderers alive), and a frame's queries are
 //! resolved only once its submission has completed, in a later command
 //! buffer: Metal does not order a counter resolve after the samples of
 //! the same command buffer, and resolving there read stale or zero
@@ -26,6 +28,7 @@ use crate::gpu::Gpu;
 /// run untimed.
 pub const MAX_TIMED_PASSES: u32 = 16;
 const RING: usize = 4;
+const SLOT_QUERIES: u32 = 2 * MAX_TIMED_PASSES;
 
 /// One frame's GPU times.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -61,7 +64,6 @@ enum SlotState {
 }
 
 struct Slot {
-    query_set: wgpu::QuerySet,
     buffer: wgpu::Buffer,
     labels: Vec<&'static str>,
     /// The frame number the slot was written in: several maps can
@@ -74,6 +76,8 @@ struct Slot {
 /// `compute_writes` per pass, `end_frame` before the submit and
 /// `after_submit` after it.
 pub struct GpuTimer {
+    /// The ring's queries: slot `i` owns `i · SLOT_QUERIES ..`.
+    query_set: wgpu::QuerySet,
     resolve: wgpu::Buffer,
     slots: Vec<Slot>,
     /// The slot this frame writes; `None` while the ring is full (the
@@ -96,8 +100,7 @@ impl GpuTimer {
         {
             return None;
         }
-        let queries = 2 * MAX_TIMED_PASSES;
-        let bytes = u64::from(queries) * 8;
+        let bytes = u64::from(SLOT_QUERIES) * 8;
         let resolve = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("jbm timestamp resolve"),
             size: bytes,
@@ -106,11 +109,6 @@ impl GpuTimer {
         });
         let slots = (0..RING)
             .map(|_| Slot {
-                query_set: gpu.device.create_query_set(&wgpu::QuerySetDescriptor {
-                    label: Some("jbm pass timestamps"),
-                    ty: wgpu::QueryType::Timestamp,
-                    count: queries,
-                }),
                 buffer: gpu.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("jbm timestamp readback"),
                     size: bytes,
@@ -123,6 +121,11 @@ impl GpuTimer {
             })
             .collect();
         Some(GpuTimer {
+            query_set: gpu.device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("jbm pass timestamps"),
+                ty: wgpu::QueryType::Timestamp,
+                count: RING as u32 * SLOT_QUERIES,
+            }),
             resolve,
             slots,
             current: None,
@@ -156,7 +159,7 @@ impl GpuTimer {
             return None;
         }
         labels.push(label);
-        Some((&self.slots[slot].query_set, 2 * index))
+        Some((&self.query_set, slot as u32 * SLOT_QUERIES + 2 * index))
     }
 
     /// Timestamp writes for one render pass.
@@ -268,12 +271,13 @@ impl GpuTimer {
 
     /// Resolves and copies every completed slot.
     fn resolve_done(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        for slot in &mut self.slots {
+        for (index, slot) in self.slots.iter_mut().enumerate() {
             if !matches!(slot.state, SlotState::Done) {
                 continue;
             }
             let queries = 2 * slot.labels.len() as u32;
-            encoder.resolve_query_set(&slot.query_set, 0..queries, &self.resolve, 0);
+            let first = index as u32 * SLOT_QUERIES;
+            encoder.resolve_query_set(&self.query_set, first..first + queries, &self.resolve, 0);
             encoder.copy_buffer_to_buffer(
                 &self.resolve,
                 0,
