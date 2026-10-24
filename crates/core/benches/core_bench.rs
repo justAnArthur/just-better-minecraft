@@ -11,7 +11,7 @@ use glam::DVec3;
 use jbm_core::block::BlockStateId;
 use jbm_core::coords::{BlockPos, CUBE_SIZE, CUBE_VOLUME, LocalPos};
 use jbm_core::cube::Cube;
-use jbm_core::lod::{CellBox, downsample_octant, downsample_region};
+use jbm_core::lod::{CellBox, LodTops, downsample_octant, downsample_region};
 use jbm_core::physics::{self, BlockShapes, MoveInput, PlayerState};
 use jbm_core::raycast::{REACH, raycast};
 
@@ -223,10 +223,16 @@ fn bench_lod(c: &mut Criterion) {
     group.bench_function("downsample_octant/surface", |b| {
         let child = lod_surface_cube();
         b.iter_batched(
-            || Cube::filled(BlockStateId::AIR),
-            |mut parent| {
-                black_box(downsample_octant(&child, &mut parent, 0));
-                parent
+            || (Cube::filled(BlockStateId::AIR), LodTops::empty(1)),
+            |(mut parent, mut tops)| {
+                black_box(downsample_octant(
+                    &child,
+                    &LodTops::LOD0,
+                    &mut parent,
+                    &mut tops,
+                    0,
+                ));
+                (parent, tops)
             },
             BatchSize::SmallInput,
         )
@@ -235,10 +241,16 @@ fn bench_lod(c: &mut Criterion) {
     group.bench_function("downsample_octant/uniform", |b| {
         let child = Cube::filled(BlockStateId(1));
         b.iter_batched(
-            || Cube::filled(BlockStateId::AIR),
-            |mut parent| {
-                black_box(downsample_octant(&child, &mut parent, 0));
-                parent
+            || (Cube::filled(BlockStateId::AIR), LodTops::empty(1)),
+            |(mut parent, mut tops)| {
+                black_box(downsample_octant(
+                    &child,
+                    &LodTops::LOD0,
+                    &mut parent,
+                    &mut tops,
+                    0,
+                ));
+                (parent, tops)
             },
             BatchSize::SmallInput,
         )
@@ -252,23 +264,39 @@ fn bench_lod(c: &mut Criterion) {
         // write and the compact).
         let child = lod_surface_cube();
         let mut base = Cube::filled(BlockStateId::AIR);
-        downsample_octant(&child, &mut base, 0);
+        let mut base_tops = LodTops::empty(1);
+        downsample_octant(&child, &LodTops::LOD0, &mut base, &mut base_tops, 0);
         let (edited, local) = (0..CUBE_VOLUME)
             .find_map(|i| {
                 let local = LocalPos::from_index(i);
                 let mut edited = child.clone();
                 edited.set(local, BlockStateId(7));
                 let mut parent = base.clone();
-                downsample_region(&edited, &mut parent, 0, CellBox::single(local))
-                    .map(|_| (edited, local))
+                let mut tops = base_tops.clone();
+                downsample_region(
+                    &edited,
+                    &LodTops::LOD0,
+                    &mut parent,
+                    &mut tops,
+                    0,
+                    CellBox::single(local),
+                )
+                .map(|_| (edited, local))
             })
             .expect("some single edit changes the parent");
         b.iter_batched(
-            || base.clone(),
-            |mut parent| {
-                let changed = downsample_region(&edited, &mut parent, 0, CellBox::single(local));
+            || (base.clone(), base_tops.clone()),
+            |(mut parent, mut tops)| {
+                let changed = downsample_region(
+                    &edited,
+                    &LodTops::LOD0,
+                    &mut parent,
+                    &mut tops,
+                    0,
+                    CellBox::single(local),
+                );
                 assert!(changed.is_some());
-                parent
+                (parent, tops)
             },
             BatchSize::SmallInput,
         )

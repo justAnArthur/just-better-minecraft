@@ -13,11 +13,12 @@
 use crate::block::BlockStateId;
 use crate::coords::{BlockPos, CubePos};
 use crate::cube::Cube;
+use crate::lod::LodTops;
 use crate::physics::{MoveInput, PlayerState};
 
 /// Version of the client/server protocol. A `Hello` carrying any other
 /// version is rejected.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Identifies a joined player inside one server. Ids start at 1 and count up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -97,11 +98,15 @@ pub enum ServerMsg {
     /// their LOD rings, or changed (a re-send replaces the client's copy
     /// wholesale). `level` is 1-based; a level-`n` cube at `pos` covers
     /// blocks `pos * CUBE_SIZE * 2^n` onwards, each cell `2^n` blocks per
-    /// side. Uniform cubes are sent too, as for `CubeData`.
+    /// side. Uniform cubes are sent too, as for `CubeData`. `tops` are
+    /// the cube's column tops (v7, task 2.14): the fill height of each
+    /// column's topmost filled cell, which the client's mesher puts the
+    /// coarse surface at.
     LodCubeData {
         level: u8,
         pos: CubePos,
         cube: Box<Cube>,
+        tops: LodTops,
     },
     /// The LOD cube left the player's rings; the client drops it and its
     /// mesh.
