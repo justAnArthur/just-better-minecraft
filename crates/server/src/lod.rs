@@ -80,7 +80,7 @@ use std::thread::{self, JoinHandle};
 use jbm_core::block::BlockStateId;
 use jbm_core::coords::{BlockPos, CubePos};
 use jbm_core::cube::Cube;
-use jbm_core::lod::{CellBox, copy_octant, downsample_octant, downsample_region, parent};
+use jbm_core::lod::{CellBox, LodTops, copy_octant, downsample_octant, downsample_region, parent};
 
 use crate::storage::{Storage, StorageError};
 use crate::terrain::Generator;
@@ -107,18 +107,24 @@ use crate::terrain::Generator;
 /// A cube is ready exactly when every octant is `known` or `filled`; a
 /// stale octant keeps the cube ready with its last real content until the
 /// recompute lands (and the change it brings is reported).
+///
+/// `tops` are the cube's column tops (task 2.14), kept per octant half
+/// like the cells, so each octant's content — cells and tops — comes from
+/// one source.
 #[derive(Debug, Clone)]
 pub struct LodCube {
     pub cube: Cube,
+    pub tops: LodTops,
     pub known: u8,
     pub filled: u8,
     pub pending: u8,
 }
 
 impl LodCube {
-    fn empty() -> Self {
+    fn empty(level: u8) -> Self {
         Self {
             cube: Cube::filled(BlockStateId::AIR),
+            tops: LodTops::empty(level),
             known: 0,
             filled: 0,
             pending: 0,
@@ -158,7 +164,7 @@ struct Job {
 }
 
 enum JobResult {
-    Done(Job, Cube, u8),
+    Done(Job, Cube, LodTops, u8),
     /// A worker panicked on this job; `poll` resumes the panic on the tick
     /// thread so it never silently vanishes with the worker.
     Panicked(Job, Box<dyn std::any::Any + Send>),
@@ -328,7 +334,7 @@ impl LodPyramid {
     fn entry(&mut self, level: u8, pos: CubePos) -> &mut LodCube {
         self.level_mut(level)
             .entry(pos)
-            .or_insert_with(LodCube::empty)
+            .or_insert_with(|| LodCube::empty(level))
     }
 
     /// Records that `(level, pos)` changed (`content`) or first became
@@ -354,7 +360,7 @@ impl LodPyramid {
     /// into its level-1 parent — created as uniform air if absent — set the
     /// known bit, then walk the change up ([`LodPyramid::propagate`]).
     /// When `half` is given it is the cube's precomputed level-1 octant
-    /// (a generation worker's downsample, installed with
+    /// with its tops (a generation worker's downsample, installed with
     /// [`copy_octant`]); without it the downsample runs here. Re-inserting
     /// an unchanged cube reports no changes.
     pub fn insert_lod0(&mut self, pos: CubePos, cube: &Cube) -> LodChanges {
@@ -366,7 +372,7 @@ impl LodPyramid {
         &mut self,
         pos: CubePos,
         cube: &Cube,
-        half: Option<&Cube>,
+        half: Option<(&Cube, &LodTops)>,
     ) -> LodChanges {
         if !self.enabled() {
             return LodChanges::default();
@@ -376,8 +382,8 @@ impl LodPyramid {
         let region = {
             let lc = self.entry(1, parent_pos);
             let region = match half {
-                Some(half) => copy_octant(half, &mut lc.cube, octant),
-                None => downsample_octant(cube, &mut lc.cube, octant),
+                Some((half, tops)) => copy_octant(half, tops, &mut lc.cube, &mut lc.tops, octant),
+                None => downsample_octant(cube, &LodTops::LOD0, &mut lc.cube, &mut lc.tops, octant),
             };
             lc.known |= 1 << octant;
             region
@@ -420,7 +426,14 @@ impl LodPyramid {
             let Some(lc) = self.level_mut(1).get_mut(&parent_pos) else {
                 return changes;
             };
-            downsample_region(cube, &mut lc.cube, octant, CellBox::single(local))
+            downsample_region(
+                cube,
+                &LodTops::LOD0,
+                &mut lc.cube,
+                &mut lc.tops,
+                octant,
+                CellBox::single(local),
+            )
         };
         let Some(region) = region else {
             return changes; // the first level did not change
@@ -459,7 +472,14 @@ impl LodPyramid {
                     break;
                 } else {
                     let was_ready = lc.ready();
-                    let changed = downsample_region(&child_lc.cube, &mut lc.cube, octant, region);
+                    let changed = downsample_region(
+                        &child_lc.cube,
+                        &child_lc.tops,
+                        &mut lc.cube,
+                        &mut lc.tops,
+                        octant,
+                        region,
+                    );
                     Some((was_ready, changed))
                 }
             };
@@ -538,7 +558,9 @@ impl LodPyramid {
             let (below, above) = self.levels.split_at_mut(level as usize);
             let (was_ready, was_known, changed) = {
                 let child_lc = &below[level as usize - 1][&child];
-                let lc = above[0].entry(pos).or_insert_with(LodCube::empty);
+                let lc = above[0]
+                    .entry(pos)
+                    .or_insert_with(|| LodCube::empty(parent_level));
                 let was_ready = lc.ready();
                 let was_known = lc.known & bit != 0;
                 // A pending bit on a known octant marks it stale: the child
@@ -547,13 +569,26 @@ impl LodPyramid {
                 let stale = lc.pending & bit != 0;
                 let changed = if was_known && !stale {
                     region.and_then(|region| {
-                        downsample_region(&child_lc.cube, &mut lc.cube, octant, region)
+                        downsample_region(
+                            &child_lc.cube,
+                            &child_lc.tops,
+                            &mut lc.cube,
+                            &mut lc.tops,
+                            octant,
+                            region,
+                        )
                     })
                 } else {
                     lc.pending &= !bit;
                     lc.filled &= !bit;
                     lc.known |= bit;
-                    downsample_octant(&child_lc.cube, &mut lc.cube, octant)
+                    downsample_octant(
+                        &child_lc.cube,
+                        &child_lc.tops,
+                        &mut lc.cube,
+                        &mut lc.tops,
+                        octant,
+                    )
                 };
                 (was_ready, was_known, changed)
             };
@@ -599,7 +634,7 @@ impl LodPyramid {
         for (pos, cube) in lod0 {
             let (parent_pos, octant) = parent(pos);
             let lc = pyramid.entry(1, parent_pos);
-            downsample_octant(cube, &mut lc.cube, octant);
+            downsample_octant(cube, &LodTops::LOD0, &mut lc.cube, &mut lc.tops, octant);
             lc.known |= 1 << octant;
             span = Some(match span {
                 None => (parent_pos, parent_pos),
@@ -635,8 +670,14 @@ impl LodPyramid {
                 // cloning it (as `propagate` does).
                 let (below, above) = pyramid.levels.split_at_mut(level as usize - 1);
                 let child_lc = &below[level as usize - 2][&child];
-                let lc = above[0].entry(pos).or_insert_with(LodCube::empty);
-                downsample_octant(&child_lc.cube, &mut lc.cube, octant);
+                let lc = above[0].entry(pos).or_insert_with(|| LodCube::empty(level));
+                downsample_octant(
+                    &child_lc.cube,
+                    &child_lc.tops,
+                    &mut lc.cube,
+                    &mut lc.tops,
+                    octant,
+                );
                 lc.known |= 1 << octant;
             }
             (min, max) = (parent(min).0, parent(max).0);
@@ -660,9 +701,9 @@ impl LodPyramid {
         positions.sort_unstable();
         positions.dedup();
         for pos in positions {
-            let sample = generator.sample_lod(level, pos);
+            let (sample, tops) = generator.sample_lod(level, pos);
             let lc = self.entry(level, pos);
-            fill_octants(lc, &sample, 0);
+            fill_octants(lc, &sample, &tops, 0);
         }
     }
 
@@ -676,9 +717,15 @@ impl LodPyramid {
     /// later (an edit, a LOD0 cube replacing a worldgen guess); such
     /// changes are reported by [`LodPyramid::take_changed`].
     pub fn ready(&self, level: u8, pos: CubePos) -> Option<&Cube> {
+        self.ready_tops(level, pos).map(|(cube, _)| cube)
+    }
+
+    /// [`LodPyramid::ready`] with the cube's column tops — what streaming
+    /// sends.
+    pub fn ready_tops(&self, level: u8, pos: CubePos) -> Option<(&Cube, &LodTops)> {
         self.get(level, pos)
             .filter(|lc| lc.ready())
-            .map(|lc| &lc.cube)
+            .map(|lc| (&lc.cube, &lc.tops))
     }
 
     /// Ask for `(level, pos)` to become ready: a load-or-sample job is
@@ -781,9 +828,9 @@ impl LodPyramid {
         } else {
             loop {
                 match self.results_rx.try_recv() {
-                    Ok(JobResult::Done(job, cube, known)) => {
+                    Ok(JobResult::Done(job, cube, tops, known)) => {
                         self.in_flight.remove(&job);
-                        self.merge(job, &cube, known);
+                        self.merge(job, &cube, &tops, known);
                     }
                     Ok(JobResult::Panicked(job, payload)) => {
                         self.in_flight.remove(&job);
@@ -808,19 +855,19 @@ impl LodPyramid {
                 panic!("injected LOD job failure (test hook)");
             }
         }
-        let (cube, known) = load_or_sample(self.storage.as_ref(), &generator, job);
-        self.merge(job, &cube, known);
+        let (cube, tops, known) = load_or_sample(self.storage.as_ref(), &generator, job);
+        self.merge(job, &cube, &tops, known);
     }
 
     /// Merges one job result into its cube: real octants win (memory's own
     /// real data, or the stored record's), pending octants wait for their
     /// child, everything else takes the job's content. Then the deferred
     /// propagations that became possible run.
-    fn merge(&mut self, job: Job, result: &Cube, result_known: u8) {
+    fn merge(&mut self, job: Job, result: &Cube, result_tops: &LodTops, result_known: u8) {
         let was_ready = self.get(job.level, job.pos).is_some_and(|lc| lc.ready());
         {
             let lc = self.entry(job.level, job.pos);
-            fill_octants(lc, result, result_known);
+            fill_octants(lc, result, result_tops, result_known);
         }
         self.touch(job.level, job.pos, was_ready, true);
         self.propagate(job.level, job.pos, None);
@@ -914,7 +961,7 @@ impl LodPyramid {
             .iter()
             .map(|map| {
                 map.values()
-                    .map(|lc| lc.cube.heap_bytes() + size_of::<LodCube>())
+                    .map(|lc| lc.cube.heap_bytes() + lc.tops.heap_bytes() + size_of::<LodCube>())
                     .sum::<usize>()
                     + map.capacity() * (size_of::<(CubePos, LodCube)>() + 1)
             })
@@ -938,10 +985,11 @@ impl Drop for LodPyramid {
     }
 }
 
-/// Fills `lc`'s non-real, non-pending octants from `result`: `result_known`
-/// marks octants the stored record held as real (they become real here
-/// too); the rest are worldgen-filled. Real octants in memory always win.
-fn fill_octants(lc: &mut LodCube, result: &Cube, result_known: u8) {
+/// Fills `lc`'s non-real, non-pending octants — cells and column tops —
+/// from `result`: `result_known` marks octants the stored record held as
+/// real (they become real here too); the rest are worldgen-filled. Real
+/// octants in memory always win.
+fn fill_octants(lc: &mut LodCube, result: &Cube, result_tops: &LodTops, result_known: u8) {
     for octant in 0..8u8 {
         let bit = 1 << octant;
         if lc.known & bit != 0 || lc.pending & bit != 0 {
@@ -951,7 +999,7 @@ fn fill_octants(lc: &mut LodCube, result: &Cube, result_known: u8) {
         if !becomes_real && lc.filled & bit != 0 {
             continue;
         }
-        copy_octant(result, &mut lc.cube, octant);
+        copy_octant(result, result_tops, &mut lc.cube, &mut lc.tops, octant);
         if becomes_real {
             lc.known |= bit;
         } else {
@@ -964,10 +1012,14 @@ fn fill_octants(lc: &mut LodCube, result: &Cube, result_known: u8) {
 /// mask), a missing or unreadable one is sampled from worldgen. A corrupt
 /// record is logged with its position and resampled — never a panic — and
 /// the record on disk stays untouched until the cube is saved again.
-fn load_or_sample(storage: Option<&Arc<Storage>>, generator: &Generator, job: Job) -> (Cube, u8) {
+fn load_or_sample(
+    storage: Option<&Arc<Storage>>,
+    generator: &Generator,
+    job: Job,
+) -> (Cube, LodTops, u8) {
     if let Some(storage) = storage {
         match storage.load_lod(job.level, job.pos) {
-            Ok(Some((cube, known))) => return (cube, known),
+            Ok(Some((cube, tops, known))) => return (cube, tops, known),
             Ok(None) => {}
             Err(StorageError::Corrupt { pos, reason }) => {
                 eprintln!(
@@ -984,7 +1036,8 @@ fn load_or_sample(storage: Option<&Arc<Storage>>, generator: &Generator, job: Jo
             }
         }
     }
-    (generator.sample_lod(job.level, job.pos), 0)
+    let (cube, tops) = generator.sample_lod(job.level, job.pos);
+    (cube, tops, 0)
 }
 
 /// The worker half of the fill pipeline. A separate module so the worker's
@@ -1031,8 +1084,8 @@ mod lod_worker {
             match panic::catch_unwind(AssertUnwindSafe(|| {
                 load_or_sample(storage.as_ref(), generator, job)
             })) {
-                Ok((cube, known)) => {
-                    let _ = worker.results.send(JobResult::Done(job, cube, known));
+                Ok((cube, tops, known)) => {
+                    let _ = worker.results.send(JobResult::Done(job, cube, tops, known));
                 }
                 Err(payload) => {
                     let _ = worker.results.send(JobResult::Panicked(job, payload));

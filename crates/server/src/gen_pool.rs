@@ -17,32 +17,37 @@ use std::thread::{self, JoinHandle};
 use jbm_core::block::BlockStateId;
 use jbm_core::coords::CubePos;
 use jbm_core::cube::Cube;
-use jbm_core::lod::downsample_octant;
 use jbm_core::lod::parent;
+use jbm_core::lod::{LodTops, downsample_octant};
 
 use crate::storage::{Storage, StorageError};
 use crate::terrain::Generator;
 
 /// One finished (or exploded) job, as a worker reports it. The second cube
-/// is the LOD0 cube's precomputed level-1 octant (task 2.7): the worker
+/// (with its column tops) is the LOD0 cube's precomputed level-1 octant
+/// (task 2.7): the worker
 /// downsamples off the tick thread, into a uniform-air scratch cube at the
 /// octant's own slot of its level-1 parent, so pyramid ingest on the tick
 /// thread is a bulk copy (`copy_octant`), not a downsample.
 enum JobResult {
-    Done(CubePos, Cube, Cube),
+    Done(CubePos, Cube, Lod1Octant),
     /// A worker panicked generating this cube; the payload is re-raised on
     /// the tick thread by `try_recv` so the panic never silently vanishes.
     Panicked(CubePos, Box<dyn std::any::Any + Send>),
 }
 
+/// A LOD0 cube's precomputed level-1 octant: cells and column tops.
+pub type Lod1Octant = (Cube, LodTops);
+
 /// The level-1 octant of a LOD0 cube, as the workers hand it back: a
-/// uniform-air scratch cube with the downsample installed at the cube's
-/// octant slot of its parent.
-fn lod1_octant(pos: CubePos, cube: &Cube) -> Cube {
+/// uniform-air scratch cube (and empty tops) with the downsample installed
+/// at the cube's octant slot of its parent.
+fn lod1_octant(pos: CubePos, cube: &Cube) -> Lod1Octant {
     let (_, octant) = parent(pos);
     let mut scratch = Cube::filled(BlockStateId::AIR);
-    downsample_octant(cube, &mut scratch, octant);
-    scratch
+    let mut tops = LodTops::empty(1);
+    downsample_octant(cube, &LodTops::LOD0, &mut scratch, &mut tops, octant);
+    (scratch, tops)
 }
 
 /// Cube generation pool. With `threads == 0` it runs in inline mode: requests
@@ -143,7 +148,7 @@ impl GenPool {
     /// If a worker panicked generating a cube, that panic is resumed here —
     /// panics surface on the tick thread instead of vanishing with the
     /// worker.
-    pub fn try_recv(&mut self) -> Option<(CubePos, Cube, Cube)> {
+    pub fn try_recv(&mut self) -> Option<(CubePos, Cube, Lod1Octant)> {
         if self.threads.is_empty() {
             let pos = self.inline_queue.pop_front()?;
             let cube = load_or_generate(self.storage.as_ref(), &self.generator, pos);
@@ -249,7 +254,7 @@ fn worker(
 
 #[cfg(test)]
 mod tests {
-    use super::{Cube, GenPool, Generator};
+    use super::{Cube, GenPool, Generator, LodTops};
     use jbm_core::block::BlockRegistry;
     use jbm_core::block::builtin::Blocks;
     use jbm_core::coords::CubePos;
@@ -306,8 +311,16 @@ mod tests {
                 // at its own slot of the parent.
                 let (_, octant_index) = jbm_core::lod::parent(pos);
                 let mut expected = Cube::filled(jbm_core::block::BlockStateId::AIR);
-                jbm_core::lod::downsample_octant(&cube, &mut expected, octant_index);
-                assert_eq!(octant, expected, "octant scratch for {pos:?}");
+                let mut expected_tops = LodTops::empty(1);
+                jbm_core::lod::downsample_octant(
+                    &cube,
+                    &LodTops::LOD0,
+                    &mut expected,
+                    &mut expected_tops,
+                    octant_index,
+                );
+                assert_eq!(octant.0, expected, "octant scratch for {pos:?}");
+                assert_eq!(octant.1, expected_tops, "octant tops for {pos:?}");
                 got.insert(pos);
             }
         }

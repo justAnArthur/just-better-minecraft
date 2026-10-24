@@ -213,6 +213,12 @@ impl Server {
         self.lod.ready(level, pos)
     }
 
+    /// The column tops of the level-`level` LOD cube at `pos`, when the
+    /// pyramid holds one (task 2.14).
+    pub fn lod_tops(&self, level: u8, pos: CubePos) -> Option<&jbm_core::lod::LodTops> {
+        self.lod.get(level, pos).map(|lc| &lc.tops)
+    }
+
     /// Forwards to [`LodPyramid::request`]: queue `(level, pos)` for
     /// load-or-sample. Test and streaming access.
     pub fn request_lod(&mut self, level: u8, pos: CubePos) {

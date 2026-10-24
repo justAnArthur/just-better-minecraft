@@ -3,7 +3,7 @@
 //! arrive — level 0 and level 1 from real terrain (level 1 by the core
 //! downsampling rule over the level-0 data, since its footprint is
 //! small), levels 2 and 3 by sampling the heightfield at each level's
-//! resolution with a solid-leaning corner-max rule (the worldgen path
+//! resolution with a corner-max rule and column tops (the worldgen path
 //! 2.7 brings). The cubes go through the real client world, coverage
 //! rule, mesher and renderer; eight cameras — close, zoomed and
 //! steep-down views straight at the LOD0/LOD1 and LOD1/LOD2 borders and
@@ -43,7 +43,7 @@ use jbm_client::world::ClientWorld;
 use jbm_core::block::{BlockRegistry, BlockStateId, builtin::Blocks};
 use jbm_core::coords::{BlockPos, CUBE_SIZE, CubePos, LocalPos};
 use jbm_core::cube::Cube;
-use jbm_core::lod::{downsample_octant, parent};
+use jbm_core::lod::{LodTops, downsample_octant, parent};
 use jbm_core::protocol::ServerMsg;
 
 const SIZE: u32 = 256;
@@ -66,7 +66,7 @@ const RINGS_PINHOLES: PinholeRule = PinholeRule {
 };
 
 /// The smooth synthetic heightfield: gentle sines, gradient well under
-/// one block per block so the coarse (solid-leaning) samples sit above
+/// one block per block so the coarse (corner-max) samples sit above
 /// the fine surface by less than the two-cell skirt cover.
 fn height_at(x: i64, z: i64) -> i64 {
     let fx = x as f64;
@@ -108,20 +108,28 @@ fn lod0_cube(grid: &HeightGrid, blocks: &Blocks, pos: CubePos) -> Cube {
     })
 }
 
-/// A level >= 2 cube sampled at its own resolution.
-fn sampled_cube(grid: &HeightGrid, blocks: &Blocks, pos: CubePos, level: u8) -> Cube {
+/// A level >= 2 cube sampled at its own resolution, with its column tops
+/// (task 2.14). The column's surface block is the 3×3 sample max `M` of
+/// [`HeightGrid::max_over_cell`]; like the server's sampling, a cell is
+/// filled when it holds a block at or below `M`, and the column's top cell
+/// has fill height `M + 1 − y` (its top block is `M`).
+fn sampled_cube(grid: &HeightGrid, blocks: &Blocks, pos: CubePos, level: u8) -> (Cube, LodTops) {
     let cell_blocks = 1i64 << level;
     let base_x = i64::from(pos.x) * i64::from(CUBE_SIZE) * cell_blocks;
     let base_y = i64::from(pos.y) * i64::from(CUBE_SIZE) * cell_blocks;
     let base_z = i64::from(pos.z) * i64::from(CUBE_SIZE) * cell_blocks;
-    Cube::from_fn(|local: LocalPos| {
-        let x = base_x + i64::from(local.x) * cell_blocks;
+    let column = |local_x: u8, local_z: u8| {
+        let x = base_x + i64::from(local_x) * cell_blocks;
+        let z = base_z + i64::from(local_z) * cell_blocks;
+        (x, z, grid.max_over_cell(x, z, level))
+    };
+    let cube = Cube::from_fn(|local: LocalPos| {
+        let (x, z, surface) = column(local.x, local.z);
         let y = base_y + i64::from(local.y) * cell_blocks;
-        let z = base_z + i64::from(local.z) * cell_blocks;
-        if y < grid.max_over_cell(x, z, level) {
+        if y <= surface {
             // Material: grass at the topmost filled cell of the column,
             // sampled at the cell's corner.
-            let above_filled = y + cell_blocks < grid.max_over_cell(x, z, level);
+            let above_filled = y + cell_blocks <= surface;
             if above_filled {
                 blocks.stone
             } else {
@@ -133,7 +141,32 @@ fn sampled_cube(grid: &HeightGrid, blocks: &Blocks, pos: CubePos, level: u8) -> 
         } else {
             BlockStateId::AIR
         }
-    })
+    });
+    // Tops per octant half: the half's topmost filled cell holds `M`
+    // when the surface is inside the half, else the half is full to its
+    // top (the surface is above it) or empty (below it).
+    let half_rows = i64::from(CUBE_SIZE / 2);
+    let mut tops = LodTops::empty(level);
+    for z in 0..CUBE_SIZE as u8 {
+        for x in 0..CUBE_SIZE as u8 {
+            let (_, _, surface) = column(x, z);
+            for half in 0..2u8 {
+                let bottom = base_y + i64::from(half) * half_rows * cell_blocks;
+                let top = bottom + half_rows * cell_blocks;
+                let h = if surface < bottom {
+                    0
+                } else if surface >= top {
+                    cell_blocks
+                } else {
+                    surface + 1 - (bottom + (surface - bottom) / cell_blocks * cell_blocks)
+                };
+                tops.set_half(half, x, z, h as u8);
+            }
+        }
+    }
+    tops.compact();
+    debug_assert!(tops.consistent_with(&cube));
+    (cube, tops)
 }
 
 /// Every level-`level` cube position in that ring around the scene's
@@ -230,6 +263,7 @@ fn build_scene() -> (ClientWorld, BlockAppearance, Blocks) {
     }
     for pos in ring_positions(1) {
         let mut parent_cube = level1[&pos].clone();
+        let mut parent_tops = LodTops::empty(1);
         for dy in 0..2i32 {
             for dz in 0..2i32 {
                 for dx in 0..2i32 {
@@ -239,7 +273,13 @@ fn build_scene() -> (ClientWorld, BlockAppearance, Blocks) {
                         z: pos.z * 2 + dz,
                     };
                     let (_, octant) = parent(child);
-                    downsample_octant(&children[&child], &mut parent_cube, octant);
+                    downsample_octant(
+                        &children[&child],
+                        &LodTops::LOD0,
+                        &mut parent_cube,
+                        &mut parent_tops,
+                        octant,
+                    );
                 }
             }
         }
@@ -247,16 +287,19 @@ fn build_scene() -> (ClientWorld, BlockAppearance, Blocks) {
             level: 1,
             pos,
             cube: Box::new(parent_cube),
+            tops: parent_tops,
         });
     }
 
     // Levels 2 and 3: worldgen-style sampling at each level's resolution.
     for level in [2u8, 3] {
         for pos in ring_positions(level) {
+            let (cube, tops) = sampled_cube(&grid, &blocks, pos, level);
             world.apply(&ServerMsg::LodCubeData {
                 level,
                 pos,
-                cube: Box::new(sampled_cube(&grid, &blocks, pos, level)),
+                cube: Box::new(cube),
+                tops,
             });
         }
     }
@@ -895,7 +938,15 @@ fn a_lod1_cube_renders_like_its_pattern_scaled() {
         } else {
             Cube::default()
         };
-        downsample_octant(&child, &mut lod1, octant);
+        // Whole-cell plateau: its tops are full, which an input without
+        // tops means too.
+        downsample_octant(
+            &child,
+            &LodTops::LOD0,
+            &mut lod1,
+            &mut LodTops::empty(1),
+            octant,
+        );
     }
 
     let target = OffscreenTarget::new(&gpu.device, SIZE, SIZE);

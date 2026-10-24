@@ -25,7 +25,8 @@ classic graph's narrower `[36, 92]` sits inside them).
 - **Water and sea level (task 2.8).** `SEA_LEVEL = 63`: air cells at or
   below it become `base:water` — in `generate` and `sample_lod` alike.
   The water's top face is at 64, a multiple of 16, so every LOD level up
-  to 4 downsamples the sea to the same height (no steps at ring borders).
+  to 4 downsamples the sea to the same height (no steps at ring borders);
+  ocean column tops are full cells.
   Water is non-solid, so physics passes through it; no swimming or flow.
   Sea-less worlds (`Classic`, custom graphs) never gain water.
 - **Surface materials (overworld):** per column, from that column's own
@@ -205,8 +206,18 @@ terrain. It reuses the bounds fast paths (uniform air above, stone
 below), otherwise samples density on the level-(*n*−1) grid — 64³ points
 at one child-cell stride, surface lookahead included — runs the surface
 stage in block units and downsamples each 2×2×2 group with the shared
-rule. Level 1 is exact: it equals the downsample of the eight generated
-LOD0 cubes. It never calls `generate` and never touches the world.
+rule. It returns the cube **and its column tops** (`(Cube, LodTops)`,
+task 2.14): each child cell's fill height comes from its column's true
+surface (partial in the cell holding it, full below; water is full —
+the sea surface sits on a cell boundary), then reduces with the
+pyramid's recurrence. At levels ≥ 2 a sample sees only its footprint's
+min corner, so each sample column is raised to a **footprint
+envelope** — the bilinear interpolation of its own and the next
+samples' true surfaces, maximized over the footprint (a corner) and
+rounded up. That keeps the coarse top within a block of the footprint's
+highest block on smooth terrain instead of under it. Level 1 is exact:
+cells and tops equal the downsample of the eight generated LOD0 cubes.
+It never calls `generate` and never touches the world.
 
 **Adding a node:** add the variant to `Node` (with its serde shape), parse
 it in `parse_node` (allow-list its fields), add an `Op` variant plus its
@@ -258,21 +269,23 @@ never corrupts the database or waits.
 
 The **cube key** is `[kind: u8][x][y][z]`, each coordinate an i32
 big-endian with the sign bit flipped, so keys sort by coordinate value.
-`kind = 0` is a LOD0 cube; kind *n* in `1..=4` is a LOD level-*n* cube
+`kind = 0` is a LOD0 cube; kind *n* ≥ 1 is a LOD level-*n* cube
 (task 2.7, `lod_levels`'s range).
 
 **Cube records.** LOD0 (kind 0): `[schema u8 = 1][zstd level-3 frame of
-the cube codec bytes]`. LOD (kind ≥ 1): `[schema u8 = 2][known u8][zstd
-frame of the same codec]`, where `known` is the cube's real-octant
-bitmask. A LOD record that fails to decode is logged and treated as
+the cube codec bytes]`. LOD (kind ≥ 1): `[schema u8 = 3][known u8][tops]
+[zstd frame of the same codec]`, where `known` is the cube's real-octant
+bitmask and `tops` its column tops in `LodTops::encode` form (task 2.14;
+schema 2 had no tops and reads as absent). A LOD record that fails to decode is logged and treated as
 absent — never a panic. The format version stays 1: databases written
 before 2.7 hold no key with kind ≥ 1, so they open unchanged.
 
 **Worldgen fingerprint.** Stored LOD is only valid under the worldgen
-that wrote it: `meta.lod_fingerprint` holds `hash(compiled graph
-fingerprint, seed)`, written on every open. On a mismatch the stored LOD
-records read as absent and the next saves overwrite them; LOD0 records
-are never deleted.
+and rule that wrote it: `meta.lod_fingerprint` holds `hash(compiled graph
+fingerprint, seed, jbm_core::lod::RULE_VERSION)`, written on every open.
+On a mismatch (a different worldgen or downsampling rule) the stored LOD
+records are deleted in the same transaction that writes the new
+fingerprint, so they are resampled; LOD0 records are never deleted.
 
 **State remapping:** runtime `BlockStateId`s are re-assigned every start;
 on-disk ids are stable. On open, both remap tables are built in one
@@ -616,8 +629,10 @@ on the next tick unless another player keeps them.
 ## LOD pyramid (`lod`, tasks 2.4 and 2.7)
 
 `LodPyramid` keeps levels `1..=lod_levels`, each a map of
-`LodCube { cube: Cube, known: u8, filled: u8, pending: u8 }`, built from
-the real world by the core's `jbm_core::lod` downsampling rule. A
+`LodCube { cube: Cube, tops: LodTops, known: u8, filled: u8, pending: u8 }`,
+built from the real world by the core's `jbm_core::lod` downsampling rule
+(1 of 8, plus column tops — the coarse top of a column is the highest
+real block in its footprint, exactly; task 2.14). A
 level-*n* cube covers the same volume as a 2×2×2 group of
 level-(*n*−1) cubes.
 
@@ -647,7 +662,7 @@ The model is a pure function of the LOD0 cubes ever seen and the
 worldgen; `LodPyramid::rebuild(max_levels, &generator, lod0)` is its
 reference implementation, and the incremental paths (inserts, edits,
 requests, fills, storage loads, in any order) must equal it cell for
-cell and `known` for `known`.
+cell, top for top and `known` for `known`.
 
 - **Ingest:** `insert_lod0(pos, &Cube) -> LodChanges` downsamples a cube
   entering the world into its level-1 parent (created as uniform air if
@@ -685,11 +700,11 @@ every worker promptly even with a deep backlog or a held test hook.
 and after each content change, batched through the `jbm-save` thread in
 the same transaction as the LOD0 edits they derive from (a crash never
 leaves stored LOD disagreeing with stored LOD0). Records live in the
-`cubes` table under key kind = level (schema 2: `[2][known u8][zstd
-frame]`); see Persistence. A **worldgen fingerprint**
-(`hash(graph fingerprint, seed)` in `meta`) guards them: on mismatch —
-a different worldgen wrote them — stored LOD reads as absent and the
-next saves overwrite it; LOD0 records are never deleted. A cube that
+`cubes` table under key kind = level (schema 3: `[3][known u8][tops]
+[zstd frame]`); see Persistence. A **worldgen fingerprint**
+(`hash(graph fingerprint, seed, RULE_VERSION)` in `meta`) guards them:
+on mismatch — a different worldgen or downsampling rule wrote them —
+stored LOD is deleted and resampled; LOD0 records are never deleted. A cube that
 changes again while its previous save is in flight stays dirty, so the
 next interval after that save's ack stores the newer content.
 
@@ -812,7 +827,7 @@ Current cases:
   and uniform-stone records are 18 bytes), and one flush-sized commit of
   1,000 cubes takes ≈ 24 ms.
 - `storage/load_lod` (task 2.7) ≈ 18 µs — one stored surface LOD record
-  (schema 2), decode included.
+  (schema 3, tops included), decode included.
 - `lod/insert_lod0/{surface,air}` (task 2.4, `lod_bench.rs`) — a
   generated surface cube (mixed, asserted) or an air cube inserted into
   an existing 4-level pyramid.

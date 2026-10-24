@@ -11,17 +11,18 @@ use crate::mesh::input::{F_AIR, FLAGS_SHIFT, PAD, PAD_Y, PAD_Z};
 
 /// Marks a face key emitted under the skirt rule (bit 30; bit 31 is the
 /// non-zero flag).
-pub(crate) const SKIRT_KEY_BIT: u32 = 1 << 30;
+pub(crate) const SKIRT_KEY_BIT: u64 = 1 << 30;
 
-/// Marks a face key emitted under the lid rule (bit 6: above the 4 light
-/// bits, below the AO byte at bit 7, so no packed field reads it).
-pub(crate) const LID_KEY_BIT: u32 = 1 << 6;
+/// Marks a face key emitted under the lid rule (bit 6: below the AO byte
+/// at bit 7, so no packed field reads it).
+pub(crate) const LID_KEY_BIT: u64 = 1 << 6;
 
 /// The skirt rule, applied at level >= 1 in the side directions +-X/+-Z.
 /// A skirt stands in for a coarse cell's side wall at a level seam,
 /// hiding the crack where the neighboring volume is drawn by finer cubes
-/// whose surface sits lower (the downsampling rule leans solid, so a
-/// coarse surface can be up to 2^n - 1 blocks above the fine one):
+/// whose surface sits lower (a coarse column top is the highest block of
+/// its whole footprint, task 2.14, so on a slope it sits above the finer
+/// columns that cover the same ground):
 ///
 /// ```text
 ///      fine side (level n-1)      coarse side (level n, this cube)
@@ -46,8 +47,10 @@ pub(crate) const LID_KEY_BIT: u32 = 1 << 6;
 ///   above c is air, or the cell two above is. At the cube's top row the
 ///   two-above cell is outside the padded array and counts as filled.
 ///
-/// The face hangs down 2 cells worth of cover, enough for the 2^n - 1 the
-/// rule leans solid. When the octant across is drawn by the same coarse
+/// The face hangs down 2 cells worth of cover, its upper edge at c's fill
+/// height (a skirt from a partial column top stops at that top; task
+/// 2.14), and it replaces the partial side face [H_B, H_A] the culled
+/// pair would otherwise get. When the octant across is drawn by the same coarse
 /// cube (no finer level arrived there), the skirt sits inside terrain and
 /// is hidden by the neighbor's top face. Skirt faces are ordinary faces:
 /// same AO, same texture, greedy-merged within the octant rule.

@@ -9,9 +9,13 @@ use jbm_core::cube::Cube;
 
 use crate::mesh::appearance::BlockAppearance;
 use crate::mesh::face::{DIRECTIONS, Direction, FaceFields, pack};
-use crate::mesh::greedy::{LAYER_KEY_MASK, LIGHT, MASK_LEN, corner_ao, stride};
+use crate::mesh::greedy::{
+    LAYER_KEY_MASK, MASK_LEN, corner_ao, face_key, inset_key, key_inset_bottom, key_inset_top,
+    stride, v_mergeable,
+};
 use crate::mesh::input::{
     F_AIR, F_OPAQUE_CULL, FLAGS_SHIFT, MeshInput, MeshOutput, ORIGIN, PAD, PAD_Y, PAD_Z,
+    PaddedHeights,
 };
 use crate::mesh::seams::{LID_KEY_BIT, SKIRT_KEY_BIT, lid, skirt};
 
@@ -103,12 +107,19 @@ pub fn naive_unit_faces(
     out
 }
 
-/// The pre-2.13 greedy sweep, copied verbatim from what `greedy.rs`
-/// shipped before the bitmask rewrite: the per-cell mask build over every
-/// (u, v) cell of every slice. Task 2.13 B keeps it as the oracle the
-/// bitmask sweep must equal bit for bit at **every** level — same
-/// `PackedFace` list, order included, plus `skirts`, `lids` and `ranges`.
-pub fn reference_mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u8) -> MeshOutput {
+/// The pre-2.13 greedy sweep, copied from what `greedy.rs` shipped before
+/// the bitmask rewrite: the per-cell mask build over every (u, v) cell of
+/// every slice. Task 2.13 B keeps it as the oracle the bitmask sweep must
+/// equal bit for bit at **every** level — same `PackedFace` list, order
+/// included, plus `skirts`, `lids` and `ranges`. Task 2.14 added the fill
+/// heights in lockstep (per cell, straight from the rule in the greedy
+/// module docs): `heights` is what `build_padded_heights` returns.
+pub fn reference_mesh_padded(
+    pad: &[u32],
+    appearance: &BlockAppearance,
+    level: u8,
+    heights: Option<&PaddedHeights>,
+) -> MeshOutput {
     let mut output = MeshOutput {
         faces: Vec::new(),
         ranges: std::array::from_fn(|_| 0u32..0),
@@ -117,7 +128,10 @@ pub fn reference_mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u
     };
     let size = CUBE_SIZE as usize;
     let half = size / 2;
-    let mut mask = [0u32; MASK_LEN];
+    let full = 1u8 << level;
+    // Fill height of a non-air cell: a full cell unless a partial top.
+    let height = |index: usize| heights.map_or(full, |hs| hs.at(index));
+    let mut mask = [0u64; MASK_LEN];
 
     for (dir_index, &direction) in DIRECTIONS.iter().enumerate() {
         let n = stride(direction.normal());
@@ -154,37 +168,37 @@ pub fn reference_mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u
                     let a_air = a & (F_AIR << FLAGS_SHIFT) != 0;
                     let b_cull = b & (F_OPAQUE_CULL << FLAGS_SHIFT) != 0;
                     let culled = a_air || b_cull || a == b;
-                    let key = if culled {
-                        if level > 0 && side && !a_air && b_cull && skirt(pad, a_index, direction) {
-                            (1 << 31)
-                                | SKIRT_KEY_BIT
-                                | (u32::from(layer_of_kind[(a & 0xFFFF) as usize]) << 15)
-                                | (corner_ao(pad, b_index as isize, u, v) << 7)
-                                | LIGHT
-                        } else if level > 0
-                            && direction == Direction::PosY
-                            && !a_air
-                            && b_cull
-                            && lid(a_index)
-                        {
-                            (1 << 31)
-                                | LID_KEY_BIT
-                                | (u32::from(layer_of_kind[(a & 0xFFFF) as usize]) << 15)
-                                | (corner_ao(pad, b_index as isize, u, v) << 7)
-                                | LIGHT
-                        } else {
-                            0
-                        }
+                    let layer = layer_of_kind[(a & 0xFFFF) as usize];
+                    let ao = corner_ao(pad, b_index as isize, u, v);
+                    // The face spans [h_b, h_a] (sides) or sits at h_a
+                    // (+Y); -Y faces never move.
+                    let h_a = if a_air { 0 } else { height(a_index) };
+                    let h_b = if culled { height(b_index) } else { 0 };
+                    let top = match direction {
+                        Direction::NegY => 0,
+                        _ => full - h_a.max(1),
+                    };
+                    let key = if a_air {
+                        0
+                    } else if !culled {
+                        face_key(layer, ao) | inset_key(0, top)
+                    } else if level > 0 && side && b_cull && skirt(pad, a_index, direction) {
+                        face_key(layer, ao) | SKIRT_KEY_BIT | inset_key(0, top)
+                    } else if level > 0 && direction == Direction::PosY && b_cull && lid(a_index) {
+                        face_key(layer, ao) | LID_KEY_BIT | inset_key(0, top)
+                    } else if side && h_a > h_b {
+                        face_key(layer, ao) | inset_key(h_b, top)
                     } else {
-                        let layer = u32::from(layer_of_kind[(a & 0xFFFF) as usize]);
-                        let ao = corner_ao(pad, b_index as isize, u, v);
-                        (1 << 31) | (layer << 15) | (ao << 7) | LIGHT
+                        0
                     };
                     mask[(vi * CUBE_SIZE as isize + ui) as usize] = key;
                 }
             }
 
-            // Greedy merge: extend along u first, then along v.
+            // Greedy merge: extend along u first, then along v. A row
+            // joins when every cell of it carries one key that may sit on
+            // the row below (`v_mergeable`: equal keys, or for side faces
+            // equal apart from insets that leave the join exact).
             for v0 in 0..size {
                 for u0 in 0..size {
                     let key = mask[v0 * size + u0];
@@ -198,13 +212,16 @@ pub fn reference_mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u
                     }
                     let v_limit = if level > 0 && v0 < half { half } else { size };
                     let mut h = 1usize;
+                    let mut top_key = key;
                     'extend: while v0 + h < v_limit {
                         let row = (v0 + h) * size;
+                        let next = mask[row + u0];
                         for ui in u0..u0 + w {
-                            if mask[row + ui] != key {
+                            if mask[row + ui] != next || !v_mergeable(top_key, next, side) {
                                 break 'extend;
                             }
                         }
+                        top_key = next;
                         h += 1;
                     }
                     for vv in v0..v0 + h {
@@ -218,7 +235,7 @@ pub fn reference_mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u
                     let x = (owner % PAD) as u32 - 1;
                     let z = ((owner / PAD_Z) % PAD) as u32 - 1;
                     let y = (owner / PAD_Y) as u32 - 1;
-                    let ao8 = (key >> 7) & 0xFF;
+                    let ao8 = ((key >> 7) & 0xFF) as u32;
                     output.faces.push(pack(&FaceFields {
                         x,
                         y,
@@ -226,9 +243,10 @@ pub fn reference_mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u
                         width: w as u32,
                         height: h as u32,
                         direction,
-                        layer: (key >> 15) & LAYER_KEY_MASK,
+                        layer: (key >> 15) as u32 & LAYER_KEY_MASK,
                         ao: [ao8 & 3, (ao8 >> 2) & 3, (ao8 >> 4) & 3, (ao8 >> 6) & 3],
-                        light: key & 0xF,
+                        inset_bottom: key_inset_bottom(key),
+                        inset_top: key_inset_top(top_key),
                     }));
                     output.skirts += u32::from(key & SKIRT_KEY_BIT != 0);
                     output.lids += u32::from(key & LID_KEY_BIT != 0);
@@ -241,9 +259,13 @@ pub fn reference_mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u
 }
 
 /// The original greedy sweep, copied verbatim (modulo the skirts
-/// counter): no octant splits, no skirts, no lids. Level 0 output must
-/// match it byte for byte.
+/// counter, and the light nibble its faces once packed — always 15,
+/// repurposed for the insets in task 2.14, so it packs zero insets): no
+/// octant splits, no skirts, no lids, no fill heights. Level 0 output
+/// must match it byte for byte.
 pub fn legacy_mesh_padded(pad: &[u32], appearance: &BlockAppearance) -> MeshOutput {
+    // The light the original keyed every face with.
+    const LIGHT: u32 = 15;
     let mut output = MeshOutput {
         faces: Vec::new(),
         ranges: std::array::from_fn(|_| 0u32..0),
@@ -328,7 +350,8 @@ pub fn legacy_mesh_padded(pad: &[u32], appearance: &BlockAppearance) -> MeshOutp
                         direction,
                         layer: (key >> 15) & 0xFFFF,
                         ao: [ao8 & 3, (ao8 >> 2) & 3, (ao8 >> 4) & 3, (ao8 >> 6) & 3],
-                        light: key & 0xF,
+                        inset_bottom: 0,
+                        inset_top: 0,
                     }));
                 }
             }

@@ -641,14 +641,22 @@ fn two_level_world(blocks: &Blocks) -> ClientWorld {
         }
     }
     let mut parent_cube = Cube::default();
+    let mut parent_tops = jbm_core::lod::LodTops::empty(1);
     for (pos, cube) in &children {
         let (_, octant) = jbm_core::lod::parent(*pos);
-        jbm_core::lod::downsample_octant(cube, &mut parent_cube, octant);
+        jbm_core::lod::downsample_octant(
+            cube,
+            &jbm_core::lod::LodTops::LOD0,
+            &mut parent_cube,
+            &mut parent_tops,
+            octant,
+        );
     }
     world.apply(&ServerMsg::LodCubeData {
         level: 1,
         pos: CubePos { x: 0, y: 1, z: 0 },
         cube: Box::new(parent_cube),
+        tops: parent_tops,
     });
     world
 }

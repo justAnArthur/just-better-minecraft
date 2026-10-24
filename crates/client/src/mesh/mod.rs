@@ -20,7 +20,10 @@ pub mod seams;
 #[cfg(any(test, feature = "testing"))]
 pub mod oracle;
 
-pub use input::{MeshInput, MeshOutput, build_padded, neighbor_index};
+pub use input::{
+    MeshInput, MeshOutput, MeshTops, PaddedHeights, SIDE_OFFSETS, build_padded,
+    build_padded_heights, neighbor_index,
+};
 
 use appearance::BlockAppearance;
 use greedy::mesh_padded;
@@ -37,7 +40,7 @@ pub fn mesh_split_study(
     ignore_ao: bool,
     ignore_layer: bool,
 ) -> usize {
-    let mut keep = u32::MAX;
+    let mut keep = u64::MAX;
     if ignore_ao {
         keep &= !greedy::KEY_AO_BITS;
     }
@@ -45,7 +48,8 @@ pub fn mesh_split_study(
         keep &= !greedy::KEY_LAYER_BITS;
     }
     let padded = build_padded(input, appearance);
-    greedy::sweep_key_masked(&padded, appearance, input.level, keep)
+    let heights = build_padded_heights(input, &padded);
+    greedy::sweep_key_masked(&padded, appearance, input.level, heights.as_ref(), keep)
         .faces
         .len()
 }
@@ -65,11 +69,22 @@ pub fn mesh(input: &MeshInput, appearance: &BlockAppearance) -> MeshOutput {
         }
     }
     let padded = build_padded(input, appearance);
-    mesh_padded(&padded, appearance, input.level)
+    let heights = build_padded_heights(input, &padded);
+    mesh_padded(&padded, appearance, input.level, heights.as_ref())
 }
 
-/// Whether all six face neighbors are present, uniform and opaque.
+/// Whether all six face neighbors are present, uniform and opaque, and
+/// (level >= 1) no side neighbor has a partial column top — a side face
+/// rises above a lower neighbor top even when that neighbor is opaque.
 fn enclosed_by_opaque(input: &MeshInput, appearance: &BlockAppearance) -> bool {
+    if input
+        .tops
+        .sides
+        .iter()
+        .any(|tops| input::has_partial_top(tops.as_deref(), input.level))
+    {
+        return false;
+    }
     const FACE_OFFSETS: [(i32, i32, i32); 6] = [
         (1, 0, 0),
         (-1, 0, 0),

@@ -128,12 +128,12 @@ axis order as `LocalPos::index`.
 
 - **Occupancy:** a child is *filled* when it is not air (water and every
   other non-air state count; block properties are never consulted). The
-  cell is filled when **at least 2 of 8** children are filled, else air.
-  A one-block wall (4 of 8) and a 1×1 pillar (2 of 8) survive every
-  level; a single floating block vanishes at LOD1 — expected behavior.
-  The rule leans solid: surfaces can rise by up to 2ⁿ − 1 blocks and
-  tunnels narrower than 2ⁿ can close (skirts, 2.6, hide the first; the
-  second is invisible from LOD distance).
+  cell is filled when **at least 1 of 8** children is filled, else air
+  (task 2.14; it was 2 of 8). The coarse volume is the fine volume
+  rounded out to cells: walls, pillars and a single floating block all
+  survive (the block as one cell of height 1 or 2 at LOD1). Tunnels
+  narrower than 2ⁿ close — invisible from LOD distance. How high a
+  filled cell really reaches is carried separately, by the column tops.
 - **Material**, for a filled cell, is "what you see from above": the
   candidates are the topmost filled child of each of the four `(dx, dz)`
   columns of the group; pick the most common candidate, ties going to
@@ -152,6 +152,30 @@ edit changes at most one cell per level — that locality is what makes
 edit propagation exact. A later refinement may use registry data but
 must stay local.
 
+**Column tops (task 2.14).** Every filled cell has a *fill height*
+`h ∈ 1..=2ⁿ`: blocks from the cell's bottom to the top of its highest
+filled block. Level 1 from blocks: `h = 2` if an upper child (`dy = 1`)
+is filled, else 1. Level *n*: `h = max over filled children of
+(dy · 2ⁿ⁻¹ + h_child)`. A cube stores `h` only for the topmost filled
+cell of each column; every other filled cell counts as full (`h = 2ⁿ`),
+also as an `h_child`. That approximation flattens overhang undersides —
+local, deterministic, and invisible on the shipped terrain. So the
+coarse top of a column is the highest filled block in its footprint,
+exactly, for real data.
+
+`LodTops` holds them, **per octant half** (the lower and upper cell
+rows separately, `[u8; 2 · COLUMNS]`) so an octant's tops depend only
+on the child cube that fills it: each writer below touches exactly its
+octant's quarter of one half, and `get(x, z)` returns the upper half if
+nonzero, else the lower — the cube's column top (0 = no filled cell).
+Uniform tops (empty, full, one flat partial plane) carry no array, like
+a uniform `Cube`; `LodTops::LOD0` stands in for a level-0 child (every
+block full at height 1). `half_top`, `set_half`, `compact`,
+`consistent_with(&Cube)`, `heap_bytes` and a versioned
+`encode`/`decode` round it out. `RULE_VERSION` (2) names the rule;
+stored LOD written under another version is resampled (the server mixes
+it into `lod_fingerprint`).
+
 **Octants:** a child cube fills one octant (`CUBE_SIZE/2` cube of cells)
 of its parent. `parent(pos) -> (CubePos, u8)` gives the parent position
 (`div_euclid(2)` per axis, so negative coordinates nest exactly) and the
@@ -169,18 +193,23 @@ are the level math in one place. The client re-exports it from
 
 **Region API:** `CellBox { min, max: [u8; 3] }` (inclusive min, exclusive
 max) with `single(LocalPos)` and `union`. `downsample_region(child,
-parent, octant, region) -> Option<CellBox>` recomputes every parent cell
-whose group overlaps `region` (a box of child cells) and returns the box
-of parent cells that actually changed — the next level's input, so
-propagation stays proportional to what changed; `None` means no change.
-`downsample_octant(child, parent, octant)` is the whole-cube case with
-fast paths: a uniform child fills its octant with its own state, and a
-parent already uniform and equal to that fill is never unpacked.
-`copy_octant(src, parent, octant) -> Option<CellBox>` (task 2.7) installs
-an octant precomputed elsewhere — a generation worker downsamples the
-LOD0 cube off-thread and the tick thread only copies — returning the
-changed box like the other writers. All of them
-call `Cube::compact` after a write, so a parent that went uniform again
+child_tops, parent, parent_tops, octant, region) -> Option<CellBox>`
+recomputes every parent cell whose group overlaps `region` (a box of
+child cells), tops included, and returns the box of parent cells that
+actually changed — state or column-top height — the next level's input,
+so propagation stays proportional to what changed; `None` means no
+change. `downsample_octant(child, child_tops, parent, parent_tops,
+octant)` is the whole-cube case with fast paths: a uniform child fills
+its octant with its own state and tops, and a parent already uniform
+and equal to that fill (cells and tops) is never unpacked.
+`copy_octant(src, src_tops, parent, parent_tops, octant) ->
+Option<CellBox>` (task 2.7) installs an octant precomputed elsewhere — a
+generation worker downsamples the LOD0 cube off-thread and the tick
+thread only copies — returning the changed box like the other writers.
+Parent tops are a pure function of the eight child cubes' cells and
+tops, so the incremental edit path, a rebuild, the worker octant and
+the fill pipeline all agree. All of them call `Cube::compact` (and
+`LodTops::compact`) after a write, so a parent that went uniform again
 returns to its cheapest storage (that cost is in the `lod/*` benches).
 
 ### `physics` — the one shared player step (task 1.6)
@@ -267,7 +296,7 @@ through); per-state outline shapes are later.
 ## Protocol and links
 
 `protocol` holds the message enums the client and server exchange
-(`PROTOCOL_VERSION = 6`): `ClientMsg` (`Hello`, `PlayerInput { seq,
+(`PROTOCOL_VERSION = 7`): `ClientMsg` (`Hello`, `PlayerInput { seq,
 input, pitch }`, `BreakBlock { pos }`, `PlaceBlock { pos, state }`,
 `Ping`, `Disconnect`) and `ServerMsg` (`Welcome` with
 the spawn feet position, look `yaw`/`pitch` and `flying` — the initial
@@ -276,8 +305,8 @@ position and look, v5 — `PlayerState { ack_seq, state }` sent before `Tick` in
 where the server processed at least one input, `Rejected`, `Tick`,
 `Pong`, `Disconnected`, `CubeData { pos, cube }`, `UnloadCube { pos }`,
 `BlockChange { pos, state }` — the authoritative state of one block,
-`LodCubeData { level, pos, cube }` and `UnloadLodCube { level, pos }` —
-LOD ring cubes, v6).
+`LodCubeData { level, pos, cube, tops }` and `UnloadLodCube { level, pos }` —
+LOD ring cubes, v6; the column `tops` joined in v7).
 `PlayerInput.seq` starts at 1 and increments per client tick; the server
 ignores seqs ≤ the last processed one. Pitch is display-only; physics
 ignores it. Messages are plain owned data — no `Arc`, no references, no
