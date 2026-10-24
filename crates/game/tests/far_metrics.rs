@@ -637,3 +637,110 @@ fn far_shots() {
         }
     }
 }
+
+/// The look review: the shipped defaults, fog on, tint off and on, from
+/// the cameras a player actually sees — spawn at eye level, spawn from 60
+/// blocks up, the mountain top, the coast looking out to sea, and 300
+/// blocks up looking down at 30 degrees. Saved under `target/look-shots/`.
+/// Run with
+/// `cargo test --release -p jbm-game --test far_metrics look_shots -- --ignored --nocapture`.
+#[test]
+#[ignore = "slow real-server screenshots; run with --ignored"]
+fn look_shots() {
+    let start = Instant::now();
+    let Some(gpu) = jbm_client::testing::screenshot::gpu_or_skip() else {
+        return;
+    };
+    let mut registry = jbm_core::block::BlockRegistry::new();
+    let blocks = jbm_core::block::builtin::Blocks::register(&mut registry);
+    let nav = Generator::with_preset(DEFAULT_SEED, blocks, Preset::Overworld);
+    let side = i64::from(CUBE_SIZE);
+    let spawn = DVec3::from(nav.spawn());
+    let mountain = mountain_top(&nav, 2048);
+    // First all-ocean column along +x from spawn, camera 3 columns inland.
+    let ocean_cx = (0..4000)
+        .find(|&cx| nav.column_surface_bounds(cx, 0).1 < jbm_server::terrain::SEA_LEVEL)
+        .expect("an ocean column");
+    let coast_x = i64::from(ocean_cx - 3) * side;
+    let coast = DVec3::new(
+        coast_x as f64,
+        (nav.surface_height(coast_x, 0)
+            .max(jbm_server::terrain::SEA_LEVEL)
+            + 1) as f64,
+        0.0,
+    );
+    let shot_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("target")
+        .join("look-shots");
+    std::fs::create_dir_all(&shot_dir).expect("shot dir");
+
+    // (tag, feet position, extra height, yaw degrees, pitch degrees)
+    let sites = [
+        ("spawn_eye", spawn, 0.0, 0.0, -5.0),
+        ("spawn_60up", spawn, 60.0, 0.0, -15.0),
+        ("mountain", mountain, 0.0, 180.0, -10.0),
+        ("coast", coast, 4.0, 90.0, -5.0),
+        ("high_300", spawn, 300.0, 45.0, -30.0),
+    ];
+    for (tag, feet, up, yaw, pitch) in sites {
+        let mut server = Server::with_config(ServerConfig {
+            gen_threads: 6,
+            ..ServerConfig::default()
+        });
+        let (mut client, server_end) = jbm_core::link::in_process_pair();
+        server.add_connection(server_end);
+        client
+            .send(ClientMsg::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                name: "look".to_owned(),
+            })
+            .unwrap();
+        let mut win = MetricsClient::new(&gpu);
+        let site = feet + DVec3::new(0.0, up, 0.0);
+        join_and_teleport(
+            &mut server,
+            &mut win,
+            &mut client,
+            &gpu,
+            site,
+            start + TEST_TIMEOUT,
+        );
+        let mut camera = Camera::new(
+            site + DVec3::new(0.0, 1.62, 0.0),
+            70.0_f32.to_radians(),
+            WIDTH as f32 / HEIGHT as f32,
+        );
+        camera.set_yaw((yaw as f32).to_radians());
+        camera.set_pitch((pitch as f32).to_radians());
+        settle(
+            &mut server,
+            &mut win,
+            &mut client,
+            &gpu,
+            &camera,
+            start + TEST_TIMEOUT,
+        );
+        win.renderer.set_fog(true);
+        for tint in [false, true] {
+            win.renderer.set_lod_tint(tint);
+            for _ in 0..WARMUP_FRAMES {
+                win.render_frame(&gpu, &camera);
+            }
+            win.render_frame(&gpu, &camera);
+            let image = win.target.read_rgba(&gpu);
+            let name = if tint {
+                format!("{tag}_tint.png")
+            } else {
+                format!("{tag}.png")
+            };
+            let path = shot_dir.join(name);
+            image.save(&path).expect("save shot");
+            println!(
+                "saved {} ({:.0} s)",
+                path.display(),
+                start.elapsed().as_secs_f64()
+            );
+        }
+    }
+}
