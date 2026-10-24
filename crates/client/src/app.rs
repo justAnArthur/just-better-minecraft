@@ -39,11 +39,11 @@ use crate::terrain_sync::TerrainSync;
 /// Frame dt is clamped so a pause (window drag, debugger) does not
 /// teleport the camera — and, with the catch-up cap below, never
 /// accumulates more than one clamped frame's worth of sim ticks.
-/// The animation clock's wrap, in seconds (task 2.15): a few hours, so the
-/// f32 clock keeps millisecond precision; clouds jump once per wrap.
-const LOOK_CLOCK_WRAP: f32 = 4.0 * 3600.0;
-
 const MAX_DT: f32 = 0.25;
+
+/// The animation clock's wrap, in seconds (task 2.15): a few hours, so the
+/// f32 clock stays precise to ~2 ms; clouds and ripples jump once per wrap.
+const LOOK_CLOCK_WRAP: f32 = 4.0 * 3600.0;
 
 /// The fixed simulation period: 20 Hz, matching the physics tick.
 const SIM_PERIOD: Duration = Duration::from_millis(1000 / 20);
