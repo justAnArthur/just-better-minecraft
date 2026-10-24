@@ -10,22 +10,25 @@ use crate::gpu::Gpu;
 use crate::render::hiz::HizPyramid;
 use crate::render::renderer::DepthTarget;
 use crate::render::settings::RenderSettings;
+use crate::render::timing::GpuTimer;
 
-use super::TerrainPass;
 use super::layout::{CullParams, cull_debug_words};
 use super::pipelines::{CMD_BYTES, FACE_BYTES};
 use super::space::direction_split_blocks;
 use super::stats::{CullStats, STATS_BYTES, TerrainStats};
+use super::{SceneDraws, TerrainPass};
 
 impl TerrainPass {
     /// The gpu-cull frame: the GPU tests, emits and draws; the CPU's only
     /// per-cube work is the frustum pass that sizes the command regions.
     /// Phase order: early cull/draw, then Hi-Z build and late cull in one
-    /// compute pass, then the late draw.
+    /// compute pass, then the late draw — which is left for the scene pass
+    /// ([`TerrainPass::record`]). Returns whether the early draw ran (and
+    /// so cleared `target` and `depth`).
     // The eight parameters are one frame's draw context; a bundling struct
     // would only be unpacked again here.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn draw_gpu_cull(
+    pub(super) fn prepare_gpu_cull(
         &mut self,
         gpu: &Gpu,
         encoder: &mut wgpu::CommandEncoder,
@@ -34,7 +37,8 @@ impl TerrainPass {
         camera: &Camera,
         uniforms: &wgpu::BindGroup,
         settings: &RenderSettings,
-    ) {
+        timer: Option<&GpuTimer>,
+    ) -> bool {
         // Complete any stats readback from earlier frames (non-blocking)
         // and arm the maps for the slots copied last frame.
         self.stats_ring.begin_frame(gpu);
@@ -53,7 +57,7 @@ impl TerrainPass {
         if resident_dirs == 0 {
             self.stats = stats;
             self.last_cull = CullStats::default();
-            return;
+            return false;
         }
 
         // The shared origin uniform (also read by the vertex shader).
@@ -170,7 +174,7 @@ impl TerrainPass {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("jbm terrain early cull"),
-                timestamp_writes: None,
+                timestamp_writes: timer.and_then(|t| t.compute_writes("cull")),
             });
             pass.set_pipeline(&self.cull_early_pipeline);
             pass.set_bind_group(0, uniforms, &[]);
@@ -178,10 +182,10 @@ impl TerrainPass {
             pass.dispatch_workgroups(self.book.meta_len.div_ceil(64), 1, 1);
         }
 
-        // 2. Early draw.
+        // 2. Early draw, clearing the targets.
         let mut draw_calls = 0u64;
         {
-            let mut pass = self.begin_pass(encoder, target, depth.view());
+            let mut pass = self.begin_early_pass(encoder, target, depth.view(), timer);
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, uniforms, &[]);
             pass.set_bind_group(2, &self.shared_bind_group, &[]);
@@ -200,7 +204,7 @@ impl TerrainPass {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("jbm terrain hiz + late cull"),
-                timestamp_writes: None,
+                timestamp_writes: timer.and_then(|t| t.compute_writes("hiz+cull")),
             });
             self.hiz.as_ref().expect("created above").record(&mut pass);
             pass.set_pipeline(&self.cull_late_pipeline);
@@ -209,14 +213,13 @@ impl TerrainPass {
             pass.dispatch_workgroups(self.book.meta_len.div_ceil(64), 1, 1);
         }
 
-        // 5. Late draw.
-        {
-            let mut pass = self.begin_pass(encoder, target, depth.view());
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, uniforms, &[]);
-            pass.set_bind_group(2, &self.shared_bind_group, &[]);
-            draw_calls += self.draw_regions(&mut pass, &region_base, &page_bounds, bound_total);
-        }
+        // 5. The late draw, in the scene pass.
+        draw_calls += page_bounds.iter().filter(|&&count| count > 0).count() as u64;
+        self.scene_draws = SceneDraws::Late {
+            region_base,
+            page_bounds,
+            phase_base: bound_total,
+        };
 
         // 6. The counters for the overlay, one or two frames late.
         if let Some(slot) = self.stats_ring.take_slot() {
@@ -236,6 +239,7 @@ impl TerrainPass {
         stats.draw_calls = draw_calls;
         self.stats = stats;
         self.last_cull = cull;
+        true
     }
 
     /// One multi_draw_indirect per page over its region of `phase_base`.
@@ -244,7 +248,7 @@ impl TerrainPass {
     /// no-ops everywhere (the reason `multi_draw_indirect_count` is not
     /// used; Metal lacks it, and its MDI is a CPU loop over the encoded
     /// count, so the count must come from the CPU anyway).
-    fn draw_regions(
+    pub(super) fn draw_regions(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
         region_base: &[u32],

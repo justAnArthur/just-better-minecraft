@@ -6,7 +6,7 @@
 
 use crate::hud::HudSnapshot;
 use crate::render::overlay::FrameStats;
-use crate::render::settings::{LOD_LEVELS, RenderSettings};
+use crate::render::settings::{AUTO_RENDER_SCALE, LOD_LEVELS, MIN_RENDER_SCALE, RenderSettings};
 use crate::render::terrain::LevelStats;
 
 /// The World section's editable half: the server view distances in cubes
@@ -158,6 +158,21 @@ fn views_section(ui: &mut egui::Ui, settings: &mut RenderSettings) {
             "MSAA {}x (JBM_MSAA, at startup)",
             settings.msaa_samples
         ));
+        // The render scale (task 2.16): auto, or a fixed fraction of the
+        // window's pixels per axis; applied next frame.
+        let mut auto = settings.render_scale <= 0.0;
+        ui.checkbox(&mut auto, "auto render scale (JBM_RENDER_SCALE)");
+        if auto {
+            settings.render_scale = AUTO_RENDER_SCALE;
+        } else {
+            if settings.render_scale <= 0.0 {
+                settings.render_scale = 1.0;
+            }
+            ui.add(
+                egui::Slider::new(&mut settings.render_scale, MIN_RENDER_SCALE..=1.0)
+                    .text("render scale"),
+            );
+        }
         ui.checkbox(
             &mut settings.prefer_gpu_cull,
             "prefer gpu cull (JBM_GPU_CULL)",

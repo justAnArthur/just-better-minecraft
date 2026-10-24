@@ -354,13 +354,15 @@ impl App {
         // MSAA (task 2.15) is fixed here: the pipelines and the depth
         // target are built for the startup sample count.
         let mut renderer = Renderer::with_settings(&gpu, format, settings);
+        renderer.set_viewport(config.width, config.height);
+        // The scene renders at the render scale's size (task 2.16).
+        let (scene_width, scene_height) = renderer.scene_size();
         let depth = DepthTarget::with_samples(
             &gpu.device,
-            config.width,
-            config.height,
+            scene_width,
+            scene_height,
             settings.msaa_samples,
         );
-        renderer.set_viewport(config.width, config.height);
         self.camera.aspect = config.width as f32 / config.height as f32;
 
         let textures = BlockTextures::builtin(&gpu)?;
@@ -397,9 +399,18 @@ impl App {
 
     fn reconfigure(w: &mut Windowed) {
         w.surface.configure(&w.gpu.device, &w.config);
-        w.depth
-            .resize(&w.gpu.device, w.config.width, w.config.height);
         w.renderer.set_viewport(w.config.width, w.config.height);
+        Self::fit_scene(w);
+    }
+
+    /// Sizes the depth target — and with it the scene — to the render
+    /// scale (task 2.16): after a resize, and when the panel changes the
+    /// scale.
+    fn fit_scene(w: &mut Windowed) {
+        let (width, height) = w.renderer.scene_size();
+        if w.depth.size() != (width, height) {
+            w.depth.resize(&w.gpu.device, width, height);
+        }
     }
 
     /// Drains every queued server message (bounded work per message, no
@@ -757,6 +768,7 @@ impl App {
         w.renderer.set_debug_lines(&w.gpu, &debug_lines);
         self.look_clock = (self.look_clock + dt.as_secs_f32()) % LOOK_CLOCK_WRAP;
         w.renderer.set_time(self.look_clock);
+        Self::fit_scene(w);
         w.renderer.render(
             &w.gpu,
             FrameInputs {

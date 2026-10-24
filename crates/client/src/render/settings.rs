@@ -2,7 +2,7 @@
 //! distances the renderer and the terrain pass must agree on — fog, the
 //! level tint, the far-look radii, the terrain draw-path flags and the
 //! task 2.12 debug views. The renderer owns the one live copy and hands
-//! `&RenderSettings` to `TerrainPass::draw` each frame; the app reads the
+//! `&RenderSettings` to `TerrainPass::prepare` each frame; the app reads the
 //! environment once at startup through [`RenderSettings::from_env`] (the
 //! only place the JBM_* rendering variables are read). The debug panel
 //! edits the same fields live.
@@ -79,8 +79,9 @@ pub struct RenderSettings {
     /// AABB is farther than this from the camera draw all their face
     /// directions in one indirect command — back-face culling drops the
     /// same faces direction skipping dropped, so the image cannot change.
-    /// Near cubes keep one command per visible direction. 0 draws one
-    /// command everywhere; `JBM_DIRECTION_SPLIT=<cubes>` seeds it.
+    /// Nearer cubes keep one command per visible direction. 0 draws one
+    /// command everywhere, the default (`u32::MAX`) splits everywhere;
+    /// `JBM_DIRECTION_SPLIT=<cubes>` seeds it.
     pub direction_split_radius: u32,
     /// Sun and sky lighting (task 2.15): a fixed mid-morning sun plus a
     /// hemisphere ambient light every terrain fragment. Off restores the
@@ -99,6 +100,14 @@ pub struct RenderSettings {
     /// created — pipelines and targets are built for it — so changing it
     /// later has no effect (the panel shows it read-only).
     pub msaa_samples: u32,
+    /// The scene's render scale (task 2.16): the terrain, sky, lines and
+    /// outline render at this fraction of the window's pixels per axis
+    /// and are upscaled to it (the overlay and egui stay native). 0 is
+    /// auto ([`effective_render_scale`]: native up to
+    /// [`AUTO_SCALE_BUDGET`] pixels, scaled down to it above); otherwise
+    /// [`MIN_RENDER_SCALE`]..=1. `JBM_RENDER_SCALE=auto|<fraction>`; the
+    /// panel changes it live.
+    pub render_scale: f32,
 }
 
 impl Default for RenderSettings {
@@ -121,7 +130,58 @@ impl Default for RenderSettings {
             clouds: true,
             water: true,
             msaa_samples: DEFAULT_MSAA_SAMPLES,
+            render_scale: AUTO_RENDER_SCALE,
         }
+    }
+}
+
+/// `RenderSettings::render_scale`'s auto value (task 2.16).
+pub const AUTO_RENDER_SCALE: f32 = 0.0;
+
+/// The lowest render scale the setting accepts.
+pub const MIN_RENDER_SCALE: f32 = 0.25;
+
+/// The scene pixels the auto render scale allows (task 2.16): 2560×1600.
+/// Measured with `far_metrics::perf_views` on an M5 Pro, the 4× MSAA
+/// scene costs ~4–7 ms at 2560×1440 and ~13–23 ms at 5120×2880, nearly
+/// all of it per pixel. Windows up to this budget (every 1440p and
+/// smaller display, the test rigs) render natively; above it — a 5K
+/// display, a Retina laptop panel — the scene is scaled to the budget,
+/// which on a 2× HiDPI screen is about one scene pixel per point.
+pub const AUTO_SCALE_BUDGET: u32 = 2560 * 1600;
+
+/// The render scale applied to a `viewport`-sized window: `render_scale`
+/// clamped to [`MIN_RENDER_SCALE`]..=1, or for auto the largest scale
+/// that fits [`AUTO_SCALE_BUDGET`], capped at 1.
+pub fn effective_render_scale(render_scale: f32, (width, height): (u32, u32)) -> f32 {
+    if render_scale > 0.0 {
+        return render_scale.clamp(MIN_RENDER_SCALE, 1.0);
+    }
+    let pixels = f64::from(width) * f64::from(height);
+    (f64::from(AUTO_SCALE_BUDGET) / pixels.max(1.0))
+        .sqrt()
+        .min(1.0) as f32
+}
+
+/// The scene's pixel size for a `viewport`-sized window at
+/// `render_scale` ([`effective_render_scale`]); the viewport itself at
+/// scale 1, never below 1×1.
+pub fn scene_size(render_scale: f32, viewport: (u32, u32)) -> (u32, u32) {
+    let scale = effective_render_scale(render_scale, viewport);
+    if scale >= 1.0 {
+        return viewport;
+    }
+    let axis = |pixels: u32| ((pixels as f32 * scale).round() as u32).max(1);
+    (axis(viewport.0), axis(viewport.1))
+}
+
+/// Maps a `JBM_RENDER_SCALE` value to the setting: a fraction in
+/// (0, 1] (clamped to [`MIN_RENDER_SCALE`]), or auto for anything else,
+/// including unset and "auto".
+fn render_scale_from_env(value: Option<&str>) -> f32 {
+    match value.map(str::trim).and_then(|v| v.parse::<f32>().ok()) {
+        Some(scale) if scale > 0.0 => scale.clamp(MIN_RENDER_SCALE, 1.0),
+        _ => AUTO_RENDER_SCALE,
     }
 }
 
@@ -139,12 +199,14 @@ fn msaa_from_env(value: Option<&str>) -> u32 {
     }
 }
 
-/// The default direction-split radius (task 2.13 C), in cubes: measured
-/// against the far_metrics baseline (spawn at 16 cubes holds ~7k LOD0
-/// cubes issuing ~2.4k commands, nearly all beyond 4 cubes) it collapses
-/// the far bulk to one command per cube while the near band — where a
-/// cube can straddle the camera — keeps its per-direction skipping.
-pub const DEFAULT_DIRECTION_SPLIT_RADIUS: u32 = 4;
+/// The default direction-split radius (task 2.13 C), in cubes: none —
+/// every cube draws one command per visible direction. Task 2.13 set 4
+/// cubes to collapse the far bulk to one command per cube; task 2.16
+/// measured the cost of that: the far cubes' back faces (~35 % of a
+/// 2 M-face view) then reach the vertex shader, which is the geometry
+/// floor of the frame. Splitting everywhere roughly doubles the commands
+/// (~3.5 k → ~6.6 k, +0.2 ms CPU) and takes 0.3–0.7 ms off the GPU.
+pub const DEFAULT_DIRECTION_SPLIT_RADIUS: u32 = u32::MAX;
 
 impl RenderSettings {
     /// Reads the rendering environment variables: `JBM_NO_FOG`,
@@ -153,8 +215,9 @@ impl RenderSettings {
     /// `JBM_FREEZE_CULL` as `NAME=1`; `JBM_EXPLODE=<gap>` (any value,
     /// clamped to 0..=8) and `JBM_LEVELS=<comma-separated level list>` as
     /// the shown-levels mask; task 2.15's `JBM_NO_SUN`, `JBM_NO_CLOUDS`
-    /// and `JBM_NO_WATER` as `NAME=1` and `JBM_MSAA=1|4`. The app calls
-    /// this once at startup and never reads them again.
+    /// and `JBM_NO_WATER` as `NAME=1` and `JBM_MSAA=1|4`; task 2.16's
+    /// `JBM_RENDER_SCALE=auto|<fraction>`. The app calls this once at
+    /// startup and never reads them again.
     pub fn from_env() -> RenderSettings {
         let flag = |name: &str| std::env::var_os(name).is_some_and(|v| v == "1");
         let explode = std::env::var("JBM_EXPLODE")
@@ -186,6 +249,17 @@ impl RenderSettings {
             direction_split,
         )
         .with_msaa(msaa_from_env(std::env::var("JBM_MSAA").ok().as_deref()))
+        .with_render_scale(render_scale_from_env(
+            std::env::var("JBM_RENDER_SCALE").ok().as_deref(),
+        ))
+    }
+
+    /// The same settings at `render_scale`.
+    fn with_render_scale(self, render_scale: f32) -> RenderSettings {
+        RenderSettings {
+            render_scale,
+            ..self
+        }
     }
 
     /// The same settings with `samples` MSAA samples.
@@ -296,7 +370,7 @@ mod tests {
         assert!(!settings.freeze_cull);
         assert_eq!(
             settings.direction_split_radius, DEFAULT_DIRECTION_SPLIT_RADIUS,
-            "4 cubes by default"
+            "per-direction everywhere by default"
         );
         assert_eq!(
             settings.far_radii,
@@ -304,6 +378,36 @@ mod tests {
         );
         assert!(settings.sun_lighting && settings.clouds && settings.water);
         assert_eq!(settings.msaa_samples, 4, "4x MSAA by default");
+        assert_eq!(settings.render_scale, AUTO_RENDER_SCALE, "auto by default");
+    }
+
+    /// Task 2.16: auto keeps every window up to the budget native and
+    /// scales larger ones down to it; a fixed scale is clamped.
+    #[test]
+    fn render_scale_fits_the_budget() {
+        let auto = AUTO_RENDER_SCALE;
+        for native in [(1280, 720), (2560, 1440), (2560, 1600)] {
+            assert_eq!(scene_size(auto, native), native, "{native:?} stays native");
+        }
+        let (w, h) = scene_size(auto, (5120, 2880));
+        assert!(w * h <= AUTO_SCALE_BUDGET + w + h, "5K fits the budget");
+        assert!(w * h >= AUTO_SCALE_BUDGET - w - h, "and fills it");
+        assert!(
+            (w as f32 / h as f32 - 16.0 / 9.0).abs() < 0.01,
+            "the aspect is kept"
+        );
+        let (w, h) = scene_size(auto, (3024, 1964));
+        assert!(w < 3024 && w * h <= AUTO_SCALE_BUDGET + w + h);
+        assert_eq!(scene_size(0.5, (5120, 2880)), (2560, 1440));
+        assert_eq!(scene_size(1.0, (5120, 2880)), (5120, 2880));
+        assert_eq!(scene_size(0.01, (400, 200)), (100, 50), "clamped to 0.25");
+        assert_eq!(scene_size(auto, (0, 0)), (0, 0));
+        assert_eq!(render_scale_from_env(Some(" 0.5 ")), 0.5);
+        assert_eq!(render_scale_from_env(Some("2")), 1.0);
+        assert_eq!(render_scale_from_env(Some("0.1")), MIN_RENDER_SCALE);
+        assert_eq!(render_scale_from_env(Some("auto")), AUTO_RENDER_SCALE);
+        assert_eq!(render_scale_from_env(Some("0")), AUTO_RENDER_SCALE);
+        assert_eq!(render_scale_from_env(None), AUTO_RENDER_SCALE);
     }
 
     /// Task 2.15's look switches: each `JBM_NO_*` flips exactly its own

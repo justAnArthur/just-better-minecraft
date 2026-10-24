@@ -10,11 +10,11 @@ use crate::render::renderer::DEPTH_FORMAT;
 use crate::render::settings::RenderSettings;
 use crate::render::texture_array::BlockTextures;
 
-use super::TerrainPass;
 use super::layout::{CubeMeta, CullParams, FreezeParams, TerrainUniforms};
 use super::pages::MeshBookkeeping;
 use super::stats::{CullStats, STATS_BYTES, StatsRing};
 use super::worst_case_faces;
+use super::{SceneDraws, TerrainPass};
 
 /// Bytes per face (`PackedFace`).
 pub(super) const FACE_BYTES: u64 = std::mem::size_of::<PackedFace>() as u64;
@@ -525,6 +525,7 @@ impl TerrainPass {
                 settings.force_fallback,
             ],
             stats: Default::default(),
+            scene_draws: SceneDraws::None,
         }
     }
 

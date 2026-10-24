@@ -53,6 +53,7 @@ use crate::render::hiz::HizPyramid;
 use crate::render::renderer::DepthTarget;
 use crate::render::settings::RenderSettings;
 use crate::render::texture_array::BlockTextures;
+use crate::render::timing::GpuTimer;
 
 use layout::{debug_uniform_words, far_uniform_words, meta_flags, meta_for, tint_uniform_words};
 use pages::{FacePage, MeshBookkeeping};
@@ -109,6 +110,26 @@ fn select_path(
     } else {
         TerrainPath::GpuCull
     }
+}
+
+/// The draws [`TerrainPass::record`] puts into the scene pass, decided by
+/// [`TerrainPass::prepare`] (task 2.16).
+enum SceneDraws {
+    None,
+    /// cpu-cull: one `multi_draw_indirect` per (page, command count) span,
+    /// consecutive in the indirect buffer.
+    Indirect(Vec<(usize, u32)>),
+    /// The fallback: the same spans and commands as direct draws.
+    Direct {
+        spans: Vec<(usize, u32)>,
+        commands: Vec<wgpu::util::DrawIndirectArgs>,
+    },
+    /// gpu-cull: the late phase's per-page regions.
+    Late {
+        region_base: Vec<u32>,
+        page_bounds: Vec<u32>,
+        phase_base: u32,
+    },
 }
 
 /// Draws the terrain: one pipeline, one shared bind group, one page bind
@@ -191,6 +212,8 @@ pub struct TerrainPass {
     /// change (they hold between draws by design).
     applied_paths: [bool; 3],
     stats: TerrainStats,
+    /// This frame's scene-pass draws (task 2.16).
+    scene_draws: SceneDraws,
 }
 
 impl TerrainPass {
@@ -735,15 +758,23 @@ impl TerrainPass {
         self.pages.len()
     }
 
-    /// Records the terrain draw on the chosen path. See the path table in
-    /// the README; `draw_gpu_cull` and `draw_cpu_cull` in the path
-    /// modules. `settings` is the renderer-owned frame state (fog, level
-    /// tint, the task 2.12 debug views) — its path flags are re-applied
-    /// every draw, so the panel's force checkboxes switch the path live.
-    // The seven parameters are one frame's draw context; a bundling
+    /// Prepares the frame's terrain on the chosen path (see the path
+    /// table in the README; `prepare_gpu_cull` and `prepare_cpu_cull` in
+    /// the path modules): culls, writes the frame's buffers, and — on
+    /// gpu-cull — records the early phase (which clears `target` and
+    /// `depth`), the Hi-Z build and the late cull. The remaining draws go
+    /// into the renderer's scene pass through [`TerrainPass::record`]
+    /// (task 2.16: one pass for the terrain, the sky, the lines and the
+    /// outline, so the multisampled targets stay on chip). Returns whether
+    /// the targets were already cleared, i.e. whether the scene pass must
+    /// load instead of clear. `settings` is the renderer-owned frame state
+    /// (fog, level tint, the task 2.12 debug views) — its path flags are
+    /// re-applied every frame, so the panel's force checkboxes switch the
+    /// path live.
+    // The eight parameters are one frame's draw context; a bundling
     // struct would only be unpacked again in each path.
     #[allow(clippy::too_many_arguments)]
-    pub fn draw(
+    pub fn prepare(
         &mut self,
         gpu: &Gpu,
         encoder: &mut wgpu::CommandEncoder,
@@ -752,7 +783,8 @@ impl TerrainPass {
         camera: &Camera,
         uniforms: &wgpu::BindGroup,
         settings: &RenderSettings,
-    ) {
+        timer: Option<&GpuTimer>,
+    ) -> bool {
         // Live path switching (task 2.12): a settings change (the panel)
         // is applied on the next draw. The set_force_* setters hold
         // between draws by design, so unchanged settings never clobber
@@ -774,44 +806,98 @@ impl TerrainPass {
             "the depth target's sample count must match the terrain pipeline's"
         );
         self.update_frozen(gpu, camera, settings);
+        self.scene_draws = SceneDraws::None;
         match self.active_path() {
-            TerrainPath::GpuCull => {
-                self.draw_gpu_cull(gpu, encoder, target, depth, camera, uniforms, settings)
-            }
+            TerrainPath::GpuCull => self.prepare_gpu_cull(
+                gpu, encoder, target, depth, camera, uniforms, settings, timer,
+            ),
             TerrainPath::CpuCull | TerrainPath::Fallback => {
-                self.draw_cpu_cull(gpu, encoder, target, depth, camera, uniforms, settings)
+                self.prepare_cpu_cull(gpu, camera, settings);
+                false
             }
         }
     }
 
-    /// Begins one terrain render pass; every phase loads the sky's color
-    /// and depth.
-    fn begin_pass<'a>(
+    /// Records the frame's terrain draws (everything on cpu-cull and the
+    /// fallback, the late phase on gpu-cull) into the renderer's scene
+    /// pass, whose color and depth attachments must be the ones
+    /// [`TerrainPass::prepare`] was given.
+    pub fn record(&self, pass: &mut wgpu::RenderPass<'_>, uniforms: &wgpu::BindGroup) {
+        if matches!(self.scene_draws, SceneDraws::None) {
+            return;
+        }
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, uniforms, &[]);
+        pass.set_bind_group(2, &self.shared_bind_group, &[]);
+        match &self.scene_draws {
+            SceneDraws::None => {}
+            SceneDraws::Indirect(spans) => {
+                let mut offset = 0u64;
+                for &(page, count) in spans {
+                    pass.set_bind_group(1, &self.pages[page].bind_group, &[]);
+                    pass.multi_draw_indirect(
+                        &self.indirect_buffer,
+                        offset * pipelines::CMD_BYTES,
+                        count,
+                    );
+                    offset += u64::from(count);
+                }
+            }
+            SceneDraws::Direct { spans, commands } => {
+                // Fallback: the same commands as plain direct draws. Direct
+                // draws take a first instance without the feature.
+                let mut cursor = 0usize;
+                for &(page, count) in spans {
+                    pass.set_bind_group(1, &self.pages[page].bind_group, &[]);
+                    for command in &commands[cursor..cursor + count as usize] {
+                        pass.draw(
+                            command.first_vertex..command.first_vertex + command.vertex_count,
+                            command.first_instance..command.first_instance + command.instance_count,
+                        );
+                    }
+                    cursor += count as usize;
+                }
+            }
+            SceneDraws::Late {
+                region_base,
+                page_bounds,
+                phase_base,
+            } => {
+                self.draw_regions(pass, region_base, page_bounds, *phase_base);
+            }
+        }
+    }
+
+    /// Begins the gpu-cull early phase's render pass: it clears color and
+    /// depth (the scene pass then loads them) and stores both, since the
+    /// Hi-Z build reads the depth and the late phase continues on it.
+    fn begin_early_pass<'a>(
         &self,
         encoder: &'a mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         depth: &wgpu::TextureView,
+        timer: Option<&GpuTimer>,
     ) -> wgpu::RenderPass<'a> {
         encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("jbm terrain pass"),
+            label: Some("jbm terrain early pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                     store: wgpu::StoreOp::Store,
                 },
             })],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: depth,
                 depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
+                    load: wgpu::LoadOp::Clear(0.0),
                     store: wgpu::StoreOp::Store,
                 }),
                 stencil_ops: None,
             }),
-            timestamp_writes: None,
+            timestamp_writes: timer.and_then(|t| t.render_writes("terrain early")),
             occlusion_query_set: None,
             multiview_mask: None,
         })

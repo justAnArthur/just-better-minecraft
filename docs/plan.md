@@ -106,6 +106,7 @@ Blocks are hardcoded in Rust for now.
 | E | [x] 2.13 Meshing optimization and a larger full-detail radius (LOD only far away) | `client`, `server` | Full detail to ~512 blocks at frame budget; triangle count measured before/after |
 | E | [x] 2.14 Height-exact Distant-Horizons-style LOD (per-column exact top and material) | `core`, `server`, `client` | Coarse surface within a block of the true one; you approve the look |
 | E | [x] 2.15 The look: sun and sky light, sun disk and clouds, shaded water, MSAA, aerial haze | `client` | The five look shots read as a polished game; frame budget holds; you approve the look |
+| E | [ ] 2.16 Frame rate: ≥120 fps at the user's view on a 5K display (render scale, culling, LOD density) | `client` | The user's view at 5120×2880 renders at ≤8.3 ms GPU and CPU (≥120 fps), never below 60 fps at the look sites; 2560×1440 measured too; the look shots unchanged; you approve |
 
 **Gate:** fly across kilometres without frame hitches; bench records frame times. Then `/clear`.
 

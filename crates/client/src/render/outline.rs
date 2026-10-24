@@ -110,19 +110,9 @@ impl OutlinePass {
         OutlinePass { pipeline, vertices }
     }
 
-    /// Records the outline of `block` into `encoder`, depth-tested
-    /// against `depth`.
-    #[allow(clippy::too_many_arguments)] // mirrors the other passes' draw inputs; a frame-context struct is a later refactor
-    pub fn draw(
-        &mut self,
-        gpu: &Gpu,
-        encoder: &mut wgpu::CommandEncoder,
-        target: &wgpu::TextureView,
-        depth: &wgpu::TextureView,
-        uniforms: &wgpu::BindGroup,
-        camera: &Camera,
-        block: BlockPos,
-    ) {
+    /// Writes the outline of `block` (camera-relative) for this frame's
+    /// [`OutlinePass::record`].
+    pub fn prepare(&mut self, gpu: &Gpu, camera: &Camera, block: BlockPos) {
         // The 8 corners of the expanded box, camera-relative.
         let min = DVec3::new(
             block.x as f64 - EXPAND,
@@ -149,30 +139,11 @@ impl OutlinePass {
         }
         gpu.queue
             .write_buffer(&self.vertices, 0, bytemuck::cast_slice(&data));
+    }
 
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("jbm outline pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: depth,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                }),
-                stencil_ops: None,
-            }),
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
+    /// Records the outline into the renderer's scene pass (task 2.16: no
+    /// pass of its own), depth-tested against the terrain.
+    pub fn record(&self, pass: &mut wgpu::RenderPass<'_>, uniforms: &wgpu::BindGroup) {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, uniforms, &[]);
         pass.set_vertex_buffer(0, self.vertices.slice(..));

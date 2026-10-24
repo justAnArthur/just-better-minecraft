@@ -177,6 +177,8 @@ pub struct OverlayRenderer {
     solid_pipeline: wgpu::RenderPipeline,
     instance_buffer: wgpu::Buffer,
     capacity: u64,
+    /// The prepared frame's (solid quads, all quads) instance counts.
+    counts: (u32, u32),
     /// Integer glyph scale: 2 renders 8x8 glyphs as 16x16 px.
     pub scale: u32,
 }
@@ -367,24 +369,16 @@ impl OverlayRenderer {
             solid_pipeline,
             instance_buffer,
             capacity,
+            counts: (0, 0),
             scale: 2,
         }
     }
 
-    /// Lays out `text` and records the overlay draw into `encoder`.
-    /// The pass loads the existing color (drawn on top of the sky) and
-    /// also draws the crosshair: a small centered white cross with a dark
-    /// outline, visible on both sky and terrain. `viewport` is the target
-    /// size in pixels (crosshair centering).
-    pub fn draw(
-        &mut self,
-        gpu: &Gpu,
-        encoder: &mut wgpu::CommandEncoder,
-        target: &wgpu::TextureView,
-        uniforms: &wgpu::BindGroup,
-        viewport: (u32, u32),
-        text: &OverlayText,
-    ) {
+    /// Lays out `text` (plus the crosshair: a small centered white cross
+    /// with a dark outline, visible on both sky and terrain) and writes
+    /// the instances for this frame's [`OverlayRenderer::record`].
+    /// `viewport` is the target size in pixels (crosshair centering).
+    pub fn prepare(&mut self, gpu: &Gpu, viewport: (u32, u32), text: &OverlayText) {
         let (boxes, glyphs) = self.layout(text);
         // Solid quads: line boxes then the crosshair (dark bars under
         // white arms). Glyph quads follow.
@@ -393,6 +387,7 @@ impl OverlayRenderer {
         instances.extend(crosshair_quads(viewport));
         instances.extend(glyphs);
         let instance_count = instances.len() as u32;
+        self.counts = (solid_count, instance_count);
         if instance_count == 0 {
             return;
         }
@@ -408,23 +403,16 @@ impl OverlayRenderer {
             });
         }
         gpu.queue.write_buffer(&self.instance_buffer, 0, bytes);
+    }
 
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("jbm overlay pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
+    /// Records the prepared overlay into `pass`, a single-sample pass over
+    /// the frame target (task 2.16: the renderer's present pass, after
+    /// the scene), drawn over what is there.
+    pub fn record(&self, pass: &mut wgpu::RenderPass<'_>, uniforms: &wgpu::BindGroup) {
+        let (solid_count, instance_count) = self.counts;
+        if instance_count == 0 {
+            return;
+        }
         pass.set_bind_group(0, uniforms, &[]);
         // Both pipelines share this layout, so the atlas bind group is set
         // even for the solid quads (which do not sample it).
