@@ -514,20 +514,37 @@ const RIPPLE_FADE_END: f32 = 220.0;
 // open water from reading as a flat plate where the ripples have faded;
 // gone before they would alias (SWELL_FADE_*).
 const SWELL_STRENGTH: f32 = 0.028;
-const SWELL_FADE_START: f32 = 160.0;
-const SWELL_FADE_END: f32 = 1400.0;
+const SWELL_FADE_START: f32 = 60.0;
+const SWELL_FADE_END: f32 = 500.0;
 
 // One ripple wave's slope: the gradient direction of
 // sin(2*pi*(k . p / WRAP + speed * t)) scaled to unit steepness (every
 // wave as steep as the others, whatever its length). k is in whole cycles
 // per WRAP_PERIOD (65536 blocks); the phase is reduced with fract before
 // the cos, so large k . p stays precise.
-fn ripple_slope(p: vec2f, k: vec2f, speed: f32) -> vec2f {
+//
+// `footprint` is the fragment's size on the water plane in blocks (the
+// larger of its screen-x and screen-y extents, so grazing views count the
+// long, foreshortened axis). A wave is faded out as fewer than
+// RIPPLE_PIXELS_FULL pixels span its wavelength, and gone at
+// RIPPLE_PIXELS_GONE — before it could alias into bands — so mid-distance
+// water calms smoothly into a glossy reflection.
+const RIPPLE_PIXELS_FULL: f32 = 32.0;
+const RIPPLE_PIXELS_GONE: f32 = 12.0;
+
+fn ripple_slope(p: vec2f, k: vec2f, speed: f32, footprint: f32) -> vec2f {
+    let len = length(k);
+    let wavelength = 65536.0 / len;
+    let resolved = 1.0 - smoothstep(
+        wavelength / RIPPLE_PIXELS_FULL,
+        wavelength / RIPPLE_PIXELS_GONE,
+        footprint,
+    );
     let phase = fract(dot(k, p) / 65536.0 + speed * u.sun_dir.w);
-    return cos(phase * 6.2831853) * normalize(k);
+    return cos(phase * 6.2831853) * (k / len) * resolved;
 }
 
-fn water_normal(n: vec3f, rel: vec3f, dist: f32) -> vec3f {
+fn water_normal(n: vec3f, rel: vec3f, dist: f32, footprint: f32) -> vec3f {
     if (n.y < 0.5) {
         return n;
     }
@@ -542,22 +559,22 @@ fn water_normal(n: vec3f, rel: vec3f, dist: f32) -> vec3f {
     var slope = vec2f(0.0);
     if (ripple > 0.0) {
         // Five ripples, wavelengths ~3.6..9.6 blocks, in five directions.
-        var r = ripple_slope(p, vec2f(6400.0, 2368.0), 0.11);
-        r += ripple_slope(p, vec2f(-3904.0, 9600.0), 0.15);
-        r += ripple_slope(p, vec2f(12160.0, -6080.0), 0.19);
-        r += ripple_slope(p, vec2f(2368.0, 17920.0), 0.23);
-        r += ripple_slope(p, vec2f(-15040.0, -9024.0), 0.17);
+        var r = ripple_slope(p, vec2f(6400.0, 2368.0), 0.11, footprint);
+        r += ripple_slope(p, vec2f(-3904.0, 9600.0), 0.15, footprint);
+        r += ripple_slope(p, vec2f(12160.0, -6080.0), 0.19, footprint);
+        r += ripple_slope(p, vec2f(2368.0, 17920.0), 0.23, footprint);
+        r += ripple_slope(p, vec2f(-15040.0, -9024.0), 0.17, footprint);
         slope += r * ripple;
     }
-    var w = ripple_slope(p, vec2f(896.0, 512.0), 0.021);
-    w += ripple_slope(p, vec2f(-640.0, 1088.0), 0.027);
-    w += ripple_slope(p, vec2f(1408.0, -320.0), 0.033);
+    var w = ripple_slope(p, vec2f(896.0, 512.0), 0.021, footprint);
+    w += ripple_slope(p, vec2f(-640.0, 1088.0), 0.027, footprint);
+    w += ripple_slope(p, vec2f(1408.0, -320.0), 0.033, footprint);
     slope += w * swell;
     return normalize(vec3f(-slope.x, 1.0, -slope.y));
 }
 
-fn water_color(n_face: vec3f, rel: vec3f, dist: f32, ao: f32) -> vec3f {
-    let n = water_normal(n_face, rel, dist);
+fn water_color(n_face: vec3f, rel: vec3f, dist: f32, ao: f32, footprint: f32) -> vec3f {
+    let n = water_normal(n_face, rel, dist, footprint);
     let view = -rel / dist; // toward the eye
     let cos_v = clamp(dot(n, view), 0.0, 1.0);
     let fresnel = WATER_F0 + (1.0 - WATER_F0) * pow(1.0 - cos_v, 5.0);
@@ -619,6 +636,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     // constant — so the level >= 1 path fetches the texel it then ignores;
     // far_color drops its value exactly (mix(x, y, 1.0) == y).
     let tex = textureSample(block_textures, block_sampler, in.uv, in.layer);
+    // The fragment's footprint on a horizontal surface, in blocks: the
+    // water ripples fade by it (derivatives need uniform control flow,
+    // so it is taken here, ahead of the discard and the water branch).
+    let footprint = max(length(dpdx(in.rel.xz)), length(dpdy(in.rel.xz)));
     let dist = length(in.rel);
     // Cutout: glass, leaves and holes in textures discard below 0.5 —
     // only while any texture still shows (level 0, not fully faded; a LOD
@@ -630,7 +651,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     let n = face_normal(in.dir);
     var color: vec3f;
     if (layer_material[in.layer].flags.x > 0.5 && u.ambient_ground.w > 0.5) {
-        color = water_color(n, in.rel, dist, in.ao);
+        color = water_color(n, in.rel, dist, in.ao, footprint);
     } else {
         color = far_color(tex, in.layer, dist, in.level) * lighting(n, in.ao);
     }

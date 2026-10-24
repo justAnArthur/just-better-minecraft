@@ -28,16 +28,16 @@ pub const GROUND_HAZE_COLOR: [f32; 4] = [0.34, 0.37, 0.43, 1.0];
 /// [`SUN_ELEVATION_DEGREES`] above the horizon, its horizontal direction
 /// [`SUN_AZIMUTH_XZ`] (toward the sun, not axis-aligned so all four block
 /// sides read differently). [`sun_direction`] combines them.
-pub const SUN_ELEVATION_DEGREES: f32 = 40.0;
-pub const SUN_AZIMUTH_XZ: [f32; 2] = [-0.53, 0.85];
+pub const SUN_ELEVATION_DEGREES: f32 = 36.0;
+pub const SUN_AZIMUTH_XZ: [f32; 2] = [-0.80, 0.60];
 /// Sun radiance (linear RGB): warm white. A sunlit top face receives
 /// `SUN_COLOR · sin(elevation)` plus the sky ambient.
-pub const SUN_COLOR: [f32; 3] = [0.92, 0.80, 0.62];
+pub const SUN_COLOR: [f32; 3] = [1.00, 0.85, 0.62];
 /// The hemisphere ambient (linear RGB): sky blue from straight above,
 /// a dimmer warm ground bounce from straight below, blended by the
 /// normal's y.
-pub const AMBIENT_SKY: [f32; 3] = [0.41, 0.48, 0.58];
-pub const AMBIENT_GROUND: [f32; 3] = [0.30, 0.28, 0.25];
+pub const AMBIENT_SKY: [f32; 3] = [0.32, 0.40, 0.54];
+pub const AMBIENT_GROUND: [f32; 3] = [0.21, 0.20, 0.19];
 
 /// The unit vector toward the sun (task 2.15), mirrored by the shaders
 /// through `FrameUniforms::sun_dir`.

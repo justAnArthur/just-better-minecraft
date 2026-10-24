@@ -492,8 +492,8 @@ fading into a soft haze.
   SUN_AO))`, where `ambient(n)` blends ground to sky by `n.y` and leans
   `AMBIENT_SUN_SIDE` toward faces turned to the sun's azimuth. A sunlit
   top face is about the albedo (sky ambient plus `SUN_COLOR ·
-  sin(elevation)`), sides turned away from the sun sit near a third of
-  it, slightly blue. Every LOD level is lit the same; the per-level AO
+  sin(elevation)`, just under 1 so tops never wash out), sides turned
+  away from the sun sit near a quarter to a third of it, cooler blue. Every LOD level is lit the same; the per-level AO
   softening stays; no shadow maps. The old `face_shade` table is gone:
   with sun lighting off (`JBM_NO_SUN=1`, panel) the shader computes the
   old flat shades (top 1.0, ±Z 0.8, ±X 0.6, bottom 0.5) from the normal.
@@ -525,7 +525,12 @@ fading into a soft haze.
   blend toward the sky reflected about the surface normal (gradient
   plus glow), a tight sun glint, and procedural normals — five short
   ripples fading out over 24..220 blocks and a long, gentle swell fading
-  over 160..1400 blocks, both whole numbers of cycles per `WRAP_PERIOD`.
+  over 60..500 blocks, both whole numbers of cycles per `WRAP_PERIOD`.
+  Each wave also fades by the fragment's footprint on the water plane
+  (`max(|dpdx(rel.xz)|, |dpdy(rel.xz)|)`, so grazing views count the
+  foreshortened axis): full while 32 pixels span its wavelength, gone at
+  12 — mid-distance water calms into a glossy reflection instead of
+  aliasing into horizontal bands.
   The same function shades water at every level from the world
   position, so the LOD0/L1 seam cannot show. `water: false` /
   `JBM_NO_WATER=1` draws the flat average color instead.
@@ -901,9 +906,14 @@ constants sit next to these:
 
 | Constant | Linear |
 | --- | --- |
-| `SUN_COLOR` | 0.92, 0.80, 0.62 |
-| `AMBIENT_SKY` | 0.41, 0.48, 0.58 |
-| `AMBIENT_GROUND` | 0.30, 0.28, 0.25 |
+| `SUN_COLOR` | 1.00, 0.85, 0.62 |
+| `AMBIENT_SKY` | 0.32, 0.40, 0.54 |
+| `AMBIENT_GROUND` | 0.21, 0.20, 0.19 |
+
+The sun stands `SUN_ELEVATION_DEGREES` 36° up toward `SUN_AZIMUTH_XZ`
+(−0.80, 0.60): low enough that sunlit sides are brighter than tops and
+off the default view axes, so a hillside seen at yaw 0 shows a lit and
+a shadowed flank.
 
 ## Controls
 
