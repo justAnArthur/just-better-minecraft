@@ -205,11 +205,14 @@ fn world_section(
             &mut world.view_radius,
             2..=32,
         );
+        // The floor can pass 16 (view radius 32 needs 17); a range below
+        // it would clamp the value back every frame and re-apply forever.
+        let ring_max = clamped_ring_radius(world.view_radius, 16);
         applied |= drag_u32(
             ui,
             "ring radius (cubes per level)",
             &mut world.lod_view_radius,
-            2..=16,
+            2..=ring_max,
         );
         if applied {
             world.lod_view_radius = clamped_ring_radius(world.view_radius, world.lod_view_radius);

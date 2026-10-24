@@ -28,7 +28,8 @@ const LOD_SKIP_WINDOW: usize = 512;
 
 impl Server {
     /// Changes the view distances live (task 2.12's F3 panel): clamps
-    /// LOD0 to 2..=32 cubes and the LOD rings to 2..=16, updates the
+    /// LOD0 to 2..=32 cubes and the LOD rings to 2..=16 (or the floor
+    /// when it is higher), updates the
     /// config, and replays the same transitions a border crossing does —
     /// sent cubes that left the new keep sets are unloaded (both LOD0
     /// and every ring level), the desired sets and merged LOD walks are
@@ -38,10 +39,11 @@ impl Server {
     /// feeds the wider square.
     pub fn set_view_radius(&mut self, view_radius: u32, lod_view_radius: u32) {
         self.config.view_radius = view_radius.clamp(2, 32);
-        self.config.lod_view_radius = lod_view_radius.clamp(2, 16);
         // Task 2.13 E's floor, live: keep L1 beyond the LOD0 disk (the
-        // same clamp and warning ServerConfig::clamped prints).
+        // same clamp and warning ServerConfig::clamped prints). The cap
+        // of 16 yields to it: view radius 32 needs 17.
         let min = ServerConfig::min_lod_view_radius(self.config.view_radius);
+        self.config.lod_view_radius = lod_view_radius.clamp(2, min.max(16));
         if self.config.lod_view_radius < min {
             eprintln!(
                 "jbm: lod_view_radius {} would leave L1 inside LOD0 (view_radius {}); using {min}",
