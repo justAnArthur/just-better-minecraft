@@ -218,6 +218,12 @@ struct Autofly {
     flown: f64,
     /// When the last fly toggle was sent.
     last_toggle: Instant,
+    /// Feet position at the previous sim tick, to notice being blocked.
+    last_position: DVec3,
+    /// Sim ticks left to keep climbing after being blocked by terrain.
+    climb_ticks: u32,
+    /// Sim ticks since the run started, for the progress line.
+    ticks: u64,
 }
 
 impl Autofly {
@@ -233,6 +239,9 @@ impl Autofly {
             origin: DVec3::ZERO,
             flown: 0.0,
             last_toggle: Instant::now(),
+            last_position: DVec3::ZERO,
+            climb_ticks: 0,
+            ticks: 0,
         })
     }
 
@@ -479,7 +488,9 @@ impl App {
         fly_toggle = false; // consumed by whichever input steps below
         if *joined && let Some(autofly) = autofly.as_mut() {
             // Climb to 40 blocks above spawn, then straight ahead at
-            // sprint speed (yaw 0: toward -Z).
+            // sprint speed (yaw 0: toward -Z). Terrain taller than the
+            // cruise altitude blocks the flight, so a tick that barely
+            // moves forward climbs (with forward held) for two seconds.
             let state = predictor.state();
             if state.flying {
                 autofly.toggled = true;
@@ -487,10 +498,24 @@ impl App {
                 fly_toggle = true;
                 autofly.last_toggle = Instant::now();
             }
-            let rising = state.position.y < autofly.origin.y + 40.0;
+            let below_cruise = state.position.y < autofly.origin.y + 40.0;
+            let step = state.position - autofly.last_position;
+            if autofly.toggled && !below_cruise && step.x.hypot(step.z) < 0.1 {
+                autofly.climb_ticks = 40;
+            }
+            autofly.last_position = state.position;
+            let climbing = autofly.climb_ticks > 0;
+            autofly.climb_ticks = autofly.climb_ticks.saturating_sub(1);
+            autofly.ticks += 1;
+            if autofly.ticks.is_multiple_of(200) {
+                eprintln!(
+                    "autofly: {:.0} of {:.0} blocks, y {:.0}",
+                    autofly.flown, autofly.distance, state.position.y
+                );
+            }
             stepped = jbm_core::physics::MoveInput {
-                up: rising.into(),
-                forward: (!rising).into(),
+                up: (below_cruise || climbing).into(),
+                forward: (!below_cruise).into(),
                 sprint: true,
                 fly_toggle,
                 ..jbm_core::physics::MoveInput::IDLE
@@ -1207,6 +1232,9 @@ mod tests {
             origin: DVec3::ZERO,
             flown: 0.0,
             last_toggle: Instant::now(),
+            last_position: DVec3::ZERO,
+            climb_ticks: 0,
+            ticks: 0,
         };
         // Fresh attempt: too soon to retry.
         assert!(!autofly.wants_toggle(Duration::ZERO));
