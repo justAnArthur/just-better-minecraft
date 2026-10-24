@@ -20,6 +20,11 @@
 //! the order c0=(0,0), c1=(1,0), c2=(1,1), c3=(0,1) wind counter-clockwise
 //! viewed from outside the block — the front face for back-face culling.
 //! The AO corners are packed in that same c0..c3 order.
+//!
+//! **Insets** (task 2.14) move a level >= 1 face's edges by whole blocks
+//! so a coarse column's surface sits at its true height: `inset_bottom`
+//! raises a side face's lower edge, `inset_top` lowers a side face's upper
+//! edge or a +Y face's plane. Both are 0 on level-0 faces and on -Y faces.
 
 use bytemuck::{Pod, Zeroable};
 
@@ -37,7 +42,7 @@ use jbm_core::coords::CUBE_SIZE;
 /// | 15..20 | width - 1 |
 /// | 20..25 | height - 1 |
 /// | 25..28 | direction (see the table above) |
-/// | 28..32 | spare, zero |
+/// | 28..32 | inset_bottom, low 4 bits |
 ///
 /// **Word 1:**
 ///
@@ -48,8 +53,12 @@ use jbm_core::coords::CUBE_SIZE;
 /// | 18..20 | AO corner c1 |
 /// | 20..22 | AO corner c2 |
 /// | 22..24 | AO corner c3 |
-/// | 24..28 | light 0..15 (always 15 until lighting exists) |
-/// | 28..32 | spare, zero |
+/// | 24..26 | inset_bottom, high 2 bits |
+/// | 26..32 | inset_top |
+///
+/// Both insets are 6 bits, in **blocks** (not cells), 0..=63. Word 1 bits
+/// 24..28 once held a light nibble that was always 15 and never read on
+/// the GPU; task 2.14 repurposed them.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct PackedFace(pub u32, pub u32);
@@ -111,12 +120,16 @@ impl Direction {
     }
 }
 
-/// The four quad corners c0..c3 of a face in cube-local block units: the
-/// CPU mirror of the corner math in `terrain.wgsl`'s `vs_main` (keep them
-/// identical). The quad starts at the owner's corner one block along the
-/// normal if it points positive, and one block along u or v if that axis
-/// points negative, then spans `width` along u and `height` along v.
-pub fn quad_corners(f: &FaceFields) -> [[i32; 3]; 4] {
+/// The four quad corners c0..c3 of a face of a level-`level` cube, in
+/// cube-local **block** units: the CPU mirror of the corner math in
+/// `terrain.wgsl`'s `vs_main` (keep them identical). The quad starts at
+/// the owner's corner one cell along the normal if it points positive,
+/// and one cell along u or v if that axis points negative, then spans
+/// `width` cells along u and `height` along v; everything scales by the
+/// cell size `2^level`. The insets then move y by whole blocks: a side
+/// face's lower corners rise by `inset_bottom` and its upper corners drop
+/// by `inset_top`; a +Y face drops by `inset_top`.
+pub fn quad_corners(f: &FaceFields, level: u8) -> [[i32; 3]; 4] {
     let n = f.direction.normal();
     let u = f.direction.u_axis();
     let v = f.direction.v_axis();
@@ -124,8 +137,15 @@ pub fn quad_corners(f: &FaceFields) -> [[i32; 3]; 4] {
     let base: [i32; 3] =
         std::array::from_fn(|i| owner[i] + n[i].max(0) + (-u[i]).max(0) + (-v[i]).max(0));
     let (w, h) = (f.width as i32, f.height as i32);
-    [(0, 0), (1, 0), (1, 1), (0, 1)]
-        .map(|(cu, cv)| std::array::from_fn(|i| base[i] + u[i] * cu * w + v[i] * cv * h))
+    let scale = 1i32 << level;
+    let (bottom, top) = (f.inset_bottom as i32, f.inset_top as i32);
+    [(0, 0), (1, 0), (1, 1), (0, 1)].map(|(cu, cv)| {
+        let mut corner: [i32; 3] =
+            std::array::from_fn(|i| (base[i] + u[i] * cu * w + v[i] * cv * h) * scale);
+        // v[1] is 1 on side faces only; n[1].max(0) is 1 on +Y only.
+        corner[1] += v[1] * if cv == 0 { bottom } else { -top } - n[1].max(0) * top;
+        corner
+    })
 }
 
 /// The unpacked fields of a [`PackedFace`].
@@ -144,8 +164,11 @@ pub struct FaceFields {
     pub layer: u32,
     /// AO per corner, c0..c3 order, 0 (dark) ..= 3 (open).
     pub ao: [u32; 4],
-    /// Block light, 0..=15. Always 15 until lighting exists.
-    pub light: u32,
+    /// Blocks the lower edge of a side face rises, 0..=63 (level >= 1).
+    pub inset_bottom: u32,
+    /// Blocks the upper edge of a side face, or the plane of a +Y face,
+    /// drops, 0..=63 (level >= 1).
+    pub inset_top: u32,
 }
 
 /// Packs fields into the two words. Debug-asserts the documented ranges so
@@ -164,21 +187,30 @@ pub fn pack(f: &FaceFields) -> PackedFace {
         "height out of 1..=CUBE_SIZE"
     );
     debug_assert!(f.layer <= u16::MAX as u32, "layer overflows 16 bits");
-    debug_assert!(f.light <= 15, "light out of 0..=15");
+    debug_assert!(
+        f.inset_bottom <= 63 && f.inset_top <= 63,
+        "inset out of 0..=63"
+    );
     let w0 = f.x
         | (f.y << 5)
         | (f.z << 10)
         | ((f.width - 1) << 15)
         | ((f.height - 1) << 20)
-        | ((f.direction as u32) << 25);
+        | ((f.direction as u32) << 25)
+        | ((f.inset_bottom & 15) << 28);
     let ao = f.ao;
     debug_assert!(ao.iter().all(|&a| a <= 3), "AO out of 0..=3");
-    let w1 =
-        f.layer | (ao[0] << 16) | (ao[1] << 18) | (ao[2] << 20) | (ao[3] << 22) | (f.light << 24);
+    let w1 = f.layer
+        | (ao[0] << 16)
+        | (ao[1] << 18)
+        | (ao[2] << 20)
+        | (ao[3] << 22)
+        | ((f.inset_bottom >> 4) << 24)
+        | (f.inset_top << 26);
     PackedFace(w0, w1)
 }
 
-/// Inverse of [`pack`]. Spare bits are ignored.
+/// Inverse of [`pack`].
 pub fn unpack(face: PackedFace) -> FaceFields {
     let (w0, w1) = (face.0, face.1);
     let direction = match (w0 >> 25) & 7 {
@@ -204,7 +236,8 @@ pub fn unpack(face: PackedFace) -> FaceFields {
             (w1 >> 20) & 3,
             (w1 >> 22) & 3,
         ],
-        light: (w1 >> 24) & 15,
+        inset_bottom: (w0 >> 28) | (((w1 >> 24) & 3) << 4),
+        inset_top: w1 >> 26,
     }
 }
 
@@ -235,7 +268,8 @@ mod tests {
                 direction: Direction::PosX,
                 layer: 0,
                 ao: [0, 0, 0, 0],
-                light: 0,
+                inset_bottom: 0,
+                inset_top: 0,
             },
             FaceFields {
                 x: last,
@@ -246,7 +280,8 @@ mod tests {
                 direction: Direction::NegZ,
                 layer: u16::MAX as u32,
                 ao: [3, 3, 3, 3],
-                light: 15,
+                inset_bottom: 63,
+                inset_top: 63,
             },
             FaceFields {
                 x: last,
@@ -257,7 +292,8 @@ mod tests {
                 direction: Direction::NegY,
                 layer: 1,
                 ao: [3, 0, 1, 2],
-                light: 7,
+                inset_bottom: 17,
+                inset_top: 0,
             },
             FaceFields {
                 x: 1,
@@ -268,14 +304,18 @@ mod tests {
                 direction: Direction::PosZ,
                 layer: 10,
                 ao: [2, 2, 0, 1],
-                light: 15,
+                inset_bottom: 0,
+                inset_top: 40,
             },
         ];
         for (i, fields) in cases.iter().enumerate() {
             let packed = pack(fields);
-            // Spare bits stay zero.
-            assert_eq!(packed.0 >> 28, 0, "case {i}: word 0 spare bits set");
-            assert_eq!(packed.1 >> 28, 0, "case {i}: word 1 spare bits set");
+            // Zero insets (every level-0 face) leave bits 28..32 of both
+            // words clear.
+            if fields.inset_bottom == 0 && fields.inset_top == 0 {
+                assert_eq!(packed.0 >> 28, 0, "case {i}: word 0 inset bits set");
+                assert_eq!(packed.1 >> 24, 0, "case {i}: word 1 inset bits set");
+            }
             assert_eq!(unpack(packed), *fields, "case {i} does not round-trip");
         }
         // All six directions survive the trip.
@@ -289,7 +329,8 @@ mod tests {
                 direction,
                 layer: 11,
                 ao: [1, 2, 3, 0],
-                light: 15,
+                inset_bottom: 0,
+                inset_top: 0,
             };
             assert_eq!(unpack(pack(&fields)), fields, "{direction:?}");
         }
@@ -310,9 +351,10 @@ mod tests {
                 direction,
                 layer: 0,
                 ao: [3; 4],
-                light: 15,
+                inset_bottom: 0,
+                inset_top: 0,
             };
-            let corners = quad_corners(&fields);
+            let corners = quad_corners(&fields, 0);
             let n = direction.normal();
             let (u, v) = (direction.u_axis(), direction.v_axis());
             let mut lo = [i32::MAX; 3];
@@ -344,6 +386,66 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn every_inset_pair_round_trips_beside_saturated_fields() {
+        let last = (CUBE_SIZE - 1) as u32;
+        for inset_bottom in 0..64 {
+            for inset_top in 0..64 {
+                let fields = FaceFields {
+                    x: last,
+                    y: last,
+                    z: last,
+                    width: CUBE_SIZE as u32,
+                    height: CUBE_SIZE as u32,
+                    direction: Direction::NegZ,
+                    layer: u16::MAX as u32,
+                    ao: [3; 4],
+                    inset_bottom,
+                    inset_top,
+                };
+                assert_eq!(unpack(pack(&fields)), fields);
+            }
+        }
+    }
+
+    #[test]
+    fn quad_corners_apply_insets_in_blocks_after_the_level_scale() {
+        // A level-2 face (4-block cells) owned by cell (3, 4, 5), 2 x 3
+        // cells, bottom inset 1 block and top inset 2.
+        let face = |direction| FaceFields {
+            x: 3,
+            y: 4,
+            z: 5,
+            width: 2,
+            height: 3,
+            direction,
+            layer: 0,
+            ao: [3; 4],
+            inset_bottom: 1,
+            inset_top: 2,
+        };
+        for direction in [
+            Direction::PosX,
+            Direction::NegX,
+            Direction::PosZ,
+            Direction::NegZ,
+        ] {
+            let ys = quad_corners(&face(direction), 2).map(|c| c[1]);
+            // c0/c1 on the bottom edge (cell 4 = block 16, raised by 1),
+            // c2/c3 on the top (cell 7 = block 28, lowered by 2).
+            assert_eq!(ys, [17, 17, 26, 26], "{direction:?}");
+        }
+        // +Y: the plane at the top of cell 4 (block 20), lowered by 2.
+        assert_eq!(
+            quad_corners(&face(Direction::PosY), 2).map(|c| c[1]),
+            [18; 4]
+        );
+        // In-plane coordinates only scale.
+        let pos_y = quad_corners(&face(Direction::PosY), 2);
+        assert_eq!(pos_y[0], [12, 18, 20]);
+        assert_eq!(pos_y[2], [12 + 3 * 4, 18, 20 + 2 * 4]);
     }
 
     #[test]

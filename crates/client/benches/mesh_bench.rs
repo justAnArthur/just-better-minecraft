@@ -20,10 +20,11 @@ use std::sync::Arc;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use jbm_client::mesh::appearance::BlockAppearance;
-use jbm_client::mesh::{self, MeshInput, neighbor_index};
+use jbm_client::mesh::{self, MeshInput, MeshTops, neighbor_index};
 use jbm_client::render::suballoc;
 use jbm_core::block::{BlockRegistry, BlockStateId, builtin};
 use jbm_core::cube::Cube;
+use jbm_core::lod::LodTops;
 
 fn setup() -> (BlockAppearance, builtin::Blocks) {
     let mut registry = BlockRegistry::new();
@@ -49,6 +50,26 @@ fn terrain_like_cube(blocks: &builtin::Blocks) -> Cube {
             blocks.stone
         }
     })
+}
+
+/// Level-2 column tops for [`terrain_like_cube`]: each column's top cell
+/// (the one holding its grass) gets a deterministic partial height
+/// 1..=4; a lower half under a filled upper half is full.
+fn terrain_like_tops() -> LodTops {
+    let mut tops = LodTops::empty(2);
+    let half = jbm_core::coords::CUBE_SIZE as u8 / 2;
+    for z in 0..jbm_core::coords::CUBE_SIZE as u8 {
+        for x in 0..jbm_core::coords::CUBE_SIZE as u8 {
+            let h = 1 + (x * 7 + z * 3) % 4;
+            if height_at(x, z) >= half {
+                tops.set_half(0, x, z, 4);
+                tops.set_half(1, x, z, h);
+            } else {
+                tops.set_half(0, x, z, h);
+            }
+        }
+    }
+    tops
 }
 
 /// Neighbors for `center`: `filler` in every slot, or all missing.
@@ -83,6 +104,7 @@ fn bench(c: &mut Criterion) {
         level: 0,
         center: Arc::new(terrain_like_cube(&blocks)),
         neighbors: terrain_neighbors(&air, &stone),
+        tops: MeshTops::default(),
     };
     let checker_input = MeshInput {
         level: 0,
@@ -94,22 +116,29 @@ fn bench(c: &mut Criterion) {
             }
         })),
         neighbors: uniform_neighbors(Some(Arc::clone(&air))),
+        tops: MeshTops::default(),
     };
     let uniform_input = MeshInput {
         level: 0,
         center: Arc::new(Cube::filled(blocks.stone)),
         neighbors: uniform_neighbors(Some(Arc::clone(&air))),
+        tops: MeshTops::default(),
     };
     let padded_input = MeshInput {
         level: 0,
         center: Arc::new(terrain_like_cube(&blocks)),
         neighbors: uniform_neighbors(Some(Arc::clone(&stone))),
+        tops: MeshTops::default(),
     };
 
     let lod2_input = MeshInput {
         level: 2,
         center: Arc::new(terrain_like_cube(&blocks)),
         neighbors: terrain_neighbors(&air, &stone),
+        tops: MeshTops {
+            center: Some(Arc::new(terrain_like_tops())),
+            ..MeshTops::default()
+        },
     };
 
     let mut group = c.benchmark_group("mesh");

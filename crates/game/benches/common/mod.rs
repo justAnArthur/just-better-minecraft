@@ -16,7 +16,7 @@ use std::sync::Arc;
 pub mod rings;
 
 use jbm_client::mesh::appearance::BlockAppearance;
-use jbm_client::mesh::{MeshInput, neighbor_index};
+use jbm_client::mesh::{MeshInput, MeshTops, neighbor_index};
 use jbm_client::testing::heightfield::layer_state;
 use jbm_core::block::BlockRegistry;
 use jbm_core::block::BlockStateId;
@@ -244,6 +244,7 @@ impl Region {
             center: Arc::clone(&self.cubes[&pos]),
             neighbors,
             level: 0,
+            tops: MeshTops::default(),
         }
     }
 

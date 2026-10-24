@@ -20,13 +20,13 @@ use std::sync::Arc;
 use glam::DVec3;
 use jbm_client::camera::Camera;
 use jbm_client::lod::CubeKey;
-use jbm_client::mesh::{self, MeshInput, neighbor_index};
+use jbm_client::mesh::{self, MeshInput, MeshTops, neighbor_index};
 use jbm_client::testing::heightfield::{HeightGrid, layer_state};
 use jbm_core::block::BlockStateId;
 use jbm_core::block::builtin::Blocks;
 use jbm_core::coords::{CUBE_SIZE, CubePos, LocalPos};
 use jbm_core::cube::Cube;
-use jbm_core::lod::{downsample_octant, octant_offset, parent};
+use jbm_core::lod::{LodTops, downsample_octant, octant_offset, parent};
 use jbm_server::terrain::Generator;
 
 /// Default `lod_view_radius`: every ring is a disk of this many cubes of
@@ -153,6 +153,8 @@ impl RingsScene {
         }
         for pos in disk(1) {
             let mut parent_cube = Cube::default();
+            // The bench scene meshes every level with full-height tops.
+            let mut parent_tops = LodTops::empty(1);
             for octant in 0..8u8 {
                 let [dx, dy, dz] = octant_offset(octant);
                 let child = CubePos {
@@ -160,7 +162,13 @@ impl RingsScene {
                     y: pos.y * 2 + dy as i32,
                     z: pos.z * 2 + dz as i32,
                 };
-                downsample_octant(&lod0[&child], &mut parent_cube, octant);
+                downsample_octant(
+                    &lod0[&child],
+                    &LodTops::LOD0,
+                    &mut parent_cube,
+                    &mut parent_tops,
+                    octant,
+                );
             }
             by_level[1].push((pos, Arc::new(parent_cube)));
         }
@@ -225,6 +233,7 @@ impl RingsScene {
                     center: Arc::clone(cube),
                     neighbors,
                     level,
+                    tops: MeshTops::default(),
                 };
                 let key = CubeKey { level, pos: *pos };
                 meshes.push((key, mesh::mesh(&input, appearance)));

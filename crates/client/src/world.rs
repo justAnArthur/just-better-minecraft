@@ -4,7 +4,9 @@
 //!
 //! LOD ring cubes (task 2.6) live beside the LOD0 cubes, keyed by
 //! [`CubeKey`] so meshes, versions and dirt share one bookkeeping at every
-//! level. Mesh inputs carry the 26 **same-level** neighbors.
+//! level. Mesh inputs carry the 26 **same-level** neighbors, and at LOD
+//! levels the column tops (task 2.14) of the cube and its four side
+//! neighbors.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -13,11 +15,12 @@ use glam::DVec3;
 use jbm_core::block::{BlockRegistry, builtin};
 use jbm_core::coords::{BlockPos, CUBE_SIZE, CubePos};
 use jbm_core::cube::Cube;
+use jbm_core::lod::LodTops;
 use jbm_core::physics::{BlockShapes, SolidTable};
 use jbm_core::protocol::ServerMsg;
 
 use crate::lod::CubeKey;
-use crate::mesh::{MeshInput, neighbor_index};
+use crate::mesh::{MeshInput, MeshTops, SIDE_OFFSETS, neighbor_index};
 
 /// What `apply` did with a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +58,8 @@ pub enum WorldChange {
 pub struct ClientWorld {
     /// Every loaded cube keyed by level and position.
     cubes: HashMap<CubeKey, Arc<Cube>>,
+    /// The column tops of every loaded level >= 1 cube (task 2.14).
+    tops: HashMap<CubeKey, Arc<LodTops>>,
     versions: HashMap<CubeKey, u32>,
     dirty: HashSet<CubeKey>,
     /// Dirty cubes taken first by `take_dirty`: those holding a recent
@@ -87,6 +92,7 @@ impl ClientWorld {
         builtin::register(&mut registry);
         ClientWorld {
             cubes: HashMap::new(),
+            tops: HashMap::new(),
             versions: HashMap::new(),
             dirty: HashSet::new(),
             priority: HashSet::new(),
@@ -103,11 +109,17 @@ impl ClientWorld {
                 self.load(CubeKey::lod0(*pos), cube);
                 WorldChange::Loaded(CubeKey::lod0(*pos))
             }
-            ServerMsg::LodCubeData { level, pos, cube } => {
+            ServerMsg::LodCubeData {
+                level,
+                pos,
+                cube,
+                tops,
+            } => {
                 let key = CubeKey {
                     level: *level,
                     pos: *pos,
                 };
+                self.tops.insert(key, Arc::new(tops.clone()));
                 self.load(key, cube);
                 WorldChange::Loaded(key)
             }
@@ -166,6 +178,7 @@ impl ClientWorld {
 
     fn unload(&mut self, key: CubeKey) {
         self.cubes.remove(&key);
+        self.tops.remove(&key);
         self.versions.remove(&key);
         self.dirty.remove(&key);
         self.priority.remove(&key);
@@ -335,6 +348,19 @@ impl ClientWorld {
                     }
                 }
             }
+            let mut tops = MeshTops::default();
+            if key.level > 0 {
+                let tops_at = |dx: i32, dz: i32| {
+                    let pos = CubePos {
+                        x: key.pos.x + dx,
+                        y: key.pos.y,
+                        z: key.pos.z + dz,
+                    };
+                    self.tops.get(&CubeKey { pos, ..key }).cloned()
+                };
+                tops.center = tops_at(0, 0);
+                tops.sides = SIDE_OFFSETS.map(|(dx, dz)| tops_at(dx, dz));
+            }
             let version = self.versions.get(&key).copied().unwrap_or(0);
             inputs.push((
                 key,
@@ -343,6 +369,7 @@ impl ClientWorld {
                     center,
                     neighbors,
                     level: key.level,
+                    tops,
                 },
             ));
         }
@@ -382,6 +409,11 @@ impl ClientWorld {
 
     pub fn cube(&self, key: CubeKey) -> Option<&Arc<Cube>> {
         self.cubes.get(&key)
+    }
+
+    /// The column tops of a loaded level >= 1 cube.
+    pub fn tops(&self, key: CubeKey) -> Option<&Arc<LodTops>> {
+        self.tops.get(&key)
     }
 
     /// The block at `pos`, or `None` when its cube is not loaded.
@@ -443,6 +475,7 @@ mod tests {
             level,
             pos,
             cube: stone_cube(),
+            tops: LodTops::full(level),
         }
     }
 
@@ -644,6 +677,15 @@ mod tests {
         assert_eq!(taken.len(), 4);
         for (key, _, input) in &taken {
             assert_eq!(input.level, key.level);
+            // Tops ride along at level >= 1 only: the center's and the
+            // loaded side neighbors'.
+            assert_eq!(input.tops.center.is_some(), key.level > 0);
+            if key.level == 1 {
+                let other_side = if key.pos == a { 0 } else { 1 }; // +X or -X
+                for (i, side) in input.tops.sides.iter().enumerate() {
+                    assert_eq!(side.is_some(), i == other_side, "side {i} of {key:?}");
+                }
+            }
             if key.level == 0 && key.pos == a || key.level == 1 && key.pos == a {
                 assert!(input.neighbor(1, 0, 0).is_some(), "+X neighbor loaded");
                 assert!(input.neighbor(-1, 0, 0).is_none(), "-X neighbor missing");
