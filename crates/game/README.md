@@ -116,6 +116,23 @@ they measure gpu-cull even though the game defaults to cpu-cull. To
 play on gpu-cull, run `JBM_GPU_CULL=1 cargo run -p jbm-game --release`
 (the overlay names the active path).
 
+**The look (task 2.15).** The game starts with sun lighting, clouds,
+water shading and 4× MSAA on (see `crates/client/README.md`, "The
+look"). Environment switches, read once at startup: `JBM_NO_SUN=1`
+(the pre-2.15 flat face shades), `JBM_NO_CLOUDS=1`, `JBM_NO_WATER=1`
+(water draws its flat average color), `JBM_MSAA=1` (single-sample;
+any other value means 4×). The F3 panel toggles the first three live
+and shows the sample count. `terrain_draw` follows `JBM_MSAA` too
+(default 4×), so `JBM_MSAA=1 cargo bench -p jbm-game --bench
+terrain_draw` measures the MSAA cost. The look review renders the five
+player views (spawn at eye level, spawn 60 up, the mountain top, the
+coast, 300 up) into `target/look-shots/`:
+
+```bash
+cargo test --release -p jbm-game --test far_metrics look_shots -- --ignored --nocapture
+JBM_LOOK_SHOTS=coast,mountain cargo test --release -p jbm-game --test far_metrics look_shots -- --ignored --nocapture
+```
+
 **LOD rings (task 2.6).** `terrain_draw` adds `rings/cpu_cull` and
 `rings/gpu_cull`: the rings scene at game scale (default
 `lod_view_radius`, 5 levels since task 2.13 E) built in

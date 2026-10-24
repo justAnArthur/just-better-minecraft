@@ -98,6 +98,9 @@ Baselines are bench worker runs on an otherwise idle machine. Run-to-run noise o
 - Level ≥ 1 quads overlap by 1/512 block at convex edges (the T-junction expansion), so draw paths may disagree on an exact edge pixel; the rings path-identity test allows 2.
 - Ring surface spans are exact for LOD0, sampled 8×8 for L1 and skipped for L2+ (their camera windows cover the overworld's height range).
 - First release/bench build is slow (wgpu + thin LTO + codegen-units=1). Revisit profile if CI bench-smoke gets too slow.
+- MSAA 4× (2.15) stores and reloads the multisampled color and depth at every pass boundary (sky, terrain, lines, outline, then an empty resolve pass). `terrain_draw` rings at 1280×720 run about 1.5× the 1× frame. Resolving in the last scene pass, or drawing the sky inside the terrain pass, would cut most of it.
+- The sentinel hole tests, the level-tint test and `surface_windows` render at 1×: at 4× a sliver hole that misses some samples resolves to a blend the exact sentinel check would not see. Geometry is the same at both sample counts.
+- No shadows (2.15 has sun lighting without shadow maps): terrain seen with the sun behind the camera reads flat, and overhangs are lit like open ground.
 
 ## Log
 
