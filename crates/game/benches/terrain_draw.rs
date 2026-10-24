@@ -25,6 +25,7 @@ use jbm_client::lod::Coverage;
 use jbm_client::mesh;
 use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
+use jbm_client::render::settings::RenderSettings;
 use jbm_client::render::terrain::{TerrainPass, TerrainPath};
 use jbm_client::render::texture_array::BlockTextures;
 use jbm_client::testing::screenshot::gpu_or_skip;
@@ -166,9 +167,15 @@ fn bench(c: &mut Criterion) {
     let surface = surface_scene(&region);
     let cave = cave_scene(&mut region);
 
+    // The shipped settings apart from the sample count, which follows
+    // JBM_MSAA (default 4×) so the MSAA cost can be measured.
+    let settings = RenderSettings {
+        msaa_samples: RenderSettings::from_env().msaa_samples,
+        ..RenderSettings::default()
+    };
     let target = OffscreenTarget::new(&gpu.device, WIDTH, HEIGHT);
-    let depth = DepthTarget::new(&gpu.device, WIDTH, HEIGHT);
-    let mut renderer = Renderer::new(&gpu, target.format());
+    let depth = DepthTarget::with_samples(&gpu.device, WIDTH, HEIGHT, settings.msaa_samples);
+    let mut renderer = Renderer::with_settings(&gpu, target.format(), settings);
     renderer.set_viewport(WIDTH, HEIGHT);
     let textures = BlockTextures::builtin(&gpu).expect("texture array");
 
@@ -178,7 +185,8 @@ fn bench(c: &mut Criterion) {
     let uniform_layout = renderer.uniform_layout().clone();
     let format = target.format();
     let make_pass = |gpu: &jbm_client::gpu::Gpu, meshes: &[(CubePos, mesh::MeshOutput)]| {
-        let mut pass = TerrainPass::new(gpu, format, &uniform_layout, &textures);
+        let mut pass =
+            TerrainPass::with_settings(gpu, format, &uniform_layout, &textures, &settings);
         for (pos, mesh) in meshes {
             pass.upload(gpu, jbm_client::lod::CubeKey::lod0(*pos), mesh);
         }
@@ -253,7 +261,8 @@ fn bench(c: &mut Criterion) {
     }
     let make_rings_pass =
         |gpu: &jbm_client::gpu::Gpu, meshes: &[(jbm_client::lod::CubeKey, mesh::MeshOutput)]| {
-            let mut pass = TerrainPass::new(gpu, format, &uniform_layout, &textures);
+            let mut pass =
+                TerrainPass::with_settings(gpu, format, &uniform_layout, &textures, &settings);
             let mut coverage = Coverage::default();
             for (key, mesh) in meshes {
                 pass.upload(gpu, *key, mesh);
