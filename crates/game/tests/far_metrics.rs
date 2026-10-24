@@ -26,7 +26,7 @@ use glam::DVec3;
 use jbm_client::camera::Camera;
 use jbm_client::gpu::Gpu;
 use jbm_client::mesh::appearance::BlockAppearance;
-use jbm_client::mesh::{self, MeshInput, neighbor_index};
+use jbm_client::mesh::{self, MeshInput, MeshTops, neighbor_index};
 use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
 use jbm_client::render::terrain::TerrainPass;
@@ -393,6 +393,7 @@ fn measure_site(
             center: Arc::clone(center),
             neighbors,
             level: 0,
+            tops: MeshTops::default(),
         });
     }
     let mut timings: Vec<f64> = Vec::with_capacity(inputs.len());

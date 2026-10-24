@@ -103,13 +103,13 @@ fn bench(c: &mut Criterion) {
         y: (h >> 7) as i32,
         z: 0,
     };
-    let lod_cube = generator.sample_lod(2, lod_pos);
+    let (lod_cube, lod_tops) = generator.sample_lod(2, lod_pos);
     assert!(lod_cube.uniform().is_none(), "the LOD record must be mixed");
     storage
         .set_worldgen_fingerprint(jbm_server::worldgen::overworld().fingerprint())
         .unwrap();
     storage
-        .save_lod_batch(&[], &[(2, lod_pos, &lod_cube, 0)], &[])
+        .save_lod_batch(&[], &[(2, lod_pos, &lod_cube, &lod_tops, 0)], &[])
         .unwrap();
     group.bench_function("load_lod", |b| {
         b.iter(|| storage.load_lod(2, lod_pos).unwrap().expect("stored"))

@@ -161,8 +161,14 @@ makes water bodies render their internal faces until translucency lands.)
 `PackedFace(u32, u32)`; the bit layout lives in one comment block in
 `mesh/face.rs` mirrored by `render/shaders/terrain.wgsl` — keep the two in
 sync. Word 0: x (5), y (5), z (5), width−1 (5), height−1 (5), direction
-(3), spare. Word 1: texture layer (16), AO 2 bits × 4 corners, light 4
-bits (always 15 until lighting exists), spare.
+(3), `inset_bottom` bits 0..4. Word 1: texture layer (16), AO 2 bits × 4
+corners, `inset_bottom` bits 4..6, `inset_top` (6). The insets (task
+2.14; the bits were the never-read light nibble, always 15) are in
+**blocks**, applied after the level scale: `inset_bottom` raises a side
+quad's lower edge, `inset_top` lowers its upper edge — or, for a +Y
+face, the whole plane. Up to 63 blocks, enough for L6. Level 0 faces
+always have zero insets. `face::quad_corners(&FaceFields, level)` is the
+CPU mirror of the shader's corner math (tests pin it).
 
 Width runs along the face's **u** axis, height along its **v** axis:
 
@@ -191,6 +197,24 @@ AO** (unloaded space reads as open). Uniform fast paths: uniform air
 meshes to nothing without building anything; a uniform opaque cube whose
 six face neighbors are all present, uniform and opaque meshes to nothing.
 
+**Fill heights (level ≥ 1, task 2.14).** `MeshInput::tops`
+(`MeshTops { center, sides }`) carries the cube's column tops and those
+of its four side neighbours (a border face needs the neighbour's
+height); level 0 carries none and meshes bit-identically to before.
+When any of them has a partial top, `build_padded_heights` gives every
+padded cell a fill height `H`: 0 for air, the tops value for a column's
+top cell, `2ⁿ` for any other filled cell and for a missing cell. Then:
+
+- a **+Y face** of a column-top cell sits at `H` (`inset_top = 2ⁿ − H`);
+- a **side face** of A toward B covers `[H_B', H_A]`, where `H_B' = H_B`
+  when B culls A's face by the rule above (opaque, missing, equal
+  non-opaque) and 0 otherwise; it is emitted when `H_A > H_B'`, so a
+  step between two partial tops gets its riser and stays closed;
+- **−Y faces** are unchanged; skirts and lids reach up to the cell's `H`.
+
+Without partial tops (`build_padded_heights` returns `None`) the mesher
+runs exactly the pre-2.14 path.
+
 ### AO rule
 
 Per corner, 0 (dark) ..= 3 (open), classic side1/side2/corner:
@@ -216,8 +240,11 @@ walking, e.g. a checkerboard — aborts the build for that axis and its two
 directions sweep per-cell like the pre-2.13 mesher instead; shell rows
 never count toward that density (a boundary is dense by design). Per
 direction and slice, coplanar faces with identical (texture layer, AO
-pattern, light) merge into maximal rectangles: extend along u first,
-then along v. Faces never span outside the cube. Output is grouped by
+pattern, skirt/lid bits, insets) merge into maximal rectangles: extend
+along u first, then along v. A side quad merges up across cells only
+when the result is exactly representable — the lower row has no top
+inset and the upper no bottom inset — so the merged quad takes its
+bottom inset from the first row and its top inset from the last. Faces never span outside the cube. Output is grouped by
 direction (`ranges`) so 2.2 can skip back-facing directions, and is
 bit-for-bit the pre-2.13 sweep at every level (oracle tests).
 
@@ -327,9 +354,11 @@ reference):
   above, or air two above; at the cube's top row the two-above look
   reads as filled). The faces stand in for the coarse cell's side when
   the volume across is drawn by finer cubes whose surface sits lower
-  (the downsampling rule leans solid, so the coarse surface can be up
-  to 2^n − 1 blocks above the fine one; two coarse cells of skirt cover
-  that). When the octant across is drawn by the same coarse cube the
+  (the coarse surface never sits below the fine one — task 2.14 puts it
+  at the footprint's highest block — so a skirt from the coarse top
+  down two cells covers the fine side; its upper edge is the cell's
+  fill height, and it replaces the partial-top step face it coincides
+  with). When the octant across is drawn by the same coarse cube the
   skirt sits inside terrain, hidden by the neighbor's top face. Skirt
   faces are ordinary faces (same AO from same-level neighbors, same
   texture, greedy-merged within the octant rule); `MeshOutput::skirts`
@@ -998,7 +1027,8 @@ are unchanged.
 `tests/lod_rings.rs` (task 2.6) has no golden of its own for most
 cameras: it builds a synthetic heightfield's rings (levels 0..=3, level
 1 by the real downsampling rule over level-0 data, levels 2–3 sampled
-at their own resolution with a child-corner-dominating max), feeds them
+at their own resolution with a child-corner-dominating max `M` — filled
+iff `y <= M`, column tops at `M + 1` — task 2.14), feeds them
 through the real client world, coverage rule, mesher and renderer, and
 asserts **zero sentinel pixels** below a per-camera horizon margin
 (computed from the sky's ~15° below-horizon fade and the rings' far-edge
@@ -1031,6 +1061,13 @@ flat-colored silhouette is pure at 1× but blended at 4×. The border test in
 `tests/lod_rings.rs` (`lod0_lod1_border_is_invisible_with_flat_colors`)
 checks 16×16 windows either side of the LOD0/LOD1 border for
 `zoom_border01` and `down_border01`: mean luminance within 3%, fog off.
+
+`tests/lod_tops.rs` (task 2.14) has no golden either: a level-2
+plateau whose column tops sit 3 of 4 blocks into the cell must show its
+wall's silhouette within a pixel of the projected exact height
+(`quad_corners`), several pixels from the cell top; and a 2-block step
+between two partial tops at the same cell row must show no sentinel
+ground — while the same mesh minus its step faces does.
 
 `tests/terrain_pages.rs` (task 2.2, extended by 2.5) has no golden of
 its own: it churns 200 cubes through tiny face pages (re-uploads that

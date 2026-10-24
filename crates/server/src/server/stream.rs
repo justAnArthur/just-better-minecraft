@@ -147,12 +147,12 @@ impl Server {
         if inline {
             for _ in 0..budget {
                 match pool.try_recv() {
-                    Some((pos, cube, octant)) => {
+                    Some((pos, cube, (octant, tops))) => {
                         collected = true;
                         if let std::collections::hash_map::Entry::Vacant(slot) = world.entry(pos) {
                             let inserted = slot.insert(cube);
                             if lod_on {
-                                lod.insert_lod0_octant(pos, inserted, Some(&octant));
+                                lod.insert_lod0_octant(pos, inserted, Some((&octant, &tops)));
                             }
                         }
                     }
@@ -160,12 +160,12 @@ impl Server {
                 }
             }
         } else {
-            while let Some((pos, cube, octant)) = pool.try_recv() {
+            while let Some((pos, cube, (octant, tops))) = pool.try_recv() {
                 collected = true;
                 if let std::collections::hash_map::Entry::Vacant(slot) = world.entry(pos) {
                     let inserted = slot.insert(cube);
                     if lod_on {
-                        lod.insert_lod0_octant(pos, inserted, Some(&octant));
+                        lod.insert_lod0_octant(pos, inserted, Some((&octant, &tops)));
                     }
                 }
             }
@@ -584,7 +584,7 @@ fn stream_player_lod(
             player.lod_resend.pop_front();
             continue;
         }
-        let Some(cube) = lod.ready(level, pos) else {
+        let Some((cube, tops)) = lod.ready_tops(level, pos) else {
             // No longer ready: nothing true to send, drop the entry.
             player.lod_resend.pop_front();
             continue;
@@ -594,6 +594,7 @@ fn stream_player_lod(
                 level,
                 pos,
                 cube: Box::new(cube.clone()),
+                tops: tops.clone(),
             })
             .is_err()
         {
@@ -638,13 +639,14 @@ fn stream_player_lod(
             i += 1;
             continue;
         }
-        match lod.ready(level, pos) {
-            Some(cube) => {
+        match lod.ready_tops(level, pos) {
+            Some((cube, tops)) => {
                 if link
                     .send(ServerMsg::LodCubeData {
                         level,
                         pos,
                         cube: Box::new(cube.clone()),
+                        tops: tops.clone(),
                     })
                     .is_err()
                 {
@@ -1288,6 +1290,7 @@ mod tests {
             let cube = server
                 .lod_cube(*level, *pos)
                 .expect("changed cube is ready");
+            let tops = server.lod_tops(*level, *pos).unwrap();
             assert!(
                 messages.iter().any(|m| matches!(
                     m,
@@ -1295,7 +1298,8 @@ mod tests {
                         level: l,
                         pos: p,
                         cube: c,
-                    } if l == level && p == pos && c.as_ref() == cube
+                        tops: t,
+                    } if l == level && p == pos && c.as_ref() == cube && t == tops
                 )),
                 "re-send content differs from the pyramid at level {level} {pos:?}"
             );

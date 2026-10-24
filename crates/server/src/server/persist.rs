@@ -26,7 +26,7 @@ const FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Default)]
 pub(super) struct SaveBatch {
     cubes: Vec<(CubePos, jbm_core::cube::Cube, u64)>,
-    lod: Vec<(CubeKey, jbm_core::cube::Cube, u8)>,
+    lod: Vec<(CubeKey, jbm_core::cube::Cube, jbm_core::lod::LodTops, u8)>,
     players: Vec<(String, PlayerRecord)>,
 }
 
@@ -102,7 +102,9 @@ impl Server {
             if let Some(lc) = self.lod.get(level, pos)
                 && lc.ready()
             {
-                batch.lod.push((key, lc.cube.clone(), lc.known));
+                batch
+                    .lod
+                    .push((key, lc.cube.clone(), lc.tops.clone(), lc.known));
             }
         }
     }
@@ -193,7 +195,7 @@ impl Server {
             self.pending_save.insert(*pos, *version);
         }
         self.lod_pending_save
-            .extend(batch.lod.iter().map(|&(key, _, _)| key));
+            .extend(batch.lod.iter().map(|&(key, ..)| key));
         match &self.save_tx {
             Some(tx) if tx.send(batch).is_ok() => self.sent_batches += 1,
             _ => eprintln!("jbm: the save thread is gone; unsaved edits may be lost"),
@@ -258,12 +260,14 @@ pub(super) fn save_loop(
             .collect();
         // The pyramid and storage APIs spell `(level, pos)`; the batch and
         // the acks carry the key.
-        let lod_refs: Vec<(u8, CubePos, &jbm_core::cube::Cube, u8)> = batch
+        let lod_refs: Vec<crate::storage::LodRecord<'_>> = batch
             .lod
             .iter()
-            .map(|&(CubeKey { level, pos }, ref cube, known)| (level, pos, cube, known))
+            .map(|&(CubeKey { level, pos }, ref cube, ref tops, known)| {
+                (level, pos, cube, tops, known)
+            })
             .collect();
-        let lod_keys: Vec<CubeKey> = batch.lod.iter().map(|&(key, _, _)| key).collect();
+        let lod_keys: Vec<CubeKey> = batch.lod.iter().map(|&(key, ..)| key).collect();
         let ack = match storage.save_lod_batch(&refs, &lod_refs, &batch.players) {
             Ok(()) => SaveAck::Committed(
                 batch

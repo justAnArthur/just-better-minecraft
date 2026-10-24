@@ -285,7 +285,8 @@ fn vs_main(
     let face = faces[vertex / 6u];
     let m = cube_meta[slot];
 
-    // Word 0: x | y<<5 | z<<10 | (width-1)<<15 | (height-1)<<20 | dir<<25.
+    // Word 0: x | y<<5 | z<<10 | (width-1)<<15 | (height-1)<<20 | dir<<25
+    // | inset_bottom low 4 bits<<28.
     let bx = f32(face.x & 31u);
     let by = f32((face.x >> 5u) & 31u);
     let bz = f32((face.x >> 10u) & 31u);
@@ -293,12 +294,15 @@ fn vs_main(
     let height = f32(((face.x >> 20u) & 31u) + 1u);
     let direction = (face.x >> 25u) & 7u;
 
-    // Word 1: layer | ao c0..c3 (2 bits each) | light<<24.
+    // Word 1: layer | ao c0..c3 (2 bits each) | inset_bottom high 2
+    // bits<<24 | inset_top<<26. The insets (task 2.14) are in blocks.
     let layer = (face.y & 0xFFFFu);
     let ao0 = (face.y >> 16u) & 3u;
     let ao1 = (face.y >> 18u) & 3u;
     let ao2 = (face.y >> 20u) & 3u;
     let ao3 = (face.y >> 22u) & 3u;
+    let inset_bottom = f32((face.x >> 28u) | (((face.y >> 24u) & 3u) << 4u));
+    let inset_top = f32(face.y >> 26u);
 
     // Quad corners c0..c3 and the AO table use the same slot order, so
     // corner_table indexes both. The diagonal is picked by AO: split
@@ -336,6 +340,12 @@ fn vs_main(
     let scale = cell_scale(level);
     var relative = cube_origin(m.pos_page.xyz, level)
         + vec3f(block + offset) * scale;
+    // Height-exact LOD (task 2.14): a side face's lower edge rises by
+    // inset_bottom blocks and its upper edge drops by inset_top; a +Y
+    // face's plane drops by inset_top. va.y is 1 on side faces only,
+    // max(n.y, 0) is 1 on +Y only. Mirrored by `quad_corners`.
+    relative.y += f32(va.y) * mix(inset_bottom, -inset_top, c.y)
+        - f32(max(n.y, 0)) * inset_top;
     // The exploded-cube debug view (task 2.12): shift every cube by the
     // gap times its own cube-grid offset, spreading the world apart
     // radially from the world origin. A pure world-space translation, so
@@ -363,7 +373,10 @@ fn vs_main(
     // v is world-up on side faces and texture v grows downward, so the
     // image's top row lands at the block's top. One texture tile per
     // BLOCK (not per cell), so tiles line up across ring borders.
-    let uv = vec2f(c.x * width, (1.0 - c.y) * height) * scale;
+    // The insets shorten a side face from both ends; texture v keeps one
+    // tile per block (the face's top edge sits on a whole block).
+    let uv = vec2f(c.x * width * scale,
+        (1.0 - c.y) * (height * scale - f32(va.y) * (inset_bottom + inset_top)));
 
     // Octant masking (level >= 1): a ready child replaces this octant, so
     // the cube's faces here must produce no fragments. Collapsing every

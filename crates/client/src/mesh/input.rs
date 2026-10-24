@@ -10,6 +10,7 @@ use std::sync::Arc;
 use jbm_core::block::BlockStateId;
 use jbm_core::coords::CUBE_SIZE;
 use jbm_core::cube::Cube;
+use jbm_core::lod::LodTops;
 
 use crate::mesh::appearance::BlockAppearance;
 use crate::mesh::face::PackedFace;
@@ -61,7 +62,25 @@ pub struct MeshInput {
     /// The LOD level being meshed: 0 for streamed world cubes, >= 1 for
     /// ring cubes (cells are 2^level blocks per side).
     pub level: u8,
+    /// The column tops (task 2.14) of the center and its four side
+    /// neighbors at level >= 1; empty at level 0.
+    pub tops: MeshTops,
 }
+
+/// The column tops a level >= 1 mesh reads (task 2.14): the center cube's
+/// and those of its four same-level side neighbors, whose border column
+/// heights the side faces at the cube border need. `None` means every
+/// column top is a full cell (and is all a level-0 input ever carries).
+#[derive(Clone, Default)]
+pub struct MeshTops {
+    pub center: Option<Arc<LodTops>>,
+    /// The side neighbors' tops in [`SIDE_OFFSETS`] order.
+    pub sides: [Option<Arc<LodTops>>; 4],
+}
+
+/// The `(dx, dz)` offsets of the four side neighbors, the order of
+/// [`MeshTops::sides`]: +X, -X, +Z, -Z.
+pub const SIDE_OFFSETS: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
 
 impl MeshInput {
     /// A mesh input with no neighbors loaded (everything around is
@@ -71,6 +90,7 @@ impl MeshInput {
             center,
             neighbors: std::array::from_fn(|_| None),
             level: 0,
+            tops: MeshTops::default(),
         }
     }
 
@@ -214,6 +234,135 @@ pub fn build_padded(input: &MeshInput, appearance: &BlockAppearance) -> Vec<u32>
         }
     }
     cells
+}
+
+/// Whether `tops` hold a column top below a full cell of `level`.
+pub(crate) fn has_partial_top(tops: Option<&LodTops>, level: u8) -> bool {
+    let full = 1u8 << level;
+    tops.is_some_and(|tops| !matches!(tops.uniform(), Some(h) if h == 0 || h == full))
+}
+
+/// The fill heights (task 2.14) of the cells a level >= 1 sweep reads, in
+/// blocks: every filled (or missing) cell is a full `2^level` except the
+/// **partial column tops** — the topmost filled cell of a column of the
+/// center or of a side neighbor whose top is lower than a full cell. At
+/// most one cell per padded column, so this stores that cell's padded y
+/// and height per column. Built by [`build_padded_heights`].
+pub struct PaddedHeights {
+    full: u8,
+    /// Per padded column `x + PAD · z`: the padded y of its partial top,
+    /// `u8::MAX` for none.
+    top_y: [u8; PAD * PAD],
+    /// The partial top's fill height, `1..full`.
+    top_h: [u8; PAD * PAD],
+}
+
+impl PaddedHeights {
+    /// A full cell's height, `2^level` blocks.
+    pub fn full(&self) -> u8 {
+        self.full
+    }
+
+    /// The fill height of the filled or missing cell at padded `index`.
+    /// (Air cells have height 0; callers never ask for them.)
+    #[inline]
+    pub fn at(&self, index: usize) -> u8 {
+        let column = index % PAD_Y;
+        if usize::from(self.top_y[column]) == index / PAD_Y {
+            self.top_h[column]
+        } else {
+            self.full
+        }
+    }
+
+    /// The partial tops as `(padded column, padded y)` pairs.
+    pub(crate) fn partial_tops(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.top_y
+            .iter()
+            .enumerate()
+            .filter(|&(_, &y)| y != u8::MAX)
+            .map(|(column, &y)| (column, usize::from(y)))
+    }
+}
+
+/// The padded kind (state id + 1) of [`BlockStateId::AIR`].
+const AIR_KIND: u32 = BlockStateId::AIR.0 + 1;
+
+/// Builds the [`PaddedHeights`] of a level >= 1 input from its tops and
+/// its padded cells (`pad` from [`build_padded`]). `None` when every cell
+/// is full height — level 0, or no partial column top in the center or a
+/// side neighbor — and the sweep then meshes exactly as before task 2.14.
+/// A column's top cell is its topmost non-air cell within the cube's 32
+/// rows (the LOD occupancy notion: any non-air state is filled).
+pub fn build_padded_heights(input: &MeshInput, pad: &[u32]) -> Option<PaddedHeights> {
+    let level = input.level;
+    if level == 0 {
+        return None;
+    }
+    let sources: [(Option<&LodTops>, (i32, i32)); 5] = [
+        (input.tops.center.as_deref(), (0, 0)),
+        (input.tops.sides[0].as_deref(), SIDE_OFFSETS[0]),
+        (input.tops.sides[1].as_deref(), SIDE_OFFSETS[1]),
+        (input.tops.sides[2].as_deref(), SIDE_OFFSETS[2]),
+        (input.tops.sides[3].as_deref(), SIDE_OFFSETS[3]),
+    ];
+    if !sources
+        .iter()
+        .any(|&(tops, _)| has_partial_top(tops, level))
+    {
+        return None;
+    }
+    let full = 1u8 << level;
+    let mut heights = PaddedHeights {
+        full,
+        top_y: [u8::MAX; PAD * PAD],
+        top_h: [0; PAD * PAD],
+    };
+    let size = CUBE_SIZE;
+    for (tops, (dx, dz)) in sources {
+        let Some(tops) = tops.filter(|&tops| has_partial_top(Some(tops), level)) else {
+            continue;
+        };
+        // The cube's columns as (local x, local z) -> padded column: the
+        // center covers all of them, a side neighbor only its border row
+        // facing the center.
+        let (xs, zs) = (shell_span(dx), shell_span(dz));
+        for z in zs.clone() {
+            for x in xs.clone() {
+                let h = tops.get(x as u8, z as u8);
+                if h == 0 || h >= full {
+                    continue;
+                }
+                let column = (x + size * dx + 1) as usize + PAD * (z + size * dz + 1) as usize;
+                // The upper half's top hides the lower one's.
+                let start = if tops.half_top(1, x as u8, z as u8) != 0 {
+                    size - 1
+                } else {
+                    size / 2 - 1
+                };
+                let top = (0..=start).rev().find(|&y| {
+                    let kind = pad[column + PAD_Y * (y + 1) as usize] & 0xFFFF;
+                    kind != 0 && kind != AIR_KIND
+                });
+                if let Some(y) = top {
+                    heights.top_y[column] = (y + 1) as u8;
+                    heights.top_h[column] = h;
+                }
+            }
+        }
+    }
+    Some(heights)
+}
+
+/// The local coordinates along one horizontal axis of the cube at offset
+/// `offset` whose columns the padded array holds: all of them for the
+/// center (0), the border row facing it for a side neighbor.
+fn shell_span(offset: i32) -> Range<i32> {
+    match offset {
+        1 => 0..1,
+        -1 => CUBE_SIZE - 1..CUBE_SIZE,
+        _ => 0..CUBE_SIZE,
+    }
 }
 
 /// Padded-coordinate span for one axis of a neighbor offset: a fixed shell

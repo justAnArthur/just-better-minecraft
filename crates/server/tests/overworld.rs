@@ -221,7 +221,7 @@ fn ocean_columns_fill_with_water_to_sea_level_at_every_level() {
                 (y.rem_euclid(side) / cell) as u8,
                 (z.rem_euclid(side) / cell) as u8,
             );
-            lod.get(local.unwrap())
+            lod.0.get(local.unwrap())
         };
         assert_ne!(
             at(SEA_LEVEL),
@@ -271,19 +271,29 @@ fn spawn_lands_on_gentle_land_for_ten_seeds() {
     }
 }
 
-/// Task 2.10 E: the per-level accuracy of the coarse surface against the
-/// true surface. For a seeded sample of land columns, the height error
-/// `coarse_top − true_top` (the topmost solid cell of the level-*n*
-/// `sample_lod` cube over the column, minus `surface_height`) — mean and
-/// p99 per level 1..=6. The downsampling rule leans solid, so the errors
-/// sit mostly ≥ 0 and within the documented `2^n − 1` bias; the printed
-/// numbers are the task's report. Water cells count as surface (the sea
-/// is flat and aligned, so sea columns are skipped for the solid
-/// comparison instead).
+/// Task 2.14 (restating 2.10 E): the per-level accuracy of the coarse
+/// surface. For a seeded sample of 512 land columns, per level 1..=5, the
+/// coarse top — the topmost filled cell over the column plus its column
+/// top height — minus the **highest true surface over the column's
+/// footprint** (the `2ⁿ × 2ⁿ` columns the coarse column covers):
+/// - real data (the pyramid's downsample of generated LOD0 cubes): exactly
+///   0 — the coarse top is the highest filled block in the footprint;
+/// - worldgen-sampled data (`sample_lod`): within a block for ≥ 95 % of
+///   columns at levels 1..=4, mean in [−1, 1] at every level. The sample
+///   grid can miss a peak between samples: at level 5 the samples are 16
+///   blocks apart and the footprint envelope (see `sample_lod`) only
+///   interpolates between them, so ~10 % of hill columns miss their peak
+///   by more than a block there — level 5 is held to ≥ 85 %.
+///
+/// The coarse top minus the footprint's *mean* true height is printed too.
 #[test]
 fn lod_surface_accuracy_per_level() {
+    use jbm_core::cube::Cube;
+    use jbm_core::lod::{LodTops, downsample_octant, octant_offset};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
     let terrain = overworld(DEFAULT_SEED);
-    let blocks = blocks();
     let spawn = terrain.spawn();
     // A seeded sample of land columns within ±2 km of spawn.
     let mut rng = jbm_testkit::XorShift64(0x00a1_1ce5_2a10);
@@ -297,71 +307,180 @@ fn lod_surface_accuracy_per_level() {
         }
     }
 
-    let mut cube_cache =
-        std::collections::HashMap::<(u8, CubePos), std::sync::Arc<jbm_core::cube::Cube>>::new();
-    for level in 1..=6u8 {
-        let cell = 1i64 << level;
-        let cube_side = i64::from(jbm_core::coords::CUBE_SIZE) * cell;
-        let mut errors: Vec<i64> = Vec::with_capacity(columns.len());
-        for &(x, z, h) in &columns {
-            // The level-n cube containing the column's true surface; the
-            // solid lean (at most 2^n - 1 blocks) can push the coarse top
-            // into the cube above, so scan that one too when needed.
-            let xz = (
-                x.div_euclid(cube_side) as i32,
-                z.div_euclid(cube_side) as i32,
-            );
-            let mut coarse_top = None;
-            for cube_y in [
-                h.div_euclid(cube_side) as i32,
-                h.div_euclid(cube_side) as i32 + 1,
-            ] {
-                let pos = CubePos {
-                    x: xz.0,
-                    y: cube_y,
-                    z: xz.1,
-                };
-                let cube = cube_cache
-                    .entry((level, pos))
-                    .or_insert_with(|| std::sync::Arc::new(terrain.sample_lod(level, pos)));
-                let local_x = ((x - i64::from(xz.0) * cube_side) / cell) as u8;
-                let local_z = ((z - i64::from(xz.1) * cube_side) / cell) as u8;
-                for local_y in (0..32u8).rev() {
-                    let state = cube.get(LocalPos::new_unchecked(local_x, local_y, local_z));
-                    if state != BlockStateId::AIR && state != blocks.water {
-                        coarse_top =
-                            Some(i64::from(cube_y) * cube_side + i64::from(local_y + 1) * cell - 1);
-                        break;
-                    }
-                }
-                if coarse_top.is_some() {
-                    break;
+    // True surfaces per LOD0 cube column: every footprint up to level 5
+    // (32 × 32 blocks) lies inside its column's LOD0 cube column.
+    let mut surfaces = HashMap::<(i64, i64), Vec<i64>>::new();
+    for &(x, z, _) in &columns {
+        let key = (x.div_euclid(32), z.div_euclid(32));
+        surfaces.entry(key).or_insert_with(|| {
+            let mut heights = Vec::with_capacity(32 * 32);
+            for dz in 0..32 {
+                for dx in 0..32 {
+                    heights.push(terrain.surface_height(key.0 * 32 + dx, key.1 * 32 + dz));
                 }
             }
-            if let Some(coarse) = coarse_top {
-                errors.push(coarse - h);
+            heights
+        });
+    }
+
+    // Real data: the exact pyramid over one LOD0 cube column. A level-n
+    // cube's cells and tops over a column depend only on the LOD0 cubes
+    // under it (locality), so the octants off that column stay air.
+    type Lod = Arc<(Cube, LodTops)>;
+    type RealMemo = HashMap<(u8, CubePos, (i32, i32)), Lod>;
+    fn real(
+        terrain: &Generator,
+        memo: &mut RealMemo,
+        level: u8,
+        pos: CubePos,
+        column: (i32, i32),
+    ) -> Lod {
+        if let Some(lod) = memo.get(&(level, pos, column)) {
+            return Arc::clone(lod);
+        }
+        let lod = if level == 0 {
+            Arc::new((terrain.generate(pos), LodTops::LOD0))
+        } else {
+            let mut cube = Cube::filled(BlockStateId::AIR);
+            let mut tops = LodTops::empty(level);
+            for octant in 0..8u8 {
+                let [dx, dy, dz] = octant_offset(octant).map(i32::from);
+                let child = CubePos {
+                    x: pos.x * 2 + dx,
+                    y: pos.y * 2 + dy,
+                    z: pos.z * 2 + dz,
+                };
+                let shift = level as u32 - 1;
+                if column.0 >> shift != child.x || column.1 >> shift != child.z {
+                    continue;
+                }
+                let child_lod = real(terrain, memo, level - 1, child, column);
+                downsample_octant(&child_lod.0, &child_lod.1, &mut cube, &mut tops, octant);
+            }
+            Arc::new((cube, tops))
+        };
+        memo.insert((level, pos, column), Arc::clone(&lod));
+        lod
+    }
+    // The coarse top (block y of the highest filled block) over world
+    // column (x, z) at `level`, scanning the cubes from `above` down to
+    // `below`.
+    fn coarse_top(
+        mut cube_at: impl FnMut(CubePos) -> Lod,
+        level: u8,
+        (x, z): (i64, i64),
+        above: i64,
+        below: i64,
+    ) -> Option<i64> {
+        let cell = 1i64 << level;
+        let side = 32 * cell;
+        let (cx, cz) = (x.div_euclid(side), z.div_euclid(side));
+        let local_x = ((x - cx * side) / cell) as u8;
+        let local_z = ((z - cz * side) / cell) as u8;
+        for cube_y in (below.div_euclid(side) - 1..=above.div_euclid(side) + 1).rev() {
+            let lod = cube_at(CubePos {
+                x: cx as i32,
+                y: cube_y as i32,
+                z: cz as i32,
+            });
+            for local_y in (0..32u8).rev() {
+                if lod
+                    .0
+                    .get(LocalPos::new_unchecked(local_x, local_y, local_z))
+                    != BlockStateId::AIR
+                {
+                    let h = i64::from(lod.1.get(local_x, local_z));
+                    return Some(cube_y * side + i64::from(local_y) * cell + h - 1);
+                }
             }
         }
-        errors.sort_unstable();
-        let mean = errors.iter().sum::<i64>() as f64 / errors.len() as f64;
-        let p99 = errors[(errors.len() * 99) / 100];
-        let min = errors[0];
+        None
+    }
+
+    let mut sampled_memo = HashMap::<(u8, CubePos), Lod>::new();
+    for level in 1..=5u8 {
+        let cell = 1i64 << level;
+        let mut real_memo = RealMemo::new();
+        let mut real_errors = Vec::with_capacity(columns.len());
+        let mut sampled_errors = Vec::with_capacity(columns.len());
+        let mut sampled_vs_mean = 0.0f64;
+        let mut real_vs_mean = 0.0f64;
+        for &(x, z, h) in &columns {
+            let heights = &surfaces[&(x.div_euclid(32), z.div_euclid(32))];
+            let (fx, fz) = (
+                x.rem_euclid(32) & !(cell - 1),
+                z.rem_euclid(32) & !(cell - 1),
+            );
+            let mut max = i64::MIN;
+            let mut sum = 0i64;
+            for dz in 0..cell {
+                for dx in 0..cell {
+                    let s = heights[((fz + dz) * 32 + fx + dx) as usize];
+                    max = max.max(s);
+                    sum += s;
+                }
+            }
+            let mean = sum as f64 / (cell * cell) as f64;
+            let column = (x.div_euclid(32) as i32, z.div_euclid(32) as i32);
+            let real_top = coarse_top(
+                |pos| real(&terrain, &mut real_memo, level, pos, column),
+                level,
+                (x, z),
+                max,
+                h,
+            )
+            .expect("a land column has a real coarse top");
+            let sampled_top = coarse_top(
+                |pos| {
+                    Arc::clone(
+                        sampled_memo
+                            .entry((level, pos))
+                            .or_insert_with(|| Arc::new(terrain.sample_lod(level, pos))),
+                    )
+                },
+                level,
+                (x, z),
+                max,
+                h,
+            )
+            .expect("a land column has a sampled coarse top");
+            real_errors.push(real_top - max);
+            sampled_errors.push(sampled_top - max);
+            real_vs_mean += real_top as f64 - mean;
+            sampled_vs_mean += sampled_top as f64 - mean;
+        }
+        let n = columns.len() as f64;
+        sampled_errors.sort_unstable();
+        let sampled_mean = sampled_errors.iter().sum::<i64>() as f64 / n;
+        let within_one = sampled_errors.iter().filter(|e| e.abs() <= 1).count() as f64 / n;
+        let worst_real = real_errors.iter().copied().max_by_key(|e| e.abs()).unwrap();
         println!(
-            "lod accuracy L{level}: n {} mean {mean:+.2} p99 {p99:+} min {min:+} \
-             (one-cell lean {})",
-            errors.len(),
-            1i64 << level
+            "lod accuracy L{level} (vs footprint max): real: worst {worst_real:+}; \
+             sampled: n {} mean {sampled_mean:+.2} |err|<=1 {:.1}% p1 {:+} p99 {:+} \
+             min {:+} max {:+}; vs footprint mean: real {:+.2} sampled {:+.2}",
+            sampled_errors.len(),
+            within_one * 100.0,
+            sampled_errors[sampled_errors.len() / 100],
+            sampled_errors[sampled_errors.len() * 99 / 100],
+            sampled_errors[0],
+            sampled_errors[sampled_errors.len() - 1],
+            real_vs_mean / n,
+            sampled_vs_mean / n,
         );
-        // The solid lean keeps the coarse surface over the true one on
-        // average (mean >= 0), with a p99 within two cells — the measured
-        // lean (e.g. L2 reaching +6 = 1.5 cells) compounds the sampled
-        // stride's own lean with the downsample's; the exact worst case
-        // is not derived here, the printed numbers are the measurement.
+        assert_eq!(
+            worst_real, 0,
+            "L{level}: the real-data coarse top is not the footprint's highest block"
+        );
+        let bar = if level <= 4 { 0.95 } else { 0.85 };
         assert!(
-            p99 <= 2i64 << level,
-            "L{level} p99 {p99} beyond the two-cell sanity bound"
+            within_one >= bar,
+            "L{level}: only {:.1}% of sampled columns within a block",
+            within_one * 100.0
         );
-        assert!(mean >= 0.0, "L{level} mean {mean} under the true surface");
+        assert!(
+            (-1.0..=1.0).contains(&sampled_mean),
+            "L{level}: sampled mean error {sampled_mean:+.2} outside [-1, 1]"
+        );
     }
 }
 

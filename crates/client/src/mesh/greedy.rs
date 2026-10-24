@@ -1,11 +1,11 @@
 //! The greedy sweep over the padded cell view built in `super::input`:
-//! merges coplanar faces with identical (layer, AO, light) into maximal
+//! merges coplanar faces with identical (layer, AO, insets) into maximal
 //! rectangles per direction. Rules are documented in
 //! crates/client/README.md.
 //!
 //! The same sweep serves every LOD level: cells are cells whatever their
-//! world size, so the face format is unchanged. One rule switches on for
-//! level >= 1 (LOD0 output is bit-for-bit what it was):
+//! world size. Two rules switch on for level >= 1 (LOD0 output is what it
+//! was):
 //!
 //! - **Octant-split merging.** Greedy rectangles never cross the cell
 //!   planes x, y or z = `CUBE_SIZE / 2`, so every face lies in exactly one
@@ -13,16 +13,30 @@
 //!   mask space the halves stay `[0, half)` and `[half, size)` however the
 //!   u/v strides are signed, because the mask-to-world map is affine with
 //!   slope +-1 per axis.)
+//! - **Fill heights** (task 2.14, [`PaddedHeights`]). A cell's fill height
+//!   `H` is 0 for air, its column top's height for a partial column top,
+//!   and a full `2^level` for every other filled or missing cell. A +Y
+//!   face sits at `H_A`; a side face from A toward B covers `[H_B', H_A]`,
+//!   `H_B' = H_B` when B culls A's face under the ordinary rule (opaque,
+//!   missing, or the same state) and 0 otherwise, and is emitted when
+//!   `H_A > H_B'` — so a culled pair still shows the step above a lower
+//!   partial top. -Y faces are unchanged. The insets ride in the merge
+//!   key: u merges need equal keys; a side face merges up across rows
+//!   only while the result stays exact (no top inset below the join, no
+//!   bottom inset above it), taking the first row's bottom inset and the
+//!   last row's top inset.
 //!
 //! Two more level >= 1 rules — skirts and lids, the crack hiders at
-//! level seams — live in `super::seams`.
+//! level seams — live in `super::seams`; their faces also stop at `H_A`.
 
 use jbm_core::block::BlockStateId;
 use jbm_core::coords::CUBE_SIZE;
 
 use crate::mesh::appearance::BlockAppearance;
 use crate::mesh::face::{DIRECTIONS, Direction, FaceFields, pack};
-use crate::mesh::input::{F_AIR, F_OPAQUE_AO, F_OPAQUE_CULL, FLAGS_SHIFT, ORIGIN, PAD_Y, PAD_Z};
+use crate::mesh::input::{
+    F_AIR, F_OPAQUE_AO, F_OPAQUE_CULL, FLAGS_SHIFT, ORIGIN, PAD, PAD_Y, PAD_Z, PaddedHeights,
+};
 use crate::mesh::seams::{LID_KEY_BIT, SKIRT_KEY_BIT, lid, skirt};
 
 use crate::mesh::input::MeshOutput;
@@ -34,11 +48,18 @@ pub(crate) fn stride(axis: [i32; 3]) -> isize {
 }
 
 /// Sweeps the six directions and greedily merges coplanar faces with
-/// identical (layer, AO, light) into maximal rectangles. At level >= 1,
-/// rectangles never cross an octant plane (see the module docs) and faces
-/// covered by the skirt or lid rules are emitted with their key bit set.
-pub fn mesh_padded(pad: &[u32], appearance: &BlockAppearance, level: u8) -> MeshOutput {
-    sweep(pad, appearance, level, u32::MAX)
+/// identical (layer, AO, insets) into maximal rectangles. At level >= 1,
+/// rectangles never cross an octant plane (see the module docs), faces
+/// covered by the skirt or lid rules are emitted with their key bit set,
+/// and `heights` (from [`crate::mesh::build_padded_heights`]; `None` when
+/// every cell is full height) places the column tops.
+pub fn mesh_padded(
+    pad: &[u32],
+    appearance: &BlockAppearance,
+    level: u8,
+    heights: Option<&PaddedHeights>,
+) -> MeshOutput {
+    sweep(pad, appearance, level, heights, u64::MAX)
 }
 
 /// [`mesh_padded`] with merge-key bits masked out: every face key is
@@ -51,18 +72,64 @@ pub(crate) fn sweep_key_masked(
     pad: &[u32],
     appearance: &BlockAppearance,
     level: u8,
-    key_keep: u32,
+    heights: Option<&PaddedHeights>,
+    key_keep: u64,
 ) -> MeshOutput {
-    sweep(pad, appearance, level, key_keep)
+    sweep(pad, appearance, level, heights, key_keep)
 }
 
 /// The mask of merge-key bits the AO byte occupies (bits 7..15).
 #[cfg(any(test, feature = "testing"))]
-pub(crate) const KEY_AO_BITS: u32 = 0xFF << 7;
+pub(crate) const KEY_AO_BITS: u64 = 0xFF << 7;
 /// The mask of merge-key bits the texture layer occupies (bits 15..30,
 /// below the skirt bit).
 #[cfg(any(test, feature = "testing"))]
-pub(crate) const KEY_LAYER_BITS: u32 = 0x7FFF << 15;
+pub(crate) const KEY_LAYER_BITS: u64 = 0x7FFF << 15;
+
+/// A face's merge key (u64): bit 31 marks a face, bit 30 the skirt rule
+/// (`super::seams`), bits 15..30 the texture layer, 7..15 the AO corners,
+/// bit 6 the lid rule; bits 32..38 the bottom inset and 38..44 the top
+/// inset, in blocks (task 2.14).
+#[inline]
+pub(crate) fn face_key(layer: u16, ao: u32) -> u64 {
+    (1 << 31) | (u64::from(layer) << 15) | (u64::from(ao) << 7)
+}
+
+/// The merge-key bits of a face's insets (see [`face_key`]).
+#[inline]
+pub(crate) fn inset_key(bottom: u8, top: u8) -> u64 {
+    (u64::from(bottom) << 32) | (u64::from(top) << 38)
+}
+
+/// Every inset bit of a merge key.
+pub(crate) const KEY_INSET_BITS: u64 = 0xFFF << 32;
+
+/// The bottom inset of a merge key.
+#[inline]
+pub(crate) fn key_inset_bottom(key: u64) -> u32 {
+    ((key >> 32) & 63) as u32
+}
+
+/// The top inset of a merge key.
+#[inline]
+pub(crate) fn key_inset_top(key: u64) -> u32 {
+    ((key >> 38) & 63) as u32
+}
+
+/// Whether a side face with key `above` may extend a vertically merged
+/// face whose topmost row so far has key `below`: same face apart from
+/// the insets, and the join stays exact — no top inset under it and no
+/// bottom inset over it. Other directions merge on equal keys only.
+#[inline]
+pub(crate) fn v_mergeable(below: u64, above: u64, side: bool) -> bool {
+    if side {
+        below & !KEY_INSET_BITS == above & !KEY_INSET_BITS
+            && key_inset_top(below) == 0
+            && key_inset_bottom(above) == 0
+    } else {
+        below == above
+    }
+}
 
 /// The bitmask sweep (task 2.13 B). Instead of a per-cell key pass over
 /// every slice, three walks over the padded array (one per axis) first
@@ -78,7 +145,13 @@ pub(crate) const KEY_LAYER_BITS: u32 = 0x7FFF << 15;
 /// output — the same `PackedFace` list, order included, at every level —
 /// is pinned bit for bit against `oracle::reference_mesh_padded`, the
 /// verbatim pre-2.13 sweep.
-fn sweep(pad: &[u32], appearance: &BlockAppearance, level: u8, key_keep: u32) -> MeshOutput {
+fn sweep(
+    pad: &[u32],
+    appearance: &BlockAppearance,
+    level: u8,
+    heights: Option<&PaddedHeights>,
+    key_keep: u64,
+) -> MeshOutput {
     let mut output = MeshOutput {
         faces: Vec::new(),
         ranges: std::array::from_fn(|_| 0u32..0),
@@ -88,7 +161,8 @@ fn sweep(pad: &[u32], appearance: &BlockAppearance, level: u8, key_keep: u32) ->
     let size = CUBE_SIZE as usize;
     let half = size / 2;
     let last = size - 1;
-    let mut mask = [0u32; MASK_LEN];
+    let full = 1u8 << level;
+    let mut mask = [0u64; MASK_LEN];
     let mut bits = [0u32; CUBE_SIZE as usize];
 
     // The boundary planes, `[direction][k][vi]` with bit ui in that
@@ -98,6 +172,9 @@ fn sweep(pad: &[u32], appearance: &BlockAppearance, level: u8, key_keep: u32) ->
     // axes whose walk aborted (see `build_differ_planes`).
     let mut differ = [[[0u32; CUBE_SIZE as usize]; CUBE_SIZE as usize]; 6];
     let dense = build_differ_planes(pad, &mut differ);
+    if let Some(heights) = heights {
+        add_partial_top_candidates(heights, &mut differ);
+    }
 
     for (dir_index, &direction) in DIRECTIONS.iter().enumerate() {
         let n = stride(direction.normal());
@@ -195,36 +272,45 @@ fn sweep(pad: &[u32], appearance: &BlockAppearance, level: u8, key_keep: u32) ->
                         // equal neighbors (an ocean once emitted every
                         // internal water face).
                         let culled = a_air || b_cull || a == b;
-                        let key = if culled {
-                            if level > 0
+                        let key = if a_air {
+                            0
+                        } else {
+                            let layer = layer_of_kind[(a & 0xFFFF) as usize];
+                            let h_a = heights.map_or(full, |hs| hs.at(a_i as usize));
+                            // Sides and +Y stop at A's fill height.
+                            let top = if direction == Direction::NegY {
+                                0
+                            } else {
+                                full - h_a
+                            };
+                            if !culled {
+                                face_key(layer, corner_ao(pad, b_i, u, v)) | inset_key(0, top)
+                            } else if level > 0
                                 && side
-                                && !a_air
                                 && b_cull
                                 && skirt(pad, a_i as usize, direction)
                             {
-                                (1 << 31)
+                                face_key(layer, corner_ao(pad, b_i, u, v))
                                     | SKIRT_KEY_BIT
-                                    | (u32::from(layer_of_kind[(a & 0xFFFF) as usize]) << 15)
-                                    | (corner_ao(pad, b_i, u, v) << 7)
-                                    | LIGHT
+                                    | inset_key(0, top)
                             } else if level > 0
                                 && direction == Direction::PosY
-                                && !a_air
                                 && b_cull
                                 && lid(a_i as usize)
                             {
-                                (1 << 31)
+                                face_key(layer, corner_ao(pad, b_i, u, v))
                                     | LID_KEY_BIT
-                                    | (u32::from(layer_of_kind[(a & 0xFFFF) as usize]) << 15)
-                                    | (corner_ao(pad, b_i, u, v) << 7)
-                                    | LIGHT
+                                    | inset_key(0, top)
+                            } else if let Some(hs) = heights.filter(|_| side)
+                                && hs.at(b_i as usize) < h_a
+                            {
+                                // A culled pair under a lower partial top:
+                                // the step [H_B, H_A].
+                                face_key(layer, corner_ao(pad, b_i, u, v))
+                                    | inset_key(hs.at(b_i as usize), top)
                             } else {
                                 0
                             }
-                        } else {
-                            let layer = u32::from(layer_of_kind[(a & 0xFFFF) as usize]);
-                            let ao = corner_ao(pad, b_i, u, v);
-                            (1 << 31) | (layer << 15) | (ao << 7) | LIGHT
                         };
                         if key != 0 {
                             mask[vi * size + ui] = key & key_keep;
@@ -235,9 +321,11 @@ fn sweep(pad: &[u32], appearance: &BlockAppearance, level: u8, key_keep: u32) ->
                     bits[vi] = row_bits;
                     row_seeds |= row_bits;
                 } else {
-                    // Candidates only: the boundary plane's set bits. A
-                    // differing pair is visible unless A is air or B culls
-                    // (equal pairs never made it here).
+                    // Candidates only: the boundary plane's set bits plus
+                    // the pairs under a partial top. A differing pair is
+                    // visible unless A is air or B culls; a culled pair
+                    // (B culls or equals A) only shows the step above a
+                    // lower partial top B.
                     let mut candidates = plane[vi];
                     let mut row_bits = 0u32;
                     while candidates != 0 {
@@ -247,14 +335,28 @@ fn sweep(pad: &[u32], appearance: &BlockAppearance, level: u8, key_keep: u32) ->
                         let b_i = a_i + n;
                         let a = pad[a_i as usize];
                         let b = pad[b_i as usize];
-                        if a & (F_AIR << FLAGS_SHIFT) != 0
-                            || b & (F_OPAQUE_CULL << FLAGS_SHIFT) != 0
-                        {
+                        if a & (F_AIR << FLAGS_SHIFT) != 0 {
                             continue;
                         }
-                        let layer = u32::from(layer_of_kind[(a & 0xFFFF) as usize]);
-                        let ao = corner_ao(pad, b_i, u, v);
-                        let key = (1 << 31) | (layer << 15) | (ao << 7) | LIGHT;
+                        let culled = b & (F_OPAQUE_CULL << FLAGS_SHIFT) != 0 || a == b;
+                        let h_a = heights.map_or(full, |hs| hs.at(a_i as usize));
+                        let bottom = if !culled {
+                            0
+                        } else if let Some(hs) = heights.filter(|_| side)
+                            && hs.at(b_i as usize) < h_a
+                        {
+                            hs.at(b_i as usize)
+                        } else {
+                            continue;
+                        };
+                        let top = if direction == Direction::NegY {
+                            0
+                        } else {
+                            full - h_a
+                        };
+                        let layer = layer_of_kind[(a & 0xFFFF) as usize];
+                        let key =
+                            face_key(layer, corner_ao(pad, b_i, u, v)) | inset_key(bottom, top);
                         mask[vi * size + ui] = key & key_keep;
                         row_bits |= 1 << ui;
                     }
@@ -290,13 +392,21 @@ fn sweep(pad: &[u32], appearance: &BlockAppearance, level: u8, key_keep: u32) ->
                         }
                         let v_limit = if level > 0 && v0 < half { half } else { size };
                         let mut h = 1usize;
+                        // The key of the topmost merged row (its top inset
+                        // is the face's).
+                        let mut top_key = key;
                         'extend: while v0 + h < v_limit {
                             let row = (v0 + h) * size;
-                            for ui in u0..u0 + w {
-                                if mask[row + ui] != key {
+                            let next = mask[row + u0];
+                            if !v_mergeable(top_key, next, side) {
+                                break;
+                            }
+                            for ui in u0 + 1..u0 + w {
+                                if mask[row + ui] != next {
                                     break 'extend;
                                 }
                             }
+                            top_key = next;
                             h += 1;
                         }
                         for vv in v0..v0 + h {
@@ -308,7 +418,7 @@ fn sweep(pad: &[u32], appearance: &BlockAppearance, level: u8, key_keep: u32) ->
                         // Owner block: the mask corner (u0, v0) of this
                         // slice, decoded by the affine cell map.
                         let (x, y, z) = cell_of(k as u32, v0 as u32, u0 as u32);
-                        let ao8 = (key >> 7) & 0xFF;
+                        let ao8 = ((key >> 7) & 0xFF) as u32;
                         output.faces.push(pack(&FaceFields {
                             x,
                             y,
@@ -321,9 +431,10 @@ fn sweep(pad: &[u32], appearance: &BlockAppearance, level: u8, key_keep: u32) ->
                             // skirt faces layer + 32768: the texture array
                             // clamped it, the 2.9 per-layer color buffer
                             // read out of bounds).
-                            layer: (key >> 15) & LAYER_KEY_MASK,
+                            layer: (key >> 15) as u32 & LAYER_KEY_MASK,
                             ao: [ao8 & 3, (ao8 >> 2) & 3, (ao8 >> 4) & 3, (ao8 >> 6) & 3],
-                            light: key & 0xF,
+                            inset_bottom: key_inset_bottom(key),
+                            inset_top: key_inset_top(top_key),
                         }));
                         output.skirts += u32::from(key & SKIRT_KEY_BIT != 0);
                         output.lids += u32::from(key & LID_KEY_BIT != 0);
@@ -334,6 +445,40 @@ fn sweep(pad: &[u32], appearance: &BlockAppearance, level: u8, key_keep: u32) ->
         output.ranges[dir_index] = start..output.faces.len() as u32;
     }
     output
+}
+
+/// Adds the culled pairs under each partial column top to the side
+/// directions' boundary planes: B is the partial top cell (center or
+/// side shell), A = B − normal its neighbor in the center cube. Equal or
+/// culling pairs never made it into the planes, but a taller A shows the
+/// step above B. Bits use each direction's own (k, vi, ui) layout, the
+/// inverse of the sweep's `cell_of`.
+fn add_partial_top_candidates(
+    heights: &PaddedHeights,
+    differ: &mut [[[u32; CUBE_SIZE as usize]; CUBE_SIZE as usize]; 6],
+) {
+    let size = CUBE_SIZE;
+    let last = size - 1;
+    for (column, padded_y) in heights.partial_tops() {
+        let bx = (column % PAD) as i32 - 1;
+        let bz = (column / PAD) as i32 - 1;
+        let y = padded_y - 1;
+        for (dir_index, &direction) in DIRECTIONS.iter().enumerate() {
+            let n = direction.normal();
+            let (ax, az) = (bx - n[0], bz - n[2]);
+            if n[1] != 0 || !(0..size).contains(&ax) || !(0..size).contains(&az) {
+                continue;
+            }
+            let (k, ui) = match direction {
+                Direction::PosX => (ax, last - az),
+                Direction::NegX => (ax, az),
+                Direction::PosZ => (az, ax),
+                Direction::NegZ => (az, last - ax),
+                Direction::PosY | Direction::NegY => unreachable!("sides only"),
+            };
+            differ[dir_index][k as usize][y] |= 1 << ui;
+        }
+    }
 }
 
 /// Pairs examined before the density abort may fire. Four rows' worth:
@@ -526,9 +671,6 @@ fn build_differ_planes(
 /// SKIRT_KEY_BIT in `super::seams`.
 pub(crate) const LAYER_KEY_MASK: u32 = 0x7FFF;
 
-/// Light is always 15 until lighting exists.
-pub(crate) const LIGHT: u32 = 15;
-
 /// Cells in one u/v slice mask (`CUBE_SIZE²`).
 pub(crate) const MASK_LEN: usize = (CUBE_SIZE as usize) * (CUBE_SIZE as usize);
 
@@ -625,7 +767,7 @@ mod tests {
             assert_eq!((faces[0].width, faces[0].height), (1, 1));
             assert_eq!((faces[0].x, faces[0].y, faces[0].z), (0, 0, 0));
             assert_eq!(faces[0].layer, crate::mesh::appearance::LAYER_STONE as u32);
-            assert_eq!(faces[0].light, 15);
+            assert_eq!((faces[0].inset_bottom, faces[0].inset_top), (0, 0));
         }
     }
 
@@ -944,7 +1086,7 @@ mod tests {
                 }
             }
             let padded = build_padded(&input, &appearance);
-            let got = mesh_padded(&padded, &appearance, 0);
+            let got = mesh_padded(&padded, &appearance, 0, None);
             let expected = legacy_mesh_padded(&padded, &appearance);
             assert_eq!(
                 got.faces, expected.faces,
@@ -1260,9 +1402,9 @@ mod tests {
                 input.neighbors[i] = Some(Arc::new(cube));
             }
             let padded = build_padded(&input, &appearance);
-            let got = mesh_padded(&padded, &appearance, input.level);
+            let got = mesh_padded(&padded, &appearance, input.level, None);
             let expected =
-                crate::mesh::oracle::reference_mesh_padded(&padded, &appearance, input.level);
+                crate::mesh::oracle::reference_mesh_padded(&padded, &appearance, input.level, None);
             assert!(
                 got.faces == expected.faces,
                 "case {case} (level {}): face list drifted",
@@ -1338,9 +1480,9 @@ mod tests {
                 input.neighbors[i] = Some(cube);
             }
             let padded = build_padded(&input, &appearance);
-            let got = mesh_padded(&padded, &appearance, input.level);
+            let got = mesh_padded(&padded, &appearance, input.level, None);
             let expected =
-                crate::mesh::oracle::reference_mesh_padded(&padded, &appearance, input.level);
+                crate::mesh::oracle::reference_mesh_padded(&padded, &appearance, input.level, None);
             assert!(
                 got.faces == expected.faces,
                 "case {case} (level {}): sparse-path face list drifted",
@@ -1350,6 +1492,370 @@ mod tests {
             assert_eq!(got.skirts, expected.skirts, "case {case}: skirts drifted");
             assert_eq!(got.lids, expected.lids, "case {case}: lids drifted");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Fill heights (task 2.14)
+
+    /// Random column tops consistent with `cube` at `level`: per octant
+    /// half, a column holding a filled cell gets a height in 1..=full
+    /// (partial three times in four), an empty one 0.
+    fn random_tops(cube: &Cube, level: u8, rng: &mut XorShift64) -> jbm_core::lod::LodTops {
+        let full = 1u8 << level;
+        let half = CUBE_SIZE as u8 / 2;
+        let mut tops = jbm_core::lod::LodTops::empty(level);
+        for z in 0..CUBE_SIZE as u8 {
+            for x in 0..CUBE_SIZE as u8 {
+                for dy in 0..2u8 {
+                    let filled = (dy * half..dy * half + half).any(|y| {
+                        cube.get(jbm_core::coords::LocalPos::new_unchecked(x, y, z))
+                            != BlockStateId::AIR
+                    });
+                    if filled {
+                        let h = if rng.next().is_multiple_of(4) {
+                            full
+                        } else {
+                            1 + (rng.next() % u64::from(full)) as u8
+                        };
+                        tops.set_half(dy, x, z, h);
+                    }
+                }
+            }
+        }
+        tops.compact();
+        tops
+    }
+
+    /// The fill height of center/side-shell cell `(x, y, z)` (cube-local,
+    /// one of x/z may be -1 or CUBE_SIZE) straight from the cubes and
+    /// tops: a full cell unless it is the topmost non-air cell of its
+    /// cube's column, which takes the column top.
+    fn brute_height(input: &MeshInput, x: i32, y: i32, z: i32) -> u8 {
+        let full = 1u8 << input.level;
+        let size = CUBE_SIZE;
+        let (dx, dz) = (x.div_euclid(size), z.div_euclid(size));
+        let (cube, tops) = if (dx, dz) == (0, 0) {
+            (Some(&input.center), input.tops.center.as_ref())
+        } else {
+            let side = crate::mesh::SIDE_OFFSETS
+                .iter()
+                .position(|&o| o == (dx, dz))
+                .expect("a side shell column");
+            (input.neighbor(dx, 0, dz), input.tops.sides[side].as_ref())
+        };
+        let (Some(cube), Some(tops)) = (cube, tops) else {
+            return full;
+        };
+        let (lx, lz) = (x.rem_euclid(size) as u8, z.rem_euclid(size) as u8);
+        let at = |y: i32| cube.get(jbm_core::coords::LocalPos::new_unchecked(lx, y as u8, lz));
+        let top = (0..size).rev().find(|&y| at(y) != BlockStateId::AIR);
+        let h = tops.get(lx, lz);
+        if top == Some(y) && h != 0 && h < full {
+            h
+        } else {
+            full
+        }
+    }
+
+    /// Task 2.14: the bitmask sweep equals the reference with random
+    /// column tops — 2,400 seeded cases at levels 1..=6, smooth terrain
+    /// (the sparse candidate path) and noisy fills (the dense fallback)
+    /// with mixed materials, random neighbor kinds and random side tops,
+    /// so partial tops sit inside the cube, at octant planes and against
+    /// the cube border. Each case also checks `build_padded_heights`
+    /// against the heights read straight from the cubes.
+    #[test]
+    fn bitmask_sweep_matches_the_reference_with_random_tops() {
+        let (_, appearance, blocks) = setup();
+        let states = [
+            BlockStateId::AIR,
+            blocks.stone,
+            blocks.dirt,
+            blocks.glass,
+            blocks.water,
+            blocks.leaves,
+        ];
+        let height_at = |x: u8, z: u8, seed: u64| -> u8 {
+            let mut h = seed ^ (u64::from(x) << 8) ^ (u64::from(z) << 16);
+            h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            h ^= h >> 31;
+            (4 + (x / 3) * 2 + (z / 4) + (h % 3) as u8).clamp(2, 30)
+        };
+        let terrain = |seed: u64, top: BlockStateId| {
+            Cube::from_fn(move |p| {
+                let height = height_at(p.x, p.z, seed);
+                if p.y > height {
+                    BlockStateId::AIR
+                } else if p.y == height {
+                    top
+                } else if p.y + 3 >= height {
+                    blocks.dirt
+                } else {
+                    blocks.stone
+                }
+            })
+        };
+        let noisy = |seed: u64| {
+            Cube::from_fn(move |p| {
+                let mut h = seed ^ (p.index() as u64).wrapping_mul(0x9e37_79b9);
+                h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                h ^= h >> 31;
+                states[(h % 100) as usize % states.len()]
+            })
+        };
+        let mut rng = XorShift64(0x0214_70b5_5eed_0001);
+        let mut partial_inputs = 0;
+        for case in 0..2400u64 {
+            let level = 1 + (case % 6) as u8;
+            let seed = case.wrapping_mul(0x2f13_171d) ^ rng.next();
+            let tops_top =
+                [blocks.grass_block, blocks.water, blocks.glass][(case / 6 % 3) as usize];
+            let make = |rng: &mut XorShift64| {
+                if case % 5 == 4 {
+                    noisy(rng.next())
+                } else {
+                    terrain(seed ^ (rng.next() % 4), tops_top)
+                }
+            };
+            let center = make(&mut rng);
+            let mut input = MeshInput::isolated_at_level(Arc::new(center), level);
+            input.tops.center = Some(Arc::new(random_tops(&input.center, level, &mut rng)));
+            for i in 0..26 {
+                let roll = rng.next() % 4;
+                if roll == 0 {
+                    continue; // missing neighbor
+                }
+                let cube = if roll == 1 {
+                    Cube::filled(
+                        [blocks.stone, blocks.water, BlockStateId::AIR][(rng.next() % 3) as usize],
+                    )
+                } else {
+                    make(&mut rng)
+                };
+                input.neighbors[i] = Some(Arc::new(cube));
+            }
+            for (side, &(dx, dz)) in crate::mesh::SIDE_OFFSETS.iter().enumerate() {
+                if rng.next().is_multiple_of(5) {
+                    continue; // tops not known: full height
+                }
+                if let Some(cube) = input.neighbor(dx, 0, dz) {
+                    let tops = random_tops(cube, level, &mut rng);
+                    input.tops.sides[side] = Some(Arc::new(tops));
+                }
+            }
+
+            let padded = build_padded(&input, &appearance);
+            let heights = crate::mesh::build_padded_heights(&input, &padded);
+            partial_inputs += usize::from(heights.is_some());
+            if let Some(heights) = &heights {
+                let size = CUBE_SIZE;
+                for y in 0..size {
+                    for z in -1..=size {
+                        for x in -1..=size {
+                            let shell_x = x == -1 || x == size;
+                            let shell_z = z == -1 || z == size;
+                            if shell_x && shell_z {
+                                continue; // corner columns are never read
+                            }
+                            let index = ORIGIN as isize + stride([x, y, z]);
+                            let cell = padded[index as usize];
+                            if cell & (F_AIR << FLAGS_SHIFT) != 0 {
+                                continue;
+                            }
+                            assert_eq!(
+                                heights.at(index as usize),
+                                brute_height(&input, x, y, z),
+                                "case {case}: height of ({x}, {y}, {z})"
+                            );
+                        }
+                    }
+                }
+            }
+            let got = mesh_padded(&padded, &appearance, level, heights.as_ref());
+            let expected = crate::mesh::oracle::reference_mesh_padded(
+                &padded,
+                &appearance,
+                level,
+                heights.as_ref(),
+            );
+            assert!(
+                got.faces == expected.faces,
+                "case {case} (level {level}): face list drifted"
+            );
+            assert_eq!(got.ranges, expected.ranges, "case {case}: ranges drifted");
+            assert_eq!(got.skirts, expected.skirts, "case {case}: skirts drifted");
+            assert_eq!(got.lids, expected.lids, "case {case}: lids drifted");
+        }
+        assert!(
+            partial_inputs >= 2000,
+            "only {partial_inputs} cases had partial tops"
+        );
+    }
+
+    /// A level-2 input around `cube` with the given center tops: air
+    /// beside and above, a missing cube below.
+    fn mesh_with_tops(
+        cube: Cube,
+        tops: jbm_core::lod::LodTops,
+        appearance: &BlockAppearance,
+    ) -> MeshOutput {
+        let air = Arc::new(Cube::default());
+        let level = tops.level();
+        let mut input = MeshInput::isolated_at_level(Arc::new(cube), level);
+        for i in 0..26 {
+            if i != neighbor_index(0, -1, 0) {
+                input.neighbors[i] = Some(Arc::clone(&air));
+            }
+        }
+        input.tops.center = Some(Arc::new(tops));
+        mesh(&input, appearance)
+    }
+
+    #[test]
+    fn a_partial_top_lowers_its_top_face_and_side_walls() {
+        let (_, appearance, blocks) = setup();
+        // A level-2 plateau 8 x 8 columns wide whose top cells (y = 3)
+        // are 3 blocks tall: the surface at block 15, not 16.
+        let cube = Cube::from_fn(|p| {
+            if p.x < 8 && p.z < 8 && p.y <= 3 {
+                blocks.stone
+            } else {
+                BlockStateId::AIR
+            }
+        });
+        let mut tops = jbm_core::lod::LodTops::empty(2);
+        for z in 0..8 {
+            for x in 0..8 {
+                tops.set_half(0, x, z, 3);
+            }
+        }
+        let output = mesh_with_tops(cube, tops, &appearance);
+        // One +Y quad, one block below the cell top.
+        let top = faces_of(&output, Direction::PosY);
+        assert_eq!(top.len(), 1, "{top:?}");
+        assert_eq!((top[0].width, top[0].height, top[0].y), (8, 8, 3));
+        assert_eq!((top[0].inset_bottom, top[0].inset_top), (0, 1));
+        // Each side wall: the three full cells below and the partial top
+        // merge into one quad spanning blocks 0..15.
+        for direction in [
+            Direction::PosX,
+            Direction::NegX,
+            Direction::PosZ,
+            Direction::NegZ,
+        ] {
+            let walls = faces_of(&output, direction);
+            assert_eq!(walls.len(), 1, "{direction:?}: {walls:?}");
+            let wall = walls[0];
+            assert_eq!((wall.y, wall.height), (0, 4), "{direction:?}");
+            assert_eq!((wall.inset_bottom, wall.inset_top), (0, 1), "{direction:?}");
+            let ys: Vec<i32> = crate::mesh::face::quad_corners(&wall, 2)
+                .iter()
+                .map(|c| c[1])
+                .collect();
+            assert_eq!(ys, [0, 0, 15, 15], "{direction:?}");
+        }
+        // The bottom never moves.
+        for f in faces_of(&output, Direction::NegY) {
+            assert_eq!((f.inset_bottom, f.inset_top), (0, 0));
+        }
+    }
+
+    #[test]
+    fn a_step_between_two_partial_tops_shows_the_taller_side() {
+        let (_, appearance, blocks) = setup();
+        // Two stone columns side by side at cell y = 5 (level 2, blocks
+        // 20..24): x = 4 is 3 blocks tall, x = 5 only 1. Both cells are
+        // opaque, so the ordinary rule culls the pair; the step from block
+        // 21 to 23 must still get a +X face on the taller column.
+        let cube = Cube::from_fn(|p| {
+            if (p.x == 4 || p.x == 5) && p.z == 4 && p.y <= 5 {
+                blocks.stone
+            } else {
+                BlockStateId::AIR
+            }
+        });
+        let mut tops = jbm_core::lod::LodTops::empty(2);
+        tops.set_half(0, 4, 4, 3);
+        tops.set_half(0, 5, 4, 1);
+        let output = mesh_with_tops(cube, tops, &appearance);
+        let step = faces_covering(&output, Direction::PosX, 4, 5, 4);
+        assert_eq!(step.len(), 1, "{step:?}");
+        assert_eq!((step[0].inset_bottom, step[0].inset_top), (1, 1));
+        let ys: Vec<i32> = crate::mesh::face::quad_corners(&step[0], 2)
+            .iter()
+            .map(|c| c[1])
+            .collect();
+        assert_eq!(ys, [21, 21, 23, 23]);
+        // Below the tops the pair stays culled, and the shorter column
+        // shows nothing toward the taller one.
+        assert!(faces_covering(&output, Direction::PosX, 4, 4, 4).is_empty());
+        assert!(faces_covering(&output, Direction::NegX, 5, 5, 4).is_empty());
+        // The +Y faces sit at each column's own height.
+        for (x, inset) in [(4, 1), (5, 3)] {
+            let top = faces_covering(&output, Direction::PosY, x, 5, 4);
+            assert_eq!(top.len(), 1);
+            assert_eq!(top[0].inset_top, inset, "x = {x}");
+        }
+    }
+
+    #[test]
+    fn a_lower_partial_top_across_the_cube_border_gets_the_step() {
+        let (_, appearance, blocks) = setup();
+        let last = CUBE_SIZE as u8 - 1;
+        // The center's +X border column and the +X neighbor's first
+        // column are both stone up to cell 9, which the center tops at a
+        // full 4 blocks and the neighbor at 2: the center's +X face shows
+        // blocks 38..40.
+        let column = |x: u8| {
+            Cube::from_fn(move |p| {
+                if p.x == x && p.z == 3 && p.y <= 9 {
+                    blocks.stone
+                } else {
+                    BlockStateId::AIR
+                }
+            })
+        };
+        let mut input = MeshInput::isolated_at_level(Arc::new(column(last)), 2);
+        let air = Arc::new(Cube::default());
+        for i in 0..26 {
+            input.neighbors[i] = Some(Arc::clone(&air));
+        }
+        input.neighbors[neighbor_index(1, 0, 0)] = Some(Arc::new(column(0)));
+        let mut center_tops = jbm_core::lod::LodTops::empty(2);
+        center_tops.set_half(0, last, 3, 4);
+        let mut side_tops = jbm_core::lod::LodTops::empty(2);
+        side_tops.set_half(0, 0, 3, 2);
+        input.tops.center = Some(Arc::new(center_tops));
+        input.tops.sides[0] = Some(Arc::new(side_tops));
+        let output = mesh(&input, &appearance);
+        let step = faces_covering(&output, Direction::PosX, last as i32, 9, 3);
+        assert_eq!(step.len(), 1, "{step:?}");
+        let f = step[0];
+        // The step and the skirt rule meet here (cube border, top cell):
+        // the skirt wins and hangs from the cell's own height.
+        assert_eq!((f.inset_bottom, f.inset_top), (0, 0));
+        assert!(output.skirts > 0);
+        // Without the neighbor's tops the pair is a plain border skirt
+        // too — the step only adds faces where no skirt hangs.
+        input.tops.sides[0] = None;
+        assert_eq!(mesh(&input, &appearance).faces.len(), output.faces.len());
+    }
+
+    #[test]
+    fn an_enclosed_opaque_cube_still_meshes_beside_a_partial_top() {
+        let (_, appearance, blocks) = setup();
+        let stone = Arc::new(Cube::filled(blocks.stone));
+        let mut input = MeshInput::isolated_at_level(Arc::clone(&stone), 1);
+        for i in 0..26 {
+            input.neighbors[i] = Some(Arc::clone(&stone));
+        }
+        assert!(mesh(&input, &appearance).faces.is_empty(), "fast path");
+        // The +X neighbor's top row is 1 block short: the center's +X
+        // wall shows the step above it (no skirt: stone lies above).
+        input.tops.sides[0] = Some(Arc::new(jbm_core::lod::LodTops::uniform_at(1, 1)));
+        input.tops.center = Some(Arc::new(jbm_core::lod::LodTops::full(1)));
+        let output = mesh(&input, &appearance);
+        assert!(!faces_of(&output, Direction::PosX).is_empty());
     }
 
     /// The affine owner decode: every direction's (x, y, z) matches the
@@ -1376,8 +1882,8 @@ mod tests {
             input.neighbors[i] = Some(Arc::clone(&air));
         }
         let padded = build_padded(&input, &appearance);
-        let got = mesh_padded(&padded, &appearance, 0);
-        let expected = crate::mesh::oracle::reference_mesh_padded(&padded, &appearance, 0);
+        let got = mesh_padded(&padded, &appearance, 0, None);
+        let expected = crate::mesh::oracle::reference_mesh_padded(&padded, &appearance, 0, None);
         // Byte equality of the packed faces is the claim; the owners ride
         // in word 0.
         for (g, e) in got.faces.iter().zip(&expected.faces) {

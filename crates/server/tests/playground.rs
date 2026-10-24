@@ -7,7 +7,7 @@ use jbm_core::block::BlockStateId;
 use jbm_core::block::builtin::Blocks;
 use jbm_core::coords::{CubePos, LocalPos};
 use jbm_core::cube::Cube;
-use jbm_core::lod::octant_offset;
+use jbm_core::lod::{LodTops, octant_offset};
 use jbm_server::terrain::Generator;
 use jbm_server::worldgen::Preset;
 
@@ -132,13 +132,14 @@ fn spawn_is_on_the_plane_facing_the_features() {
     );
 }
 
-/// The exact downsample of generated cubes, level by level (the same
-/// helper shape tests/lod.rs uses).
-fn exact_cube(generator: &Generator, level: u8, pos: CubePos) -> Cube {
+/// The exact downsample of generated cubes, cells and column tops, level
+/// by level (the same helper shape tests/lod.rs uses).
+fn exact_cube(generator: &Generator, level: u8, pos: CubePos) -> (Cube, LodTops) {
     if level == 0 {
-        return generator.generate(pos);
+        return (generator.generate(pos), LodTops::LOD0);
     }
     let mut cube = Cube::filled(BlockStateId::AIR);
+    let mut tops = LodTops::empty(level);
     for octant in 0..8u8 {
         let [dx, dy, dz] = octant_offset(octant).map(i32::from);
         let child = CubePos {
@@ -146,14 +147,15 @@ fn exact_cube(generator: &Generator, level: u8, pos: CubePos) -> Cube {
             y: pos.y * 2 + dy,
             z: pos.z * 2 + dz,
         };
-        let child_cube = exact_cube(generator, level - 1, child);
-        jbm_core::lod::downsample_octant(&child_cube, &mut cube, octant);
+        let (child_cube, child_tops) = exact_cube(generator, level - 1, child);
+        jbm_core::lod::downsample_octant(&child_cube, &child_tops, &mut cube, &mut tops, octant);
     }
-    cube
+    (cube, tops)
 }
 
 /// `sample_lod` agrees with downsampling the generated cubes: exactly at
-/// level 1 (the samples equal the LOD0 cells), and at the coarser levels
+/// level 1, column tops included (the samples equal the LOD0 cells), and
+/// at the coarser levels
 /// under the same min-corner sampling rule the graph presets follow.
 #[test]
 fn sample_lod_agrees_with_downsampling_generated_cubes() {
@@ -175,7 +177,8 @@ fn sample_lod_agrees_with_downsampling_generated_cubes() {
         let expected = exact_cube(&generator, 1, pos);
         let generates = generator.generate_calls();
         let sampled = generator.sample_lod(1, pos);
-        assert_eq!(sampled, expected, "level 1 at {pos:?}");
+        assert_eq!(sampled.0, expected.0, "level 1 cells at {pos:?}");
+        assert_eq!(sampled.1, expected.1, "level 1 tops at {pos:?}");
         assert_eq!(
             generator.generate_calls(),
             generates,
