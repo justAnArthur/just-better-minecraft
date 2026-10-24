@@ -832,7 +832,7 @@ impl Renderer {
         }
         gpu.queue.submit([encoder.finish()]);
         if let Some(timer) = &mut self.timer {
-            timer.after_submit();
+            timer.after_submit(gpu);
         }
     }
 }
