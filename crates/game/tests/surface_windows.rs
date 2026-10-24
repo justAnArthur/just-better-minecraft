@@ -20,6 +20,7 @@ use jbm_client::camera::Camera;
 use jbm_client::gpu::Gpu;
 use jbm_client::mesh::appearance::BlockAppearance;
 use jbm_client::render::renderer::{HORIZON_COLOR, ZENITH_COLOR};
+use jbm_client::render::settings::RenderSettings;
 use jbm_client::terrain_sync::TerrainSync;
 use jbm_client::testing::OffscreenRig;
 use jbm_core::coords::{CUBE_SIZE, CubePos};
@@ -178,7 +179,9 @@ impl WindowClient {
         WindowClient {
             sync: TerrainSync::new(appearance, 0),
             received_lod0: std::collections::HashSet::new(),
-            rig: OffscreenRig::new(gpu, WIDTH, HEIGHT),
+            // 1×, for `read_depth`; the flat look (no sun lighting, no
+            // water shading), so water pixels match the flat water color.
+            rig: OffscreenRig::with_settings(gpu, WIDTH, HEIGHT, &flat_look_settings()),
         }
     }
 
@@ -712,6 +715,18 @@ fn coast_from_altitude_has_no_water_triangles_on_the_beach() {
         "{after} water pixels over land columns — the coast triangles; \
          images in target/surface/"
     );
+}
+
+/// The rig's settings: 1× MSAA (the depth readback is single-sample)
+/// and the pre-2.15 flat look — sun lighting and water shading off — so
+/// the coast test's water pixels are the flat water color.
+fn flat_look_settings() -> RenderSettings {
+    RenderSettings {
+        sun_lighting: false,
+        water: false,
+        msaa_samples: 1,
+        ..RenderSettings::default()
+    }
 }
 
 /// The sRGB byte color a flat-shaded water top face shows: the water

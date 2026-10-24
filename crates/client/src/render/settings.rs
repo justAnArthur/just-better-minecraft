@@ -82,6 +82,23 @@ pub struct RenderSettings {
     /// Near cubes keep one command per visible direction. 0 draws one
     /// command everywhere; `JBM_DIRECTION_SPLIT=<cubes>` seeds it.
     pub direction_split_radius: u32,
+    /// Sun and sky lighting (task 2.15): a fixed mid-morning sun plus a
+    /// hemisphere ambient light every terrain fragment. Off restores the
+    /// pre-2.15 flat look (fixed per-direction multipliers), for
+    /// comparison; off via `JBM_NO_SUN=1`.
+    pub sun_lighting: bool,
+    /// The procedural cloud layer in the sky (task 2.15); off via
+    /// `JBM_NO_CLOUDS=1`.
+    pub clouds: bool,
+    /// Water shading (task 2.15): Fresnel sky reflection, sun glint and
+    /// ripples on water faces; off draws water as its flat texture like
+    /// any block. Off via `JBM_NO_WATER=1`.
+    pub water: bool,
+    /// MSAA sample count (task 2.15): 4 (default) or 1, via
+    /// `JBM_MSAA=1|4`. Applied when the renderer and terrain pass are
+    /// created — pipelines and targets are built for it — so changing it
+    /// later has no effect (the panel shows it read-only).
+    pub msaa_samples: u32,
 }
 
 impl Default for RenderSettings {
@@ -100,7 +117,25 @@ impl Default for RenderSettings {
             level_mask: ALL_LEVELS,
             freeze_cull: false,
             direction_split_radius: DEFAULT_DIRECTION_SPLIT_RADIUS,
+            sun_lighting: true,
+            clouds: true,
+            water: true,
+            msaa_samples: DEFAULT_MSAA_SAMPLES,
         }
+    }
+}
+
+/// The default MSAA sample count (task 2.15). `JBM_MSAA=1` switches it
+/// off; 4 is the only other count every wgpu backend guarantees for
+/// render-attachment formats.
+pub const DEFAULT_MSAA_SAMPLES: u32 = 4;
+
+/// Maps a `JBM_MSAA` value to a supported sample count: "1" is 1, "4"
+/// (or anything else, including unset) the default.
+fn msaa_from_env(value: Option<&str>) -> u32 {
+    match value.map(str::trim) {
+        Some("1") => 1,
+        _ => DEFAULT_MSAA_SAMPLES,
     }
 }
 
@@ -117,8 +152,9 @@ impl RenderSettings {
     /// `JBM_WIREFRAME`, `JBM_WIREFRAME_ONLY`, `JBM_CHUNK_BORDERS` and
     /// `JBM_FREEZE_CULL` as `NAME=1`; `JBM_EXPLODE=<gap>` (any value,
     /// clamped to 0..=8) and `JBM_LEVELS=<comma-separated level list>` as
-    /// the shown-levels mask. The app calls this once at startup and
-    /// never reads them again.
+    /// the shown-levels mask; task 2.15's `JBM_NO_SUN`, `JBM_NO_CLOUDS`
+    /// and `JBM_NO_WATER` as `NAME=1` and `JBM_MSAA=1|4`. The app calls
+    /// this once at startup and never reads them again.
     pub fn from_env() -> RenderSettings {
         let flag = |name: &str| std::env::var_os(name).is_some_and(|v| v == "1");
         let explode = std::env::var("JBM_EXPLODE")
@@ -141,11 +177,23 @@ impl RenderSettings {
                 wireframe_only: flag("JBM_WIREFRAME_ONLY"),
                 chunk_borders: flag("JBM_CHUNK_BORDERS"),
                 freeze_cull: flag("JBM_FREEZE_CULL"),
+                no_sun: flag("JBM_NO_SUN"),
+                no_clouds: flag("JBM_NO_CLOUDS"),
+                no_water: flag("JBM_NO_WATER"),
             },
             explode,
             level_mask,
             direction_split,
         )
+        .with_msaa(msaa_from_env(std::env::var("JBM_MSAA").ok().as_deref()))
+    }
+
+    /// The same settings with `samples` MSAA samples.
+    fn with_msaa(self, samples: u32) -> RenderSettings {
+        RenderSettings {
+            msaa_samples: samples,
+            ..self
+        }
     }
 
     /// The environment mapping, pure so it can be unit-tested.
@@ -167,6 +215,9 @@ impl RenderSettings {
             level_mask,
             freeze_cull: flags.freeze_cull,
             direction_split_radius,
+            sun_lighting: !flags.no_sun,
+            clouds: !flags.no_clouds,
+            water: !flags.no_water,
             ..RenderSettings::default()
         }
     }
@@ -183,6 +234,9 @@ struct DebugFlags {
     wireframe_only: bool,
     chunk_borders: bool,
     freeze_cull: bool,
+    no_sun: bool,
+    no_clouds: bool,
+    no_water: bool,
 }
 
 /// Parses `JBM_LEVELS`'s comma-separated level list ("0,1,3") into the
@@ -220,6 +274,9 @@ mod tests {
             wireframe_only: false,
             chunk_borders: false,
             freeze_cull: false,
+            no_sun: false,
+            no_clouds: false,
+            no_water: false,
         }
     }
 
@@ -245,6 +302,36 @@ mod tests {
             settings.far_radii,
             [DEFAULT_LOD0_RING_RADIUS, DEFAULT_FURTHEST_RING_RADIUS]
         );
+        assert!(settings.sun_lighting && settings.clouds && settings.water);
+        assert_eq!(settings.msaa_samples, 4, "4x MSAA by default");
+    }
+
+    /// Task 2.15's look switches: each `JBM_NO_*` flips exactly its own
+    /// field, and `JBM_MSAA` accepts 1 and 4 (anything else is 4).
+    #[test]
+    fn look_env_flags_map_to_settings() {
+        let base = || RenderSettings::from_flags(flags(), 0, ALL_LEVELS, 4);
+        let mut f = flags();
+        f.no_sun = true;
+        let settings = RenderSettings::from_flags(f, 0, ALL_LEVELS, 4);
+        assert_eq!(
+            settings,
+            RenderSettings {
+                sun_lighting: false,
+                ..base()
+            }
+        );
+        let mut f = flags();
+        f.no_clouds = true;
+        assert!(!RenderSettings::from_flags(f, 0, ALL_LEVELS, 4).clouds);
+        let mut f = flags();
+        f.no_water = true;
+        assert!(!RenderSettings::from_flags(f, 0, ALL_LEVELS, 4).water);
+        assert_eq!(msaa_from_env(Some("1")), 1);
+        assert_eq!(msaa_from_env(Some(" 4 ")), 4);
+        assert_eq!(msaa_from_env(Some("8")), 4, "unsupported counts fall back");
+        assert_eq!(msaa_from_env(None), 4);
+        assert_eq!(base().with_msaa(1).msaa_samples, 1);
     }
 
     #[test]

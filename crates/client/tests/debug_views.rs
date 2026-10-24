@@ -16,7 +16,7 @@ use jbm_client::camera::Camera;
 use jbm_client::gpu::Gpu;
 use jbm_client::lod::CubeKey;
 use jbm_client::mesh;
-use jbm_client::mesh::appearance::{BlockAppearance, builtin_textures};
+use jbm_client::mesh::appearance::BlockAppearance;
 use jbm_client::render::lines::LineVertex;
 use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
@@ -49,8 +49,7 @@ impl Ctx {
         let depth = DepthTarget::new(&gpu.device, SIZE, SIZE);
         let mut renderer = Renderer::new(&gpu, target.format());
         renderer.set_viewport(SIZE, SIZE);
-        let (layers, _) = builtin_textures();
-        let textures = BlockTextures::new(&gpu, &layers).expect("texture array");
+        let textures = BlockTextures::builtin(&gpu).expect("texture array");
         let terrain = TerrainPass::new(&gpu, target.format(), renderer.uniform_layout(), &textures);
         Ctx {
             gpu,

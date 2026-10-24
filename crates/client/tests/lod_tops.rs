@@ -14,10 +14,11 @@ use image::RgbaImage;
 use jbm_client::camera::Camera;
 use jbm_client::lod::{Coverage, CubeKey};
 use jbm_client::mesh::appearance::{BlockAppearance, builtin_textures};
-use jbm_client::mesh::face::{Direction, quad_corners, unpack};
+use jbm_client::mesh::face::{Direction, FaceFields, quad_corners, unpack};
 use jbm_client::mesh::{self, MeshInput, MeshOutput};
 use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
+use jbm_client::render::settings::RenderSettings;
 use jbm_client::render::terrain::TerrainPass;
 use jbm_client::render::texture_array::BlockTextures;
 use jbm_client::testing::holes::is_sentinel;
@@ -79,13 +80,28 @@ fn render(
     sky: ([f32; 4], [f32; 4], [f32; 4]),
 ) -> Option<RgbaImage> {
     let gpu = gpu_or_skip()?;
+    // 1× and no clouds (task 2.15): the silhouette row and the sentinel
+    // checks stay single-sample exact, and the sky above the horizon is
+    // the override gradient (plus the sun glow, which the cameras face
+    // away from).
+    let settings = RenderSettings {
+        msaa_samples: 1,
+        clouds: false,
+        ..RenderSettings::default()
+    };
     let target = OffscreenTarget::new(&gpu.device, SIZE, SIZE);
-    let depth = DepthTarget::new(&gpu.device, SIZE, SIZE);
-    let mut renderer = Renderer::new(&gpu, target.format());
+    let depth = DepthTarget::with_samples(&gpu.device, SIZE, SIZE, settings.msaa_samples);
+    let mut renderer = Renderer::with_settings(&gpu, target.format(), settings);
     renderer.set_viewport(SIZE, SIZE);
     let (layers, _) = builtin_textures();
     let textures = BlockTextures::new(&gpu, &layers).expect("texture array");
-    let mut terrain = TerrainPass::new(&gpu, target.format(), renderer.uniform_layout(), &textures);
+    let mut terrain = TerrainPass::with_settings(
+        &gpu,
+        target.format(),
+        renderer.uniform_layout(),
+        &textures,
+        &settings,
+    );
     let mut coverage = Coverage::default();
     let key = CubeKey {
         level: LEVEL,
@@ -129,24 +145,24 @@ fn a_partial_top_renders_at_its_exact_height() {
     let (cube, tops) = plateau(&blocks, |_, _| 3);
     let output = mesh_plateau(&appearance, cube, tops);
 
-    // The -Z wall's top edge, from the CPU mirror of the shader corners.
+    // The +Z wall's top edge (its highest face), from the CPU mirror of
+    // the shader corners.
+    let face_top = |f: &FaceFields| quad_corners(f, LEVEL).iter().map(|c| c[1]).max().unwrap();
     let wall = output
         .faces
         .iter()
         .map(|&f| unpack(f))
-        .find(|f| f.direction == Direction::NegZ)
-        .expect("a -Z wall");
-    let top_y = quad_corners(&wall, LEVEL)
-        .iter()
-        .map(|c| c[1])
-        .max()
-        .unwrap();
+        .filter(|f| f.direction == Direction::PosZ)
+        .max_by_key(face_top)
+        .expect("a +Z wall");
+    let top_y = face_top(&wall);
     assert_eq!(top_y, 15, "{wall:?}");
 
     // Eye below the top, facing the wall: the wall's top edge is the
-    // silhouette against an all-sentinel sky.
+    // silhouette against an all-sentinel sky. The eye looks toward -Z,
+    // away from the sun (task 2.15), so no sun glow tints that sky.
     let camera = Camera::looking_at(
-        DVec3::new(64.0, 5.0, -30.0),
+        DVec3::new(64.0, 5.0, 158.0),
         DVec3::new(64.0, 5.0, 64.0),
         FOV,
         1.0,
@@ -158,8 +174,8 @@ fn a_partial_top_renders_at_its_exact_height() {
     let silhouette = (0..SIZE)
         .find(|&row| !is_sentinel(image.get_pixel(column, row)))
         .expect("the wall is on screen") as f32;
-    let expected = project_row(&camera, DVec3::new(64.0, f64::from(top_y), 0.0));
-    let cell_top = project_row(&camera, DVec3::new(64.0, 16.0, 0.0));
+    let expected = project_row(&camera, DVec3::new(64.0, f64::from(top_y), 128.0));
+    let cell_top = project_row(&camera, DVec3::new(64.0, 16.0, 128.0));
     assert!(
         expected - cell_top > 4.0,
         "one block must span several pixels ({cell_top} vs {expected})"

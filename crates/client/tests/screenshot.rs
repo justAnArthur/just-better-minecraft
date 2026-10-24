@@ -116,8 +116,7 @@ fn render_scene(golden_name: &str, scene: &[(CubePos, Cube)], camera: &Camera) {
     let depth = DepthTarget::new(&gpu.device, 256, 256);
     let mut renderer = Renderer::new(&gpu, target.format());
     renderer.set_viewport(256, 256);
-    let (layers, _) = jbm_client::mesh::appearance::builtin_textures();
-    let textures = BlockTextures::new(&gpu, &layers).expect("texture array");
+    let textures = BlockTextures::builtin(&gpu).expect("texture array");
     let mut terrain = TerrainPass::new(&gpu, target.format(), renderer.uniform_layout(), &textures);
 
     let by_pos: HashMap<CubePos, Arc<Cube>> = scene

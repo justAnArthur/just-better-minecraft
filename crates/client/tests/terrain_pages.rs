@@ -7,7 +7,7 @@
 
 use glam::DVec3;
 use jbm_client::camera::Camera;
-use jbm_client::mesh::appearance::{BlockAppearance, builtin_textures};
+use jbm_client::mesh::appearance::BlockAppearance;
 use jbm_client::mesh::{self, MeshInput};
 use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
@@ -68,8 +68,7 @@ fn render_passes_identically(
     let depth = DepthTarget::new(&gpu.device, 256, 256);
     let mut renderer = Renderer::new(gpu, target.format());
     renderer.set_viewport(256, 256);
-    let (layers, _) = builtin_textures();
-    let textures = BlockTextures::new(gpu, &layers).expect("texture array");
+    let textures = BlockTextures::builtin(gpu).expect("texture array");
 
     churned.set_prefer_gpu_cull(path == TerrainPath::GpuCull);
     churned.set_force_cpu_cull(path == TerrainPath::CpuCull);
@@ -151,8 +150,7 @@ fn slot_reuse_after_churn_renders_like_a_fresh_pass() {
     let target = OffscreenTarget::new(&gpu.device, 256, 256);
     let mut renderer = Renderer::new(&gpu, target.format());
     renderer.set_viewport(256, 256);
-    let (layers, _) = builtin_textures();
-    let textures = BlockTextures::new(&gpu, &layers).expect("texture array");
+    let textures = BlockTextures::builtin(&gpu).expect("texture array");
     let mut terrain = TerrainPass::with_page_faces(
         &gpu,
         target.format(),

@@ -16,7 +16,7 @@ use glam::DVec3;
 use image::RgbaImage;
 use jbm_client::camera::Camera;
 use jbm_client::mesh;
-use jbm_client::mesh::appearance::{BlockAppearance, builtin_textures};
+use jbm_client::mesh::appearance::BlockAppearance;
 use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
 use jbm_client::render::terrain::{Frustum, TerrainPass, TerrainPath};
@@ -224,8 +224,7 @@ fn render_all_paths(
     let depth = DepthTarget::new(&gpu.device, 256, 256);
     let mut renderer = Renderer::new(gpu, target.format());
     renderer.set_viewport(256, 256);
-    let (layers, _) = builtin_textures();
-    let textures = BlockTextures::new(gpu, &layers).expect("texture array");
+    let textures = BlockTextures::builtin(gpu).expect("texture array");
     let mut terrain = TerrainPass::new(gpu, target.format(), renderer.uniform_layout(), &textures);
     for (pos, mesh) in meshes {
         terrain.upload(gpu, *pos, mesh);
@@ -392,8 +391,7 @@ fn crossing_the_direction_split_radius_pops_nothing() {
         4,
         "the default radius this test crosses"
     );
-    let (layers, _) = builtin_textures();
-    let textures = BlockTextures::new(&gpu, &layers).expect("texture array");
+    let textures = BlockTextures::builtin(&gpu).expect("texture array");
     let mut terrain = TerrainPass::new(&gpu, target.format(), renderer.uniform_layout(), &textures);
     for (pos, mesh) in &meshes {
         terrain.upload(&gpu, *pos, mesh);
@@ -478,8 +476,7 @@ fn nothing_pops_in_across_a_moving_camera() {
     let depth = DepthTarget::new(&gpu.device, 256, 256);
     let mut renderer = Renderer::new(&gpu, target.format());
     renderer.set_viewport(256, 256);
-    let (layers, _) = builtin_textures();
-    let textures = BlockTextures::new(&gpu, &layers).expect("texture array");
+    let textures = BlockTextures::builtin(&gpu).expect("texture array");
     // One pass object across every frame, so the two-phase state is real.
     let mut terrain = TerrainPass::new(&gpu, target.format(), renderer.uniform_layout(), &textures);
     for (pos, mesh) in &meshes {
@@ -540,8 +537,7 @@ fn cave_culling_hides_the_buried_world() {
     let depth = DepthTarget::new(&gpu.device, 256, 256);
     let mut renderer = Renderer::new(&gpu, target.format());
     renderer.set_viewport(256, 256);
-    let (layers, _) = builtin_textures();
-    let textures = BlockTextures::new(&gpu, &layers).expect("texture array");
+    let textures = BlockTextures::builtin(&gpu).expect("texture array");
     let mut terrain = TerrainPass::new(&gpu, target.format(), renderer.uniform_layout(), &textures);
     for (pos, mesh) in &meshes {
         terrain.upload(&gpu, *pos, mesh);
@@ -605,8 +601,7 @@ fn open_surface_view_stays_uncullled() {
     let depth = DepthTarget::new(&gpu.device, 256, 256);
     let mut renderer = Renderer::new(&gpu, target.format());
     renderer.set_viewport(256, 256);
-    let (layers, _) = builtin_textures();
-    let textures = BlockTextures::new(&gpu, &layers).expect("texture array");
+    let textures = BlockTextures::builtin(&gpu).expect("texture array");
     let mut terrain = TerrainPass::new(&gpu, target.format(), renderer.uniform_layout(), &textures);
     for (pos, mesh) in &meshes {
         terrain.upload(&gpu, *pos, mesh);
@@ -673,8 +668,7 @@ fn odd_resize_keeps_the_paths_identical() {
     let mut depth = DepthTarget::new(&gpu.device, 256, 256);
     let mut renderer = Renderer::new(&gpu, target.format());
     renderer.set_viewport(256, 256);
-    let (layers, _) = builtin_textures();
-    let textures = BlockTextures::new(&gpu, &layers).expect("texture array");
+    let textures = BlockTextures::builtin(&gpu).expect("texture array");
     let mut terrain = TerrainPass::new(&gpu, target.format(), renderer.uniform_layout(), &textures);
     for (pos, mesh) in &meshes {
         terrain.upload(&gpu, *pos, mesh);
@@ -725,8 +719,7 @@ fn terrain_spawn_stats_show_direction_skipping() {
     let depth = DepthTarget::new(&gpu.device, 256, 256);
     let mut renderer = Renderer::new(&gpu, target.format());
     renderer.set_viewport(256, 256);
-    let (layers, _) = builtin_textures();
-    let textures = BlockTextures::new(&gpu, &layers).expect("texture array");
+    let textures = BlockTextures::builtin(&gpu).expect("texture array");
     let mut terrain = TerrainPass::new(&gpu, target.format(), renderer.uniform_layout(), &textures);
     for (pos, mesh) in &meshes {
         terrain.upload(&gpu, *pos, mesh);

@@ -150,7 +150,8 @@ impl FlyClient {
             server_pos: None,
             server_flying: false,
             server_ack: 0,
-            rig: OffscreenRig::new(gpu, WIDTH, HEIGHT),
+            // 1×: the hole check's sentinel must stay exact (task 2.15).
+            rig: OffscreenRig::one_sample(gpu, WIDTH, HEIGHT),
         }
     }
 

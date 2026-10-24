@@ -75,8 +75,10 @@ coordinates and cfg-gated off under the crate's own `cube16` passthrough;
   `TerrainPass::draw`; `from_env()` is the one read of the `JBM_NO_FOG` /
   `JBM_LOD_TINT` / `JBM_GPU_CULL` / `JBM_NO_MDI` / `JBM_WIREFRAME` /
   `JBM_WIREFRAME_ONLY` / `JBM_CHUNK_BORDERS` / `JBM_EXPLODE` /
-  `JBM_LEVELS` / `JBM_FREEZE_CULL` / `JBM_DIRECTION_SPLIT` variables,
-  done by the app at startup (the F3 panel edits the same fields live).
+  `JBM_LEVELS` / `JBM_FREEZE_CULL` / `JBM_DIRECTION_SPLIT` /
+  `JBM_NO_SUN` / `JBM_NO_CLOUDS` / `JBM_NO_WATER` / `JBM_MSAA` variables,
+  done by the app at startup (the F3 panel edits the same fields live;
+  `msaa_samples` is fixed at startup).
 - `render::hiz::HizPyramid` — the hierarchical-Z depth pyramid the GPU
   cull tests occlusion against.
 - `render::suballoc::Suballocator` — the CPU-side free-list suballocator
@@ -431,15 +433,16 @@ invisible:
   far away, so coarse levels pull the corner AO factor toward fully
   open by a per-level factor (`AO_SOFTEN` = 1.0 / 0.6 / 0.45 / 0.3,
   clamped at the last entry). Level 0 keeps the exact factor, so
-  pre-2.9 LOD0 goldens stay bit-stable. Directional face shading stays
-  on every level.
+  pre-2.9 LOD0 goldens stay bit-stable. The lighting (task 2.15, below)
+  is the same on every level.
 - **Distance fog.** Every terrain fragment blends into the sky color
   along its own view ray with the ray's y clamped just above the
-  horizon (`max(dir.y, 1e-6)`): the same gradient the sky pass paints
-  behind it, so far rings dissolve into the sky with no visible band
-  and the outermost ring's edge is never visible. The factor is a
-  smoothstep over **35%..98% of the furthest ring radius** (98% keeps
-  the edge inside the fog). WGSL has no includes, so the gradient
+  horizon (`max(dir.y, 1e-6)`): the same gradient (and, since 2.15, the
+  same sun glow) the sky pass paints behind it, so far rings dissolve
+  into the sky with no visible band and the outermost ring's edge is
+  never visible. The factor is a smoothstep over **35%..98% of the
+  furthest ring radius** (98% keeps the edge inside the fog); task 2.15
+  combines it with the height haze (below) as the haze's hard end. WGSL has no includes, so the gradient
   lives once in `shaders/sky_gradient.wgsl` and pipeline creation
   concatenates that snippet ahead of both `sky.wgsl` and `terrain.wgsl`
   — the two can never drift.
@@ -471,6 +474,95 @@ invisible:
 Every draw path shares the one fragment shader, so cpu-cull, gpu-cull
 and fallback stay pixel-identical under the far look (the rings
 path-equality tests cover it).
+
+### The look: lighting, sky, water, haze, MSAA (task 2.15)
+
+The model is Minecraft with a tasteful shader pack or the Distant
+Horizons far view: warm sunlight, soft blue shadows, a sky with a sun
+and clouds, water that mirrors the sky, smooth edges, and distance
+fading into a soft haze.
+
+- **Lighting.** A fixed mid-morning sun (`SUN_ELEVATION_DEGREES` 40,
+  horizontal direction `SUN_AZIMUTH_XZ`, not axis-aligned so the four
+  block sides read differently; `sun_direction()`) and a hemisphere
+  ambient, all in `FrameUniforms` (`sun_dir`, `sun_color`,
+  `ambient_sky`, `ambient_ground`; constants in `renderer.rs`). Per
+  fragment, from the face direction (a flat varying) and the AO factor:
+  `albedo · (ambient(n) · ao + SUN_COLOR · max(dot(n, L), 0) · mix(1, ao,
+  SUN_AO))`, where `ambient(n)` blends ground to sky by `n.y` and leans
+  `AMBIENT_SUN_SIDE` toward faces turned to the sun's azimuth. A sunlit
+  top face is about the albedo (sky ambient plus `SUN_COLOR ·
+  sin(elevation)`, just under 1 so tops never wash out), sides turned
+  away from the sun sit near a quarter to a third of it, cooler blue. Every LOD level is lit the same; the per-level AO
+  softening stays; no shadow maps. The old `face_shade` table is gone:
+  with sun lighting off (`JBM_NO_SUN=1`, panel) the shader computes the
+  old flat shades (top 1.0, ±Z 0.8, ±X 0.6, bottom 0.5) from the normal.
+- **Sky** (`shaders/sky.wgsl`): the gradient, plus `sun_glow` (a wide
+  faint lobe and a tight corona, in `sky_gradient.wgsl` and shared with
+  the terrain haze), a soft-edged sun disk, and clouds: a 2D value-noise
+  fbm (5 octaves, 256-block cells) on a plane at `CLOUD_HEIGHT` y = 560,
+  self-shadowed toward the sun, silver-lined near it, fading into the
+  sky with distance and thinning toward the horizon. The noise is
+  periodic with `WRAP_PERIOD` (65536 blocks) and is read from
+  `camera_wrap` (the camera position reduced mod 65536 in f64), so it is
+  precise at any coordinate. Deterministic: the only other input is the
+  time uniform (`sun_dir.w`, cloud drift and ripples) — the app advances
+  it every frame (`Renderer::set_time`), tests leave it at 0. Clouds are
+  never drawn below the horizon (nor from above the plane), and the
+  glow fades out with the gradient's own ground blend, so a pixel fully
+  in the ground haze is exactly the ground color — the hole tests'
+  sentinel override stays exact (`clouds: false` / `JBM_NO_CLOUDS=1`).
+  The sky pass runs **after** the terrain (a clear pass resets color and
+  depth first): its fullscreen triangle sits at the far plane (depth 0.0)
+  with an `Equal` depth test, so only pixels no terrain covered are
+  shaded and the cloud noise is never paid for under the terrain (a cave
+  frame drops from ~0.8 ms to ~0.35 ms in `terrain_draw`).
+- **Water** stays an opaque block in the opaque pass. A per-layer
+  material buffer (terrain group binding 5, next to `layer_avg`;
+  `texture_array::builtin_materials`, keyed by layer name — never by a
+  layer number) marks the water layer; its fragments take
+  `water_color`: a deep blue base lit like any face, a Schlick Fresnel
+  blend toward the sky reflected about the surface normal (gradient
+  plus glow), a tight sun glint, and procedural normals — five short
+  ripples fading out over 24..220 blocks and a long, gentle swell fading
+  over 60..500 blocks, both whole numbers of cycles per `WRAP_PERIOD`.
+  Each wave also fades by the fragment's footprint on the water plane
+  (`max(|dpdx(rel.xz)|, |dpdy(rel.xz)|)`, so grazing views count the
+  foreshortened axis): full while 32 pixels span its wavelength, gone at
+  12 — mid-distance water calms into a glossy reflection instead of
+  aliasing into horizontal bands.
+  The same function shades water at every level from the world
+  position, so the LOD0/L1 seam cannot show. `water: false` /
+  `JBM_NO_WATER=1` draws the flat average color instead.
+- **Contour stripes.** The same material buffer leans `grass_side`'s far
+  color toward `grass_top` (`GRASS_SIDE_FAR_LEAN` 0.75) by the fade
+  factor on level 0 and fully on levels ≥ 1, so terraces seen far away
+  are thin dark-green lines rather than brown stripes; LOD0 and L1 agree
+  at the border (where the fade is 1).
+- **Haze.** Height-aware aerial perspective replacing the plain fog
+  blend: an exponential height fog (`HAZE_DENSITY` at `HAZE_BASE_Y` 63,
+  falling by e every `HAZE_SCALE_HEIGHT` 160 blocks) integrated in closed
+  form along the ray (extinction, with in-scatter = the sky along the
+  ray, sun glow included), so valleys are hazier than peaks and views
+  from altitude stay clear. It is combined with the fog smoothstep as
+  `1 − (1 − haze)(1 − end)`, so at `FOG_END_FRACTION` terrain still
+  equals the sky behind it; `set_fog(false)` turns both off. The LOD0
+  texture fade is unchanged.
+- **MSAA 4×** (`RenderSettings::msaa_samples`, `JBM_MSAA=1|4`, default
+  4, applied at startup and read-only in the panel). The renderer owns
+  a multisampled color target; terrain, sky, debug lines and the outline
+  draw into it with the (equally multisampled) `DepthTarget`, then an
+  empty pass resolves it into the frame target, and the overlay (and
+  egui after it) draw at 1×. The Hi-Z fill reads the multisampled depth
+  through `hiz_fill_ms.wgsl` and takes the **min over the samples**
+  (the farthest, in reverse-Z), so occlusion stays conservative. The
+  cutout discard is kept instead of alpha-to-coverage: leaves and glass
+  edges stay crisp and identical at 1× and 4× (only geometric edges are
+  smoothed). `DepthTarget::read_depth` needs a 1× target; `OffscreenRig::
+  one_sample` / `with_settings` build 1× rigs (`surface_windows`, the
+  sentinel hole tests and the tint test run at 1× so the exact sentinel
+  check keeps single-sample strictness). The three draw paths stay
+  pixel-identical at 4×.
 
 ### Level tint debug view (task 2.10)
 
@@ -711,11 +803,11 @@ hitches a frame.
 
 Terrain pipeline: depth `Greater` with reverse-Z, back-face culling,
 samples `BlockTextures` (nearest, linear mips, repeat addressing so
-merged faces tile per block), `discard` below alpha 0.5, directional
-shading (top 1.0, ±Z 0.8, ±X 0.6, bottom 0.5) times the AO factor
-(0.4/0.6/0.8/1.0). The far look (task 2.9, see above) replaces the
-texel with the layer average on level ≥ 1, fades level 0's texel into
-it with distance, and fogs every fragment toward the horizon sky color.
+merged faces tile per block), `discard` below alpha 0.5, the sun and
+hemisphere lighting with the AO factor (0.4/0.6/0.8/1.0; task 2.15,
+see above). The far look (task 2.9, see above) replaces the texel with
+the layer average on level ≥ 1, fades level 0's texel into it with
+distance, and hazes every fragment toward the sky color along its ray.
 
 ### App runtime
 
@@ -769,8 +861,10 @@ end convergence (and the client-world-lies correction path) is proven by
 The depth buffer is `Depth32Float` cleared to **0.0** with a **`Greater`**
 compare; the projection maps the near plane (0.05) to depth 1.0 and has an
 **infinite far plane** (depth → 0.0). Most precision sits near the camera,
-which Stage 2's kilometre view distances need. Every pipeline must draw
-with `Greater`, never `Less`, and never clear depth to 1.0.
+which Stage 2's kilometre view distances need. Every geometry pipeline
+must draw with `Greater`, never `Less`, and never clear depth to 1.0. The
+one exception is the sky (task 2.15): it draws after the terrain at depth
+0.0 with `Equal`, filling exactly the pixels still at the cleared depth.
 
 ### Camera-relative rendering
 
@@ -789,7 +883,9 @@ same golden, proving this works.
 `shaders/terrain.wgsl`. Every field is a `mat4x4f` or padded `vec4f`, so
 Rust and WGSL agree at 16-byte alignment with no hidden padding;
 `frame_uniforms_match_wgsl_layout` asserts offsets and total size
-(224 bytes). When adding a field, pad it to 16 bytes and update the test
+(304 bytes since task 2.15: `sun_dir` (w = time), `sun_color` (w = sun
+lighting on), `ambient_sky` (w = clouds on), `ambient_ground` (w =
+water shading on) and `camera_wrap` follow `viewport`). When adding a field, pad it to 16 bytes and update the test
 and all mirrors. The spare `viewport` field (x, y = target size in px)
 feeds the overlay's pixel→NDC math.
 
@@ -804,7 +900,20 @@ Linear-RGB constants in `renderer.rs`, converted to sRGB by the target:
 | `GROUND_HAZE_COLOR` | 0.34, 0.37, 0.43 | `#9ea4af` |
 
 Above the horizon the color rises from horizon pale to zenith blue with
-`pow(dir.y, 0.45)`; below it fades to ground haze over ~15°.
+`pow(dir.y, 0.45)`; below it fades to ground haze over ~15°. The sun
+glow, disk and clouds (task 2.15) are added on top; the lighting
+constants sit next to these:
+
+| Constant | Linear |
+| --- | --- |
+| `SUN_COLOR` | 1.00, 0.85, 0.62 |
+| `AMBIENT_SKY` | 0.32, 0.40, 0.54 |
+| `AMBIENT_GROUND` | 0.21, 0.20, 0.19 |
+
+The sun stands `SUN_ELEVATION_DEGREES` 36° up toward `SUN_AZIMUTH_XZ`
+(−0.80, 0.60): low enough that sunlit sides are brighter than tops and
+off the default view axes, so a hillside seen at yaw 0 shows a lit and
+a shadowed flank.
 
 ## Controls
 
@@ -872,7 +981,11 @@ its startup environment variable:
 | level tint | `JBM_LOD_TINT=1` / F4 | per-level color multiply (task 2.10) |
 | levels | `JBM_LEVELS=0,1,3` | the shown-level mask; a hidden level leaves a hole (enforced in the cull, both CPU and GPU) |
 | freeze culling | `JBM_FREEZE_CULL=1` | the cull keeps the frustum and position captured at switch-on (a `FreezeParams` uniform, binding 7, on the gpu path too — which also skips Hi-Z occlusion there, the pyramid holding the real view's depth); the frozen frustum draws as lines |
-| fog | `JBM_NO_FOG=1` | distance fog off |
+| fog | `JBM_NO_FOG=1` | distance fog and height haze off |
+| sun lighting | `JBM_NO_SUN=1` | off: the pre-2.15 flat per-direction shades |
+| clouds | `JBM_NO_CLOUDS=1` | the cloud layer off |
+| water shading | `JBM_NO_WATER=1` | off: water draws its flat average color |
+| MSAA (read-only) | `JBM_MSAA=1\|4` | the sample count, fixed at startup (default 4) |
 | direction split | `JBM_DIRECTION_SPLIT=<cubes>` | beyond this radius (default 4 cubes) a cube draws all its face directions in one command; 0 is one command everywhere |
 | prefer gpu cull / force cpu cull / force fallback | `JBM_GPU_CULL=1` / `JBM_NO_MDI=1` | the path flags are re-read from the settings every draw, so the panel switches paths live |
 
@@ -916,7 +1029,10 @@ pyramid with AO in the inner corners), `mesh_cube_border` (a building
 crossing the boundary between two cubes — no seam),
 `mesh_far_origin` (the `mesh_ao` scene ~10⁹ blocks out; matches the same
 `mesh_ao` golden, proving camera-relative rendering), and the task 2.6
-rings goldens `rings_close` / `rings_border12` / `rings_corner3`.
+rings goldens `rings_close` / `rings_border12` / `rings_corner3`
+(rendered at 1× by the sentinel test). Task 2.15 regenerated every
+golden that shows the sky or lit terrain; `triangle` and `sky_down`
+are unchanged.
 
 `tests/lod_rings.rs` (task 2.6) has no golden of its own for most
 cameras: it builds a synthetic heightfield's rings (levels 0..=3, level
@@ -936,12 +1052,22 @@ hides exactly the masked volume with fully masked cubes emitting no
 commands.
 
 `tests/far_look.rs` (task 2.9) has no goldens either: it asserts
-pixels directly. A single LOD1 cube's lit top face is the layer's flat
-average within ±1 LSB (times shade and AO); a long LOD0 strip keeps the
-textured look near, reaches the flat average far (±2 LSB), and every
-transition row matches the analytic smoothstep at its distance; with
-fog on, a fragment beyond the fog end equals the sky behind it (±1 LSB)
-while a near pixel is byte-identical with fog off. The border test in
+pixels directly. A single LOD1 cube's top face is the layer's flat
+average within ±1 LSB with sun lighting off, and the average times the
+up-facing light (`AMBIENT_SKY + SUN_COLOR · sin(elevation)`) with it on;
+a long LOD0 strip (lighting off) keeps the textured look near, reaches
+the flat average far (±2 LSB), and every transition row matches the
+analytic smoothstep at its distance; with fog on, a fragment beyond the
+fog end equals the sky behind it (±1 LSB) while a near pixel stays
+within 3 LSB of the fog-off render (the thin height haze); and the same
+wall seen level from near sea level is hazier than from 384 blocks up.
+
+`tests/look.rs` (task 2.15) asserts the rest of the look directly: the
+sun disk is brighter than the sky 20° away, clouds change no pixel
+below the horizon (and do show looking up), the sentinel override is
+exact below the horizon with the sun's glow toward it, grazing water is
+closer to the sky it reflects than water seen from above, and a
+flat-colored silhouette is pure at 1× but blended at 4×. The border test in
 `tests/lod_rings.rs` (`lod0_lod1_border_is_invisible_with_flat_colors`)
 checks 16×16 windows either side of the LOD0/LOD1 border for
 `zoom_border01` and `down_border01`: mean luminance within 3%, fog off.
