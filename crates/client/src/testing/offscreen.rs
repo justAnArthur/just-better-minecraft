@@ -4,9 +4,9 @@
 
 use crate::camera::Camera;
 use crate::gpu::Gpu;
-use crate::mesh::appearance::builtin_textures;
 use crate::render::offscreen::OffscreenTarget;
 use crate::render::renderer::{DepthTarget, FrameInputs, Renderer};
+use crate::render::settings::RenderSettings;
 use crate::render::terrain::TerrainPass;
 use crate::render::texture_array::BlockTextures;
 
@@ -23,14 +23,42 @@ pub struct OffscreenRig {
 
 impl OffscreenRig {
     /// Builds everything a frame needs at `width` x `height` with the
-    /// builtin block textures and default render settings.
+    /// builtin block textures and default render settings (4× MSAA).
     pub fn new(gpu: &Gpu, width: u32, height: u32) -> OffscreenRig {
+        OffscreenRig::with_settings(gpu, width, height, &RenderSettings::default())
+    }
+
+    /// As [`OffscreenRig::new`] at 1× MSAA: for `read_depth` and the
+    /// hole tests, whose exact sentinel check needs single-sample pixels
+    /// (at 4× a sliver hole resolves to a blend the check would miss).
+    pub fn one_sample(gpu: &Gpu, width: u32, height: u32) -> OffscreenRig {
+        let settings = RenderSettings {
+            msaa_samples: 1,
+            ..RenderSettings::default()
+        };
+        OffscreenRig::with_settings(gpu, width, height, &settings)
+    }
+
+    /// As [`OffscreenRig::new`] with explicit settings — the sample count
+    /// (`settings.msaa_samples`) is fixed here for the rig's lifetime;
+    /// `read_depth` needs a 1× rig.
+    pub fn with_settings(
+        gpu: &Gpu,
+        width: u32,
+        height: u32,
+        settings: &RenderSettings,
+    ) -> OffscreenRig {
         let target = OffscreenTarget::new(&gpu.device, width, height);
-        let depth = DepthTarget::new(&gpu.device, width, height);
-        let renderer = Renderer::new(gpu, target.format());
-        let (layers, _) = builtin_textures();
-        let textures = BlockTextures::new(gpu, &layers).expect("texture array");
-        let terrain = TerrainPass::new(gpu, target.format(), renderer.uniform_layout(), &textures);
+        let depth = DepthTarget::with_samples(&gpu.device, width, height, settings.msaa_samples);
+        let renderer = Renderer::with_settings(gpu, target.format(), *settings);
+        let textures = BlockTextures::builtin(gpu).expect("texture array");
+        let terrain = TerrainPass::with_settings(
+            gpu,
+            target.format(),
+            renderer.uniform_layout(),
+            &textures,
+            settings,
+        );
         OffscreenRig {
             renderer,
             terrain,
@@ -67,7 +95,8 @@ impl OffscreenRig {
     }
 
     /// The depth target's contents after the last render (reverse-Z:
-    /// bigger is nearer, 0.0 is the far plane / sky).
+    /// bigger is nearer, 0.0 is the far plane / sky). Needs a 1× rig
+    /// ([`OffscreenRig::with_settings`] with `msaa_samples` 1).
     pub fn read_depth(&self, gpu: &Gpu) -> Vec<f32> {
         self.depth.read_depth(gpu)
     }

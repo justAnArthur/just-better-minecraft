@@ -63,13 +63,17 @@ pub fn reduce_step(src: &[f32], src_w: u32, src_h: u32) -> (Vec<f32>, u32, u32) 
 impl HizPyramid {
     /// Builds a pyramid for a depth target of `width` x `height` and the
     /// bind group that copies the depth into mip 0. `depth_view` must be a
-    /// single-mip view of the depth texture.
+    /// single-mip view of the depth texture, which has `samples` samples
+    /// per pixel: a multisampled target (task 2.15's MSAA) fills mip 0
+    /// with the **min over its samples** — the farthest, since reverse-Z —
+    /// so the pyramid stays conservative at silhouette pixels.
     pub fn new(
         gpu: &Gpu,
         depth_view: &wgpu::TextureView,
         width: u32,
         height: u32,
         generation: u32,
+        samples: u32,
     ) -> HizPyramid {
         let device = &gpu.device;
 
@@ -135,8 +139,73 @@ impl HizPyramid {
                 cache: None,
             })
         };
-        let fill_pipeline = make_pipeline("fill_mip0");
         let reduce_pipeline = make_pipeline("reduce_mip");
+        // The fill reads the depth target: single-sample through the
+        // shared layout (hiz.wgsl's fill_mip0), multisampled through its
+        // own layout and module (hiz_fill_ms.wgsl), since the source
+        // binding's type differs.
+        let ms_fill_layout = (samples > 1).then(|| {
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("jbm hiz ms fill layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: true,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: wgpu::TextureFormat::R32Float,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            })
+        });
+        let fill_pipeline = match &ms_fill_layout {
+            None => make_pipeline("fill_mip0"),
+            Some(ms_layout) => {
+                let ms_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("jbm hiz ms fill"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        include_str!("shaders/hiz_fill_ms.wgsl").into(),
+                    ),
+                });
+                let ms_pipeline_layout =
+                    device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("jbm hiz ms fill layout"),
+                        bind_group_layouts: &[Some(ms_layout)],
+                        immediate_size: 0,
+                    });
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("jbm hiz ms fill pipeline"),
+                    layout: Some(&ms_pipeline_layout),
+                    module: &ms_shader,
+                    entry_point: Some("fill_mip0_ms"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                })
+            }
+        };
 
         // Full mip chain down to 1x1, floor-halved like wgpu's own mip
         // sizing (at most floor(log2(max(w, h))) + 1 levels, which the
@@ -177,7 +246,8 @@ impl HizPyramid {
             })
         };
 
-        let make_bind_group = |src: &wgpu::TextureView,
+        let make_bind_group = |layout: &wgpu::BindGroupLayout,
+                               src: &wgpu::TextureView,
                                dst: &wgpu::TextureView,
                                (sw, sh, dw, dh): (u32, u32, u32, u32)|
          -> wgpu::BindGroup {
@@ -191,7 +261,7 @@ impl HizPyramid {
                 .write_buffer(&uniform, 0, bytemuck::bytes_of(&[sw, sh, dw, dh]));
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("jbm hiz step"),
-                layout: &layout,
+                layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
@@ -209,13 +279,22 @@ impl HizPyramid {
             })
         };
 
-        let fill_bind_group =
-            make_bind_group(depth_view, &mip_view(0), (width, height, width, height));
+        let fill_bind_group = make_bind_group(
+            ms_fill_layout.as_ref().unwrap_or(&layout),
+            depth_view,
+            &mip_view(0),
+            (width, height, width, height),
+        );
         let reduce_bind_groups = (0..mip_count - 1)
             .map(|mip| {
                 let (sw, sh) = sizes[mip as usize];
                 let (dw, dh) = sizes[mip as usize + 1];
-                make_bind_group(&mip_view(mip), &mip_view(mip + 1), (sw, sh, dw, dh))
+                make_bind_group(
+                    &layout,
+                    &mip_view(mip),
+                    &mip_view(mip + 1),
+                    (sw, sh, dw, dh),
+                )
             })
             .collect();
 

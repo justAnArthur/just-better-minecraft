@@ -78,6 +78,7 @@ impl TerrainPass {
                 width,
                 height,
                 generation,
+                depth.samples(),
             ));
             self.rebuild_cull_bind_group();
         }

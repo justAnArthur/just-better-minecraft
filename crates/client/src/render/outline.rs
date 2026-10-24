@@ -43,6 +43,7 @@ impl OutlinePass {
         gpu: &Gpu,
         color_format: wgpu::TextureFormat,
         uniform_layout: &wgpu::BindGroupLayout,
+        samples: u32,
     ) -> OutlinePass {
         let device = &gpu.device;
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -92,7 +93,11 @@ impl OutlinePass {
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            // Drawn into the renderer's multisampled scene target (task 2.15).
+            multisample: wgpu::MultisampleState {
+                count: samples,
+                ..Default::default()
+            },
             multiview_mask: None,
             cache: None,
         });

@@ -150,6 +150,14 @@ fn views_section(ui: &mut egui::Ui, settings: &mut RenderSettings) {
         });
         ui.separator();
         ui.checkbox(&mut settings.fog, "distance fog");
+        ui.checkbox(&mut settings.sun_lighting, "sun lighting (JBM_NO_SUN)");
+        ui.checkbox(&mut settings.clouds, "clouds (JBM_NO_CLOUDS)");
+        ui.checkbox(&mut settings.water, "water shading (JBM_NO_WATER)");
+        // Read-only: the pipelines are built for the startup sample count.
+        ui.label(format!(
+            "MSAA {}x (JBM_MSAA, at startup)",
+            settings.msaa_samples
+        ));
         ui.checkbox(
             &mut settings.prefer_gpu_cull,
             "prefer gpu cull (JBM_GPU_CULL)",

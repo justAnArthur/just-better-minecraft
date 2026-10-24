@@ -127,6 +127,12 @@ pub struct TerrainPass {
     /// The per-layer average colors, kept for the shared bind group
     /// rebuilds.
     averages_buffer: wgpu::Buffer,
+    /// The per-layer material table (task 2.15), kept likewise.
+    materials_buffer: wgpu::Buffer,
+    /// The MSAA sample count the pipeline was built for (task 2.15); the
+    /// depth target must match, and the Hi-Z fill takes the min over its
+    /// samples.
+    msaa_samples: u32,
     pages: Vec<FacePage>,
     /// Faces per page (every page is the same size).
     page_faces: u32,
@@ -762,6 +768,11 @@ impl TerrainPass {
             self.force_cpu_cull = settings.force_cpu_cull;
             self.force_fallback = settings.force_fallback;
         }
+        assert_eq!(
+            depth.samples(),
+            self.msaa_samples,
+            "the depth target's sample count must match the terrain pipeline's"
+        );
         self.update_frozen(gpu, camera, settings);
         match self.active_path() {
             TerrainPath::GpuCull => {

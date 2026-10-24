@@ -141,6 +141,17 @@ impl TerrainPass {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    // Per-layer materials (task 2.15: water, far-side lean).
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -184,6 +195,10 @@ impl TerrainPass {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: textures.averages_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: textures.materials_buffer().as_entire_binding(),
                 },
             ],
         });
@@ -240,7 +255,14 @@ impl TerrainPass {
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            // The renderer's MSAA count (task 2.15). Cutout layers keep
+            // the alpha-test discard rather than alpha-to-coverage: the
+            // builtin cutout texels are exactly 0 or 255, so the discard
+            // is the same at 1× and 4× and keeps texel edges crisp.
+            multisample: wgpu::MultisampleState {
+                count: settings.msaa_samples,
+                ..Default::default()
+            },
             multiview_mask: None,
             cache: None,
         });
@@ -466,6 +488,8 @@ impl TerrainPass {
             // The per-layer average colors, kept for the shared bind group
             // rebuilds.
             averages_buffer: textures.averages_buffer().clone(),
+            materials_buffer: textures.materials_buffer().clone(),
+            msaa_samples: settings.msaa_samples,
             pages: Vec::new(),
             page_faces,
             book: MeshBookkeeping::default(),
@@ -614,6 +638,10 @@ impl TerrainPass {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: self.averages_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.materials_buffer.as_entire_binding(),
                 },
             ],
         });

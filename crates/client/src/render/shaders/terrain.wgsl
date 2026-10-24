@@ -9,7 +9,8 @@
 //   0: shared frame uniforms (same layout as sky.wgsl)
 //   1: the face page's storage buffer (array<vec2u>, one vec2 per face)
 //   2: shared terrain resources: cube meta, the terrain-only uniform,
-//      textures, sampler, per-layer average colors (task 2.9)
+//      textures, sampler, per-layer average colors (task 2.9), per-layer
+//      materials (task 2.15)
 //
 // Each draw covers one cube and one face direction: vertex_count faces * 6
 // vertices, one instance, with first_vertex = (page range start + direction
@@ -36,6 +37,12 @@ struct FrameUniforms {
     zenith_color: vec4f,
     ground_color: vec4f,
     viewport: vec4f,
+    // Task 2.15 (see FrameUniforms in render/renderer.rs).
+    sun_dir: vec4f,        // xyz toward the sun, w = time (s)
+    sun_color: vec4f,      // rgb sun radiance, w = sun lighting on
+    ambient_sky: vec4f,    // rgb sky ambient, w = clouds on
+    ambient_ground: vec4f, // rgb ground bounce, w = water shading on
+    camera_wrap: vec4f,    // xyz camera position mod WRAP_PERIOD
 };
 
 // Mirrored by `CubeMeta` in render/chunks.rs (80 bytes, 16-aligned; layout
@@ -78,6 +85,19 @@ struct TerrainUniforms {
 // One vec4f per texture layer: the alpha-weighted linear average color
 // (task 2.9), computed by BlockTextures at load.
 @group(2) @binding(4) var<storage, read> layer_avg: array<vec4f>;
+
+// Per-layer material (task 2.15), mirrored by `GpuLayerMaterial` in
+// render/texture_array.rs (32 bytes; layout test there). Water and the
+// far-side lean are decided per layer here, never by layer number.
+struct LayerMaterial {
+    // x = water (1.0) or not; y = the far-side lean strength (0..1);
+    // z, w spare.
+    flags: vec4f,
+    // rgb = the linear color this layer's flat far color leans toward
+    // (for grass_side: grass_top's average); w spare.
+    far_side: vec4f,
+};
+@group(2) @binding(5) var<storage, read> layer_material: array<LayerMaterial>;
 
 // The one origin formula, scaled by the cube's LOD level and shared by
 // this shader, cull.wgsl and `cube_origin` in render/chunks.rs:
@@ -129,10 +149,6 @@ fn v_axes() -> array<vec3i, 6> {
     );
 }
 
-// Directional shading per face: top 1.0, +/-Z 0.8, +/-X 0.6, bottom 0.5.
-fn face_shade() -> array<f32, 6> {
-    return array<f32, 6>(0.6, 0.6, 1.0, 0.5, 0.8, 0.8);
-}
 
 // ---------------------------------------------------------------------------
 // Task 2.9: the far look — flat material colors and distance fog.
@@ -148,12 +164,13 @@ fn face_shade() -> array<f32, 6> {
 //     match. The cutout discard still applies while fade < 1, i.e. while
 //     any of the texture still shows.
 //
-// Distance fog then blends every terrain fragment into the sky color
-// along its view ray at the horizon (sky_gradient below, y clamped just
-// above 0): a smoothstep from FOG_START_FRACTION to FOG_END_FRACTION of
-// the furthest ring radius (terrain.far.y), reaching 1 just inside the
-// outermost ring so its edge is never visible. terrain.far.z switches the
-// fog off entirely (Renderer::set_fog / JBM_NO_FOG; the fade stays).
+// The haze (task 2.15, replacing 2.9's plain distance fog) then blends
+// every terrain fragment toward the sky along its view ray — see the
+// haze block below. Its hard end is a smoothstep from FOG_START_FRACTION
+// to FOG_END_FRACTION of the furthest ring radius (terrain.far.y),
+// reaching 1 just inside the outermost ring so its edge is never visible.
+// terrain.far.z switches it off entirely (Renderer::set_fog / JBM_NO_FOG;
+// the fade stays).
 //
 // The fractions are mirrored by the FADE_* / FOG_* constants in
 // render/chunks.rs (tests compute expected values from them) — keep the
@@ -187,11 +204,18 @@ fn fog_factor(dist: f32) -> f32 {
 // comment above). `tex` is the already-sampled texture (the sample itself
 // must stay in uniform control flow).
 fn far_color(tex: vec4f, layer: u32, dist: f32, level: u32) -> vec3f {
-    let avg = layer_avg[layer].rgb;
+    // The far-side lean (task 2.15): a layer whose top band differs from
+    // its body (grass_side) leans its flat color toward the band's
+    // material by the fade, so mid-distance terrace sides read as shaded
+    // grass, not brown contour stripes. Level >= 1 is fully faded, so
+    // the LOD0/L1 border still matches exactly.
+    let material = layer_material[layer];
+    let f = select(fade(dist), 1.0, level >= 1u);
+    let avg = mix(layer_avg[layer].rgb, material.far_side.rgb, material.flags.y * f);
     if (level >= 1u) {
         return avg;
     }
-    return mix(tex.rgb, avg, fade(dist));
+    return mix(tex.rgb, avg, f);
 }
 
 // AO softening per LOD level (task 2.9): AO contrast scales with cell
@@ -233,9 +257,10 @@ struct VsOut {
     // UV in whole-texture tiles: one tile per block.
     @location(0) uv: vec2f,
     @location(1) @interpolate(flat) layer: u32,
-    // Directional shade times the corner's (level-softened) AO factor,
-    // interpolated.
-    @location(2) shade: f32,
+    // The corner's (level-softened) AO factor, interpolated (task 2.15:
+    // the fragment shader lights with it; it used to arrive premultiplied
+    // by a fixed per-direction shade).
+    @location(2) ao: f32,
     // The camera-relative position (task 2.9): its length is the fragment
     // distance the fade and fog smoothsteps run on. Interpolation is
     // exact for positions (affine in clip space via perspective-correct
@@ -248,6 +273,8 @@ struct VsOut {
     // view draws a fragment as edge where the smallest one is within a
     // pixel or so of zero, measured in screen space (fwidth).
     @location(5) bary: vec3f,
+    // The face direction (task 2.15), flat: the fragment shader's normal.
+    @location(6) @interpolate(flat) dir: u32,
 };
 
 @vertex
@@ -352,7 +379,8 @@ fn vs_main(
         out.pos = vec4f(0.0, 0.0, 0.0, 1.0);
         out.uv = vec2f(0.0);
         out.layer = layer;
-        out.shade = 0.0;
+        out.ao = 0.0;
+        out.dir = 0u;
         out.rel = vec3f(0.0);
         out.level = 0u;
         out.bary = vec3f(1.0);
@@ -367,7 +395,8 @@ fn vs_main(
     out.pos = u.view_proj * vec4f(relative_expanded, 1.0);
     out.uv = uv;
     out.layer = layer;
-    out.shade = face_shade()[direction] * ao;
+    out.ao = ao;
+    out.dir = direction;
     out.rel = relative_expanded;
     out.level = level;
     out.bary = array<vec3f, 3>(
@@ -387,6 +416,170 @@ fn wireframe_edge(in: VsOut) -> f32 {
     let pixels = in.bary / max(fwidth(in.bary), vec3f(1e-6));
     let nearest = min(pixels.x, min(pixels.y, pixels.z));
     return 1.0 - smoothstep(WIRE_PIXELS - 0.5, WIRE_PIXELS + 0.5, nearest);
+}
+
+// ---------------------------------------------------------------------------
+// Task 2.15: sun and sky light, water, and the haze.
+//
+// Lighting. A fixed sun (u.sun_dir, u.sun_color) and a hemisphere ambient
+// (u.ambient_sky from above, u.ambient_ground from below, blended by the
+// normal's y). The sky is brighter on the sun's side, so the ambient
+// leans by AMBIENT_SUN_SIDE toward faces turned to the sun's azimuth —
+// with the sun off-axis that gives all four sides of a block their own
+// value even in shadow. Per fragment:
+//   albedo * (ambient(n) * ao + sun * max(dot(n, L), 0) * mix(1, ao, SUN_AO))
+// where n is the face normal and ao the (level-softened) corner factor:
+// AO darkens the ambient fully and the direct sun by SUN_AO. Every level
+// lights the same way, so LOD0 and L1+ match at the border. With
+// u.sun_color.w == 0 (lighting off) the pre-2.15 flat look returns: the
+// fixed per-direction multipliers (top 1.0, +/-Z 0.8, +/-X 0.6, bottom
+// 0.5) times AO, as a formula of the normal.
+const AMBIENT_SUN_SIDE: f32 = 0.10;
+const SUN_AO: f32 = 0.5;
+
+fn face_normal(dir: u32) -> vec3f {
+    return vec3f(normals()[dir]);
+}
+
+fn ambient(n: vec3f) -> vec3f {
+    let hemi = mix(u.ambient_ground.rgb, u.ambient_sky.rgb, 0.5 + 0.5 * n.y);
+    let sun_side = normalize(u.sun_dir.xz + vec2f(1e-4, 0.0));
+    return hemi * (1.0 + AMBIENT_SUN_SIDE * dot(n.xz, sun_side));
+}
+
+fn lighting(n: vec3f, ao: f32) -> vec3f {
+    if (u.sun_color.w < 0.5) {
+        let up_down = select(0.5, 1.0, n.y > 0.0);
+        return vec3f(dot(abs(n), vec3f(0.6, up_down, 0.8)) * ao);
+    }
+    let direct = max(dot(n, u.sun_dir.xyz), 0.0);
+    return ambient(n) * ao + u.sun_color.rgb * direct * mix(1.0, ao, SUN_AO);
+}
+
+// The sky seen along `dir` as the terrain shading knows it: the shared
+// gradient plus the sun's glow (no disk, no clouds — the haze meets the
+// sky at and just above the horizon, where clouds have thinned to
+// nothing). y is clamped just above the horizon: fogged terrain meets
+// the horizon color the sky shows at the horizon line, and reflections
+// never look below it.
+fn sky_along(dir: vec3f) -> vec3f {
+    let d = vec3f(dir.x, max(dir.y, FOG_DIR_MIN_Y), dir.z);
+    return sky_gradient(d, u.horizon_color.rgb, u.zenith_color.rgb, u.ground_color.rgb)
+        + sun_glow(d, u.sun_dir.xyz, u.sun_color.rgb);
+}
+
+// Water (task 2.15). Still an opaque block in the opaque pass; the
+// fragment shader makes it read as water:
+//   - a deep-water base color, lit like any face;
+//   - a Schlick Fresnel blend toward the sky reflected about the surface
+//     normal (sky_along: the shared gradient and sun glow), so water
+//     mirrors the sky at grazing angles and shows its depth looking down;
+//   - a sun glint (a tight specular lobe around the reflected sun);
+//   - procedural ripple normals on up-facing faces: a few sine waves over
+//     the world position (camera_wrap + rel; every wave vector is a
+//     whole number of cycles per WRAP_PERIOD, so the pattern tiles the
+//     wrap exactly), animated by the time uniform (0 in tests). Short
+//     ripples fade out with distance (RIPPLE_FADE_*) and a long, gentle
+//     swell further out (SWELL_FADE_*), before either could alias, so
+//     far water is a calm mirror. The same function shades water at every
+//     level, from the same world position, so the LOD0/L1 seam cannot
+//     show.
+const WATER_DEEP: vec3f = vec3f(0.018, 0.080, 0.20);
+const WATER_F0: f32 = 0.035;
+const WATER_REFLECT_MAX: f32 = 0.85;
+const WATER_GLINT: f32 = 2.2;
+const WATER_GLINT_POWER: f32 = 600.0;
+const RIPPLE_STRENGTH: f32 = 0.06;
+const RIPPLE_FADE_START: f32 = 24.0;
+const RIPPLE_FADE_END: f32 = 220.0;
+// The swell: three long, gentle waves (~45..64 blocks) that keep the
+// open water from reading as a flat plate where the ripples have faded;
+// gone before they would alias (SWELL_FADE_*).
+const SWELL_STRENGTH: f32 = 0.028;
+const SWELL_FADE_START: f32 = 160.0;
+const SWELL_FADE_END: f32 = 1400.0;
+
+// One ripple wave's slope: the gradient direction of
+// sin(2*pi*(k . p / WRAP + speed * t)) scaled to unit steepness (every
+// wave as steep as the others, whatever its length). k is in whole cycles
+// per WRAP_PERIOD (65536 blocks); the phase is reduced with fract before
+// the cos, so large k . p stays precise.
+fn ripple_slope(p: vec2f, k: vec2f, speed: f32) -> vec2f {
+    let phase = fract(dot(k, p) / 65536.0 + speed * u.sun_dir.w);
+    return cos(phase * 6.2831853) * normalize(k);
+}
+
+fn water_normal(n: vec3f, rel: vec3f, dist: f32) -> vec3f {
+    if (n.y < 0.5) {
+        return n;
+    }
+    let ripple = RIPPLE_STRENGTH * (1.0 - smoothstep(RIPPLE_FADE_START, RIPPLE_FADE_END, dist));
+    let swell = SWELL_STRENGTH * (1.0 - smoothstep(SWELL_FADE_START, SWELL_FADE_END, dist));
+    if (ripple + swell <= 0.0) {
+        return n;
+    }
+    // camera_wrap is already reduced mod WRAP_PERIOD and rel is small
+    // where the waves show, so p stays precise.
+    let p = u.camera_wrap.xz + rel.xz;
+    var slope = vec2f(0.0);
+    if (ripple > 0.0) {
+        // Five ripples, wavelengths ~3.6..9.6 blocks, in five directions.
+        var r = ripple_slope(p, vec2f(6400.0, 2368.0), 0.11);
+        r += ripple_slope(p, vec2f(-3904.0, 9600.0), 0.15);
+        r += ripple_slope(p, vec2f(12160.0, -6080.0), 0.19);
+        r += ripple_slope(p, vec2f(2368.0, 17920.0), 0.23);
+        r += ripple_slope(p, vec2f(-15040.0, -9024.0), 0.17);
+        slope += r * ripple;
+    }
+    var w = ripple_slope(p, vec2f(896.0, 512.0), 0.021);
+    w += ripple_slope(p, vec2f(-640.0, 1088.0), 0.027);
+    w += ripple_slope(p, vec2f(1408.0, -320.0), 0.033);
+    slope += w * swell;
+    return normalize(vec3f(-slope.x, 1.0, -slope.y));
+}
+
+fn water_color(n_face: vec3f, rel: vec3f, dist: f32, ao: f32) -> vec3f {
+    let n = water_normal(n_face, rel, dist);
+    let view = -rel / dist; // toward the eye
+    let cos_v = clamp(dot(n, view), 0.0, 1.0);
+    let fresnel = WATER_F0 + (1.0 - WATER_F0) * pow(1.0 - cos_v, 5.0);
+    let r = reflect(-view, n);
+    let reflected = sky_along(r);
+    let deep = WATER_DEEP * lighting(n_face, ao);
+    var color = mix(deep, reflected, min(fresnel, WATER_REFLECT_MAX));
+    let glint = pow(max(dot(r, u.sun_dir.xyz), 0.0), WATER_GLINT_POWER);
+    color += u.sun_color.rgb * glint * WATER_GLINT * select(0.0, 1.0, r.y > 0.0);
+    return color;
+}
+
+// The haze: height-aware aerial perspective (task 2.15). Light from the
+// fragment is attenuated (extinction) and replaced by sky light scattered
+// in along the ray (in-scatter: sky_along, so the sun's glow shows in the
+// sun's direction), in proportion to the ray's optical depth through an
+// exponential height fog: density HAZE_DENSITY at HAZE_BASE_Y (about sea
+// level), falling by e every HAZE_SCALE_HEIGHT blocks up — thick in
+// valleys, thin from altitude. The optical depth of a straight ray from
+// height y0 rising dy over its length d integrates in closed form:
+//   tau = HAZE_DENSITY * exp(-(y0 - base) / H) * d * (1 - exp(-dy / H)) / (dy / H)
+// The haze amount is 1 - exp(-tau), combined with the hard end (the
+// FOG_* smoothstep of the furthest ring radius) as 1 - (1 - h)(1 - end),
+// so the outermost ring always vanishes into the sky behind it.
+const HAZE_DENSITY: f32 = 1.6e-4;
+const HAZE_BASE_Y: f32 = 63.0;
+const HAZE_SCALE_HEIGHT: f32 = 160.0;
+
+fn haze_amount(rel: vec3f, dist: f32) -> f32 {
+    let camera_y = u.camera_pos_hi.y + u.camera_pos_lo.y;
+    let h0 = clamp((camera_y - HAZE_BASE_Y) / HAZE_SCALE_HEIGHT, -2.0, 30.0);
+    let k = clamp(rel.y / HAZE_SCALE_HEIGHT, -30.0, 30.0);
+    var integral = 1.0;
+    if (abs(k) > 1e-3) {
+        integral = (1.0 - exp(-k)) / k;
+    }
+    let tau = HAZE_DENSITY * exp(-h0) * dist * integral;
+    let haze = 1.0 - exp(-tau);
+    let end = fog_factor(dist);
+    return (1.0 - (1.0 - haze) * (1.0 - end)) * terrain.far.z;
 }
 
 @fragment
@@ -409,13 +602,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     // far_color drops its value exactly (mix(x, y, 1.0) == y).
     let tex = textureSample(block_textures, block_sampler, in.uv, in.layer);
     let dist = length(in.rel);
-    var base = far_color(tex, in.layer, dist, in.level);
-    // Level tint (task 2.10): the debug view that shows which level draws
-    // where, before shade and fog. One uniform flag, shared by every draw
-    // path (they share this fragment shader).
-    if (terrain.tint.x > 0.5) {
-        base = base * lod_tint(in.level);
-    }
     // Cutout: glass, leaves and holes in textures discard below 0.5 —
     // only while any texture still shows (level 0, not fully faded; a LOD
     // cell is solid by the downsampling rule). The alpha test leads so
@@ -423,23 +609,25 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     if (tex.a < 0.5 && in.level == 0u && fade(dist) < 1.0) {
         discard;
     }
-    var color = base * in.shade;
-    // Distance fog (task 2.9): blend into the sky color along this
-    // fragment's view ray at the horizon — the same gradient the sky pass
-    // paints behind the terrain — so the far rings dissolve into it with
-    // no visible band. See the far-look block comment above. The
+    let n = face_normal(in.dir);
+    var color: vec3f;
+    if (layer_material[in.layer].flags.x > 0.5 && u.ambient_ground.w > 0.5) {
+        color = water_color(n, in.rel, dist, in.ao);
+    } else {
+        color = far_color(tex, in.layer, dist, in.level) * lighting(n, in.ao);
+    }
+    // Level tint (task 2.10): the debug view that shows which level draws
+    // where, before fog. One uniform flag, shared by every draw path
+    // (they share this fragment shader).
+    if (terrain.tint.x > 0.5) {
+        color = color * lod_tint(in.level);
+    }
+    // The haze (see above): toward the sky along this fragment's ray. The
     // direction reuses the already-computed distance instead of a second
     // length() (normalize).
-    let f = fog_factor(dist);
-    if (f > 0.0) {
-        let dir = in.rel / dist;
-        let fog_color = sky_gradient(
-            vec3f(dir.x, max(dir.y, FOG_DIR_MIN_Y), dir.z),
-            u.horizon_color.rgb,
-            u.zenith_color.rgb,
-            u.ground_color.rgb,
-        );
-        color = mix(color, fog_color, f);
+    let h = haze_amount(in.rel, dist);
+    if (h > 0.0) {
+        color = mix(color, sky_along(in.rel / dist), h);
     }
     // Wireframe (task 2.12): dark lines over the shaded terrain, drawn
     // last so they read through fog.

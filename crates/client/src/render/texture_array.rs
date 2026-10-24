@@ -1,7 +1,8 @@
 //! The block texture array: one `D2Array` sRGB texture with CPU-generated
-//! mipmaps, plus generated placeholder layers. Nothing samples it yet; the
-//! Stage 1 mesher (task 1.4) will.
+//! mipmaps, plus generated placeholder layers, the per-layer average
+//! colors (task 2.9) and the per-layer material table (task 2.15).
 
+use bytemuck::{Pod, Zeroable};
 use image::{Rgba, RgbaImage};
 
 use crate::gpu::Gpu;
@@ -43,10 +44,91 @@ impl std::fmt::Display for TextureError {
 
 impl std::error::Error for TextureError {}
 
+/// Per-layer material properties (task 2.15), the terrain shader's way to
+/// tell layers apart without hard-coding layer numbers.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LayerMaterial {
+    /// Water: the fragment shader draws Fresnel sky reflection, sun glint
+    /// and ripples instead of the texture.
+    pub water: bool,
+    /// The far-side lean `(layer, strength)`: this layer's flat far color
+    /// (the LOD0 fade and every LOD level) leans toward `layer`'s average
+    /// by `strength` (0..=1) times the fade. For layers whose top band
+    /// differs from the body — grass_side leans toward grass_top — so
+    /// distant terrace sides do not read as brown contour stripes.
+    pub far_side: Option<(u16, f32)>,
+}
+
+/// The material table of the builtin layers, by layer name: water is
+/// water, grass_side leans toward grass_top far away. Unknown names get
+/// the plain default.
+pub fn builtin_materials(names: &[&str]) -> Vec<LayerMaterial> {
+    let layer_of = |wanted: &str| {
+        names
+            .iter()
+            .position(|&name| name == wanted)
+            .map(|i| i as u16)
+    };
+    names
+        .iter()
+        .map(|&name| match name {
+            "water" => LayerMaterial {
+                water: true,
+                far_side: None,
+            },
+            "grass_side" => LayerMaterial {
+                water: false,
+                far_side: layer_of("grass_top").map(|top| (top, GRASS_SIDE_FAR_LEAN)),
+            },
+            _ => LayerMaterial::default(),
+        })
+        .collect()
+}
+
+/// How far grass_side's flat far color leans toward grass_top (task 2.15
+/// E): most of the way, so terrace sides read as darker grass (the
+/// lighting still separates them) instead of dirt stripes.
+pub const GRASS_SIDE_FAR_LEAN: f32 = 0.75;
+
+/// The GPU image of one [`LayerMaterial`] (terrain group 2, binding 5;
+/// mirrored as `LayerMaterial` in shaders/terrain.wgsl — the layout test
+/// pins it). 32 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable, PartialEq)]
+pub struct GpuLayerMaterial {
+    /// x = water (1.0) or not (0.0); y = the far-side lean strength; z, w
+    /// spare.
+    pub flags: [f32; 4],
+    /// rgb = the linear color the far side leans toward (the target
+    /// layer's average); w spare.
+    pub far_side: [f32; 4],
+}
+
+/// The GPU material table from the specs and the layer averages; layers
+/// past the end of `materials` get the default.
+fn gpu_materials(materials: &[LayerMaterial], averages: &[[f32; 4]]) -> Vec<GpuLayerMaterial> {
+    (0..averages.len())
+        .map(|layer| {
+            let material = materials.get(layer).copied().unwrap_or_default();
+            let (color, strength) = match material.far_side {
+                Some((target, strength)) if (target as usize) < averages.len() => {
+                    (averages[target as usize], strength.clamp(0.0, 1.0))
+                }
+                _ => (averages[layer], 0.0),
+            };
+            GpuLayerMaterial {
+                flags: [if material.water { 1.0 } else { 0.0 }, strength, 0.0, 0.0],
+                far_side: [color[0], color[1], color[2], 0.0],
+            }
+        })
+        .collect()
+}
+
 /// A block texture array: all layers one square power-of-two size, full
 /// mip chain generated on the CPU, nearest filtering with linear mips.
 /// Also carries each layer's average color (task 2.9's far look) as a CPU
-/// table and a storage buffer the terrain pass binds for flat far colors.
+/// table and a storage buffer the terrain pass binds for flat far colors,
+/// and the per-layer material table (task 2.15) as a second buffer.
 pub struct BlockTextures {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
@@ -57,13 +139,34 @@ pub struct BlockTextures {
     /// The same averages as a storage buffer (one vec4f per layer), bound
     /// by the terrain pass in group 2.
     averages_buffer: wgpu::Buffer,
+    /// The per-layer material table (task 2.15), CPU mirror and buffer.
+    materials: Vec<GpuLayerMaterial>,
+    materials_buffer: wgpu::Buffer,
 }
 
 impl BlockTextures {
-    /// Uploads `layers` (all the same square power-of-two size) as a mip
-    /// chain. Mipmaps are a CPU 2x2 box filter in linear space. Errors
-    /// instead of panicking on bad input or adapter limits.
+    /// The builtin placeholder layers with their material table — what
+    /// the app and every scene test draw with.
+    pub fn builtin(gpu: &Gpu) -> Result<BlockTextures, TextureError> {
+        let (layers, names) = crate::mesh::appearance::builtin_textures();
+        BlockTextures::with_materials(gpu, &layers, &builtin_materials(&names))
+    }
+
+    /// Uploads `layers` with every layer's material at the default (no
+    /// water, no far-side lean). See [`BlockTextures::with_materials`].
     pub fn new(gpu: &Gpu, layers: &[RgbaImage]) -> Result<BlockTextures, TextureError> {
+        BlockTextures::with_materials(gpu, layers, &[])
+    }
+
+    /// Uploads `layers` (all the same square power-of-two size) as a mip
+    /// chain, with `materials[i]` describing layer `i` (missing entries
+    /// default). Mipmaps are a CPU 2x2 box filter in linear space. Errors
+    /// instead of panicking on bad input or adapter limits.
+    pub fn with_materials(
+        gpu: &Gpu,
+        layers: &[RgbaImage],
+        materials: &[LayerMaterial],
+    ) -> Result<BlockTextures, TextureError> {
         let first = layers
             .first()
             .map(|l| l.dimensions())
@@ -153,6 +256,15 @@ impl BlockTextures {
         });
         gpu.queue
             .write_buffer(&averages_buffer, 0, bytemuck::cast_slice(&averages));
+        let materials = gpu_materials(materials, &averages);
+        let materials_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("jbm layer materials"),
+            size: (count as u64) * std::mem::size_of::<GpuLayerMaterial>() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        gpu.queue
+            .write_buffer(&materials_buffer, 0, bytemuck::cast_slice(&materials));
         Ok(BlockTextures {
             texture,
             view,
@@ -160,7 +272,21 @@ impl BlockTextures {
             layers: count,
             averages,
             averages_buffer,
+            materials,
+            materials_buffer,
         })
+    }
+
+    /// The per-layer GPU material table (task 2.15) — the CPU mirror of
+    /// the materials buffer, for tests.
+    pub fn materials(&self) -> &[GpuLayerMaterial] {
+        &self.materials
+    }
+
+    /// The material table as a storage buffer (one `GpuLayerMaterial`
+    /// per layer), bound by the terrain pass in group 2 (binding 5).
+    pub fn materials_buffer(&self) -> &wgpu::Buffer {
+        &self.materials_buffer
     }
 
     pub fn view(&self) -> &wgpu::TextureView {
@@ -659,5 +785,40 @@ mod tests {
             leaves[1] > 0.05,
             "cutout holes must not blacken: {leaves:?}"
         );
+    }
+
+    /// The material table's GPU layout matches the WGSL struct
+    /// (vec4f + vec4f, 32 bytes), and the builtin table marks exactly
+    /// water as water and leans grass_side toward grass_top's average.
+    #[test]
+    fn builtin_materials_mark_water_and_the_grass_side_lean() {
+        assert_eq!(std::mem::size_of::<GpuLayerMaterial>(), 32);
+        assert_eq!(std::mem::offset_of!(GpuLayerMaterial, far_side), 16);
+        let (layers, names) = crate::mesh::appearance::builtin_textures();
+        let materials = builtin_materials(&names);
+        let averages: Vec<[f32; 4]> = layers.iter().map(layer_average).collect();
+        let gpu = gpu_materials(&materials, &averages);
+        assert_eq!(gpu.len(), layers.len());
+        for (i, name) in names.iter().enumerate() {
+            let water = *name == "water";
+            assert_eq!(gpu[i].flags[0] == 1.0, water, "{name}");
+            if *name == "grass_side" {
+                let top = names.iter().position(|&n| n == "grass_top").unwrap();
+                assert_eq!(gpu[i].flags[1], GRASS_SIDE_FAR_LEAN);
+                assert_eq!(&gpu[i].far_side[..3], &averages[top][..3]);
+            } else {
+                assert_eq!(gpu[i].flags[1], 0.0, "{name} leans nowhere");
+            }
+        }
+        // Missing specs default; an out-of-range lean target is ignored.
+        let odd = gpu_materials(
+            &[LayerMaterial {
+                water: false,
+                far_side: Some((99, 1.0)),
+            }],
+            &averages[..2],
+        );
+        assert_eq!(odd[0].flags, [0.0; 4]);
+        assert_eq!(odd[1].flags, [0.0; 4]);
     }
 }

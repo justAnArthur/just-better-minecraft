@@ -2,7 +2,7 @@
 //! terrain pass, and dispatch into the debug overlay.
 
 use bytemuck::{Pod, Zeroable};
-use glam::Mat4;
+use glam::{Mat4, Vec3};
 use jbm_core::coords::BlockPos;
 
 use crate::camera::Camera;
@@ -24,6 +24,36 @@ pub const HORIZON_COLOR: [f32; 4] = [0.70, 0.82, 0.94, 1.0];
 pub const ZENITH_COLOR: [f32; 4] = [0.15, 0.40, 0.82, 1.0];
 pub const GROUND_HAZE_COLOR: [f32; 4] = [0.34, 0.37, 0.43, 1.0];
 
+/// The fixed sun (task 2.15; no day cycle yet): a mid-morning sun
+/// [`SUN_ELEVATION_DEGREES`] above the horizon, its horizontal direction
+/// [`SUN_AZIMUTH_XZ`] (toward the sun, not axis-aligned so all four block
+/// sides read differently). [`sun_direction`] combines them.
+pub const SUN_ELEVATION_DEGREES: f32 = 40.0;
+pub const SUN_AZIMUTH_XZ: [f32; 2] = [-0.53, 0.85];
+/// Sun radiance (linear RGB): warm white. A sunlit top face receives
+/// `SUN_COLOR · sin(elevation)` plus the sky ambient.
+pub const SUN_COLOR: [f32; 3] = [0.92, 0.80, 0.62];
+/// The hemisphere ambient (linear RGB): sky blue from straight above,
+/// a dimmer warm ground bounce from straight below, blended by the
+/// normal's y.
+pub const AMBIENT_SKY: [f32; 3] = [0.41, 0.48, 0.58];
+pub const AMBIENT_GROUND: [f32; 3] = [0.30, 0.28, 0.25];
+
+/// The unit vector toward the sun (task 2.15), mirrored by the shaders
+/// through `FrameUniforms::sun_dir`.
+pub fn sun_direction() -> Vec3 {
+    let (sin_e, cos_e) = SUN_ELEVATION_DEGREES.to_radians().sin_cos();
+    let h = glam::Vec2::from(SUN_AZIMUTH_XZ).normalize();
+    Vec3::new(h.x * cos_e, sin_e, h.y * cos_e)
+}
+
+/// The period, in blocks, of every world-anchored procedural pattern
+/// (clouds, water ripples; task 2.15). The camera position reaches the
+/// shaders reduced modulo this in f64 (`FrameUniforms::camera_wrap`), so
+/// the patterns stay precise at any world coordinate; every pattern
+/// tiles exactly with this period, so the wrap never shows a seam.
+pub const WRAP_PERIOD: f64 = 65536.0;
+
 /// Per-frame GPU constants.
 ///
 /// Mirrored as `struct FrameUniforms` in `shaders/sky.wgsl` and
@@ -44,22 +74,58 @@ pub struct FrameUniforms {
     pub ground_color: [f32; 4],
     /// x, y = target size in pixels (overlay needs pixel→NDC). z, w unused.
     pub viewport: [f32; 4],
+    /// Task 2.15. xyz = the unit vector toward the sun; w = the animation
+    /// time in seconds (cloud drift, water ripples; 0 in tests).
+    pub sun_dir: [f32; 4],
+    /// rgb = the sun's radiance (linear); w = sun lighting on (1.0) or
+    /// off (0.0, the pre-2.15 flat look).
+    pub sun_color: [f32; 4],
+    /// rgb = the sky-hemisphere ambient (linear); w = clouds on / off.
+    pub ambient_sky: [f32; 4],
+    /// rgb = the ground-bounce ambient (linear); w = water shading on /
+    /// off.
+    pub ambient_ground: [f32; 4],
+    /// xyz = the camera position modulo [`WRAP_PERIOD`] (reduced in f64):
+    /// the origin of the world-anchored procedural patterns. w spare.
+    pub camera_wrap: [f32; 4],
 }
 
 /// A depth attachment matching [`DEPTH_FORMAT`], recreated on resize.
-/// `TEXTURE_BINDING` lets the Hi-Z fill pass (task 2.5) sample it.
+/// `TEXTURE_BINDING` lets the Hi-Z fill pass (task 2.5) sample it. Its
+/// sample count must match the renderer's (task 2.15: 4× MSAA by default,
+/// [`DepthTarget::with_samples`] for 1×).
 pub struct DepthTarget {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     width: u32,
     height: u32,
+    samples: u32,
     /// Bumped on every recreation, so the terrain pass can rebuild its
     /// Hi-Z fill bind group even when the size did not change.
     generation: u32,
 }
 
 impl DepthTarget {
+    /// A depth target at the default MSAA sample count
+    /// ([`DEFAULT_MSAA_SAMPLES`](crate::render::settings::DEFAULT_MSAA_SAMPLES)),
+    /// matching `Renderer::new`.
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> DepthTarget {
+        DepthTarget::with_samples(
+            device,
+            width,
+            height,
+            crate::render::settings::DEFAULT_MSAA_SAMPLES,
+        )
+    }
+
+    /// A depth target with `samples` samples per pixel (1 or 4). Only a
+    /// single-sample target can be read back (`read_depth`).
+    pub fn with_samples(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        samples: u32,
+    ) -> DepthTarget {
         static NEXT_GENERATION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("jbm depth target"),
@@ -69,12 +135,18 @@ impl DepthTarget {
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
-            sample_count: 1,
+            sample_count: samples,
             dimension: wgpu::TextureDimension::D2,
             format: DEPTH_FORMAT,
+            // COPY_SRC (the read_depth hook) only where a copy is legal:
+            // multisampled textures cannot be copied to a buffer.
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
+                | if samples == 1 {
+                    wgpu::TextureUsages::COPY_SRC
+                } else {
+                    wgpu::TextureUsages::empty()
+                },
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -83,6 +155,7 @@ impl DepthTarget {
             view,
             width,
             height,
+            samples,
             // Globally unique, so two different targets of the same size
             // never match (the Hi-Z fill bind group must follow the exact
             // texture, not just its size).
@@ -95,7 +168,7 @@ impl DepthTarget {
         if self.width == width && self.height == height {
             return;
         }
-        *self = DepthTarget::new(device, width, height);
+        *self = DepthTarget::with_samples(device, width, height, self.samples);
     }
 
     pub fn view(&self) -> &wgpu::TextureView {
@@ -105,8 +178,14 @@ impl DepthTarget {
     /// The last frame's per-pixel depths, row-major, `width * height`
     /// f32s (task 2.10's test hook; reverse-Z, so
     /// distance = [`crate::camera::NEAR`] / depth). Blocking: encodes one
-    /// texture→buffer copy of the whole target and maps it.
+    /// texture→buffer copy of the whole target and maps it. Single-sample
+    /// targets only (a multisampled texture cannot be copied out); tests
+    /// that read depth render at 1×.
     pub fn read_depth(&self, gpu: &Gpu) -> Vec<f32> {
+        assert_eq!(
+            self.samples, 1,
+            "read_depth needs a single-sample depth target (DepthTarget::with_samples(.., 1))"
+        );
         let bytes_per_pixel = 4;
         let unaligned = bytes_per_pixel * self.width;
         let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT.max(bytes_per_pixel);
@@ -186,6 +265,48 @@ impl DepthTarget {
     pub fn format(&self) -> wgpu::TextureFormat {
         self.texture.format()
     }
+
+    /// Samples per pixel (1, or 4 for MSAA).
+    pub fn samples(&self) -> u32 {
+        self.samples
+    }
+}
+
+/// The multisampled color attachment (task 2.15) the sky, terrain, debug
+/// lines and outline render into; resolved into the frame's target before
+/// the overlay draws at 1×. Owned by the renderer (one color format) and
+/// recreated whenever the depth target's size changes.
+struct MsaaColor {
+    view: wgpu::TextureView,
+    size: (u32, u32),
+}
+
+impl MsaaColor {
+    fn new(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        (width, height): (u32, u32),
+        samples: u32,
+    ) -> MsaaColor {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("jbm msaa color"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: samples,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        MsaaColor {
+            view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
+            size: (width, height),
+        }
+    }
 }
 
 /// The inputs of one frame, bundled (task 2.5): the render target and its
@@ -217,6 +338,13 @@ pub struct Renderer {
     viewport: (u32, u32),
     /// Sky color overrides (hole tests): linear RGB per slot.
     sky_override: Option<([f32; 4], [f32; 4], [f32; 4])>,
+    /// The animation time in seconds (cloud drift, water ripples); the
+    /// app advances it, tests leave it at 0.
+    time: f32,
+    color_format: wgpu::TextureFormat,
+    /// The multisampled color attachment while `msaa_samples > 1`,
+    /// created on the first frame and on every resize.
+    msaa_color: Option<MsaaColor>,
     /// The frame-level settings (fog, level tint, far-look radii, path
     /// flags) the renderer owns; passed to the terrain pass with every
     /// draw. Seeded from `RenderSettings::from_env()` by the app through
@@ -225,8 +353,25 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    /// A renderer with the default settings (4× MSAA).
     pub fn new(gpu: &Gpu, color_format: wgpu::TextureFormat) -> Renderer {
+        Renderer::with_settings(gpu, color_format, RenderSettings::default())
+    }
+
+    /// A renderer seeded with `settings`; its pipelines are built for
+    /// `settings.msaa_samples`, so depth targets passed to `render` must
+    /// have that many samples.
+    pub fn with_settings(
+        gpu: &Gpu,
+        color_format: wgpu::TextureFormat,
+        settings: RenderSettings,
+    ) -> Renderer {
         let device = &gpu.device;
+        let samples = settings.msaa_samples;
+        let multisample = wgpu::MultisampleState {
+            count: samples,
+            ..Default::default()
+        };
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("jbm frame uniforms"),
@@ -303,14 +448,15 @@ impl Renderer {
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample,
             multiview_mask: None,
             cache: None,
         });
 
+        // The overlay draws after the MSAA resolve, at 1×.
         let overlay = OverlayRenderer::new(gpu, color_format, &uniform_layout);
-        let outline = OutlinePass::new(gpu, color_format, &uniform_layout);
-        let lines = LinesPass::new(gpu, color_format, &uniform_layout);
+        let outline = OutlinePass::new(gpu, color_format, &uniform_layout, samples);
+        let lines = LinesPass::new(gpu, color_format, &uniform_layout, samples);
 
         Renderer {
             uniform_buffer,
@@ -322,14 +468,33 @@ impl Renderer {
             lines,
             viewport: (1, 1),
             sky_override: None,
-            settings: RenderSettings::default(),
+            time: 0.0,
+            color_format,
+            msaa_color: None,
+            settings,
         }
     }
 
-    /// Replaces the renderer-owned settings wholesale (the app's one
-    /// `RenderSettings::from_env()` read lands here).
+    /// Replaces the renderer-owned settings wholesale, except the MSAA
+    /// sample count: the pipelines were built for the construction-time
+    /// count (`Renderer::with_settings`), which therefore stays.
     pub fn set_settings(&mut self, settings: RenderSettings) {
-        self.settings = settings;
+        self.settings = RenderSettings {
+            msaa_samples: self.settings.msaa_samples,
+            ..settings
+        };
+    }
+
+    /// The MSAA sample count the pipelines were built for.
+    pub fn msaa_samples(&self) -> u32 {
+        self.settings.msaa_samples
+    }
+
+    /// Sets the animation time in seconds (task 2.15): cloud drift and
+    /// water ripples follow it. The app advances it every frame; tests
+    /// leave it at 0 so images stay deterministic.
+    pub fn set_time(&mut self, seconds: f32) {
+        self.time = seconds;
     }
 
     /// The renderer-owned settings the terrain draws run with.
@@ -423,6 +588,9 @@ impl Renderer {
         let (horizon, zenith, ground) =
             self.sky_override
                 .unwrap_or((HORIZON_COLOR, ZENITH_COLOR, GROUND_HAZE_COLOR));
+        let sun = sun_direction();
+        let flag = |on: bool| if on { 1.0 } else { 0.0 };
+        let wrap = camera.position.map(|c| c.rem_euclid(WRAP_PERIOD)).as_vec3();
         FrameUniforms {
             view_proj,
             inv_view_proj: view_proj.inverse(),
@@ -432,13 +600,63 @@ impl Renderer {
             zenith_color: zenith,
             ground_color: ground,
             viewport: [self.viewport.0 as f32, self.viewport.1 as f32, 0.0, 0.0],
+            sun_dir: [sun.x, sun.y, sun.z, self.time],
+            sun_color: [
+                SUN_COLOR[0],
+                SUN_COLOR[1],
+                SUN_COLOR[2],
+                flag(self.settings.sun_lighting),
+            ],
+            ambient_sky: [
+                AMBIENT_SKY[0],
+                AMBIENT_SKY[1],
+                AMBIENT_SKY[2],
+                flag(self.settings.clouds),
+            ],
+            ambient_ground: [
+                AMBIENT_GROUND[0],
+                AMBIENT_GROUND[1],
+                AMBIENT_GROUND[2],
+                flag(self.settings.water),
+            ],
+            camera_wrap: [wrap.x, wrap.y, wrap.z, 0.0],
         }
     }
 
     /// Draws one frame: the sky pass (which also clears depth to 0.0),
     /// then the terrain pass, then the target outline (`outline`, task
-    /// 1.7), then the debug overlay — crosshair included — on top.
+    /// 1.7), then the debug overlay — crosshair included — on top. With
+    /// MSAA (task 2.15) everything before the overlay renders into the
+    /// renderer's multisampled color target and `frame.depth` (which must
+    /// have the same sample count), resolved into `frame.target` before
+    /// the overlay.
     pub fn render(&mut self, gpu: &Gpu, frame: FrameInputs<'_>) {
+        let samples = self.settings.msaa_samples;
+        assert_eq!(
+            frame.depth.samples(),
+            samples,
+            "the depth target's sample count must match the renderer's MSAA setting"
+        );
+        if samples > 1
+            && self
+                .msaa_color
+                .as_ref()
+                .is_none_or(|m| m.size != frame.depth.size())
+        {
+            self.msaa_color = Some(MsaaColor::new(
+                &gpu.device,
+                self.color_format,
+                frame.depth.size(),
+                samples,
+            ));
+        }
+        // The scene's color attachment: the multisampled target, or the
+        // frame's own target at 1×.
+        let msaa = samples > 1;
+        let scene_target = match &self.msaa_color {
+            Some(color) if msaa => &color.view,
+            _ => frame.target,
+        };
         let uniforms = self.build_uniforms(frame.camera);
         gpu.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
@@ -455,7 +673,7 @@ impl Renderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("jbm sky pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: frame.target,
+                    view: scene_target,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -486,7 +704,7 @@ impl Renderer {
             terrain.draw(
                 gpu,
                 &mut encoder,
-                frame.target,
+                scene_target,
                 frame.depth,
                 frame.camera,
                 &self.uniform_bind_group,
@@ -499,7 +717,7 @@ impl Renderer {
         if self.lines.vertex_count() > 0 {
             self.lines.draw(
                 &mut encoder,
-                frame.target,
+                scene_target,
                 frame.depth.view(),
                 &self.uniform_bind_group,
             );
@@ -509,12 +727,34 @@ impl Renderer {
             self.outline.draw(
                 gpu,
                 &mut encoder,
-                frame.target,
+                scene_target,
                 frame.depth.view(),
                 &self.uniform_bind_group,
                 frame.camera,
                 block,
             );
+        }
+
+        // The MSAA resolve (task 2.15): an empty pass whose only job is
+        // resolving the multisampled scene into the frame's target, so
+        // the overlay (and egui after it) draw at 1× on top.
+        if msaa {
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("jbm msaa resolve"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: scene_target,
+                    depth_slice: None,
+                    resolve_target: Some(frame.target),
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Discard,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
         }
 
         if let Some(text) = frame.overlay {
@@ -536,11 +776,12 @@ impl Renderer {
 mod tests {
     use super::*;
 
-    /// The WGSL mirror in shaders/sky.wgsl / shaders/overlay.wgsl is
-    /// 2 × mat4x4f + 6 × vec4f = 224 bytes, every field 16-byte aligned.
+    /// The WGSL mirror in shaders/sky.wgsl / shaders/overlay.wgsl /
+    /// shaders/outline.wgsl / shaders/terrain.wgsl is 2 × mat4x4f +
+    /// 11 × vec4f = 304 bytes, every field 16-byte aligned.
     #[test]
     fn frame_uniforms_match_wgsl_layout() {
-        assert_eq!(std::mem::size_of::<FrameUniforms>(), 224);
+        assert_eq!(std::mem::size_of::<FrameUniforms>(), 304);
         assert_eq!(std::mem::align_of::<FrameUniforms>(), 16);
         assert_eq!(std::mem::offset_of!(FrameUniforms, view_proj), 0);
         assert_eq!(std::mem::offset_of!(FrameUniforms, inv_view_proj), 64);
@@ -550,9 +791,30 @@ mod tests {
         assert_eq!(std::mem::offset_of!(FrameUniforms, zenith_color), 176);
         assert_eq!(std::mem::offset_of!(FrameUniforms, ground_color), 192);
         assert_eq!(std::mem::offset_of!(FrameUniforms, viewport), 208);
+        assert_eq!(std::mem::offset_of!(FrameUniforms, sun_dir), 224);
+        assert_eq!(std::mem::offset_of!(FrameUniforms, sun_color), 240);
+        assert_eq!(std::mem::offset_of!(FrameUniforms, ambient_sky), 256);
+        assert_eq!(std::mem::offset_of!(FrameUniforms, ambient_ground), 272);
+        assert_eq!(std::mem::offset_of!(FrameUniforms, camera_wrap), 288);
         assert!(
             std::mem::size_of::<FrameUniforms>().is_multiple_of(16),
             "no tail padding"
         );
+    }
+
+    /// The fixed sun is a mid-morning sun: 35–55° up, not axis-aligned
+    /// (every side face gets a different share of it).
+    #[test]
+    fn sun_is_mid_morning_and_not_axis_aligned() {
+        let sun = sun_direction();
+        assert!((sun.length() - 1.0).abs() < 1e-5);
+        let elevation = sun.y.asin().to_degrees();
+        assert!((35.0..=55.0).contains(&elevation), "{elevation}");
+        let sides = [Vec3::X, Vec3::NEG_X, Vec3::Z, Vec3::NEG_Z].map(|n| n.dot(sun));
+        for i in 0..4 {
+            for j in i + 1..4 {
+                assert!((sides[i] - sides[j]).abs() > 0.05, "{sides:?}");
+            }
+        }
     }
 }

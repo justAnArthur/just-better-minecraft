@@ -39,6 +39,10 @@ use crate::terrain_sync::TerrainSync;
 /// Frame dt is clamped so a pause (window drag, debugger) does not
 /// teleport the camera — and, with the catch-up cap below, never
 /// accumulates more than one clamped frame's worth of sim ticks.
+/// The animation clock's wrap, in seconds (task 2.15): a few hours, so the
+/// f32 clock keeps millisecond precision; clouds jump once per wrap.
+const LOOK_CLOCK_WRAP: f32 = 4.0 * 3600.0;
+
 const MAX_DT: f32 = 0.25;
 
 /// The fixed simulation period: 20 Hz, matching the physics tick.
@@ -142,6 +146,9 @@ struct App {
     /// pauses until it is visible again.
     occluded: bool,
     last_frame: Option<Instant>,
+    /// The animation clock in seconds (task 2.15: cloud drift, water
+    /// ripples), wrapped at `LOOK_CLOCK_WRAP` so f32 stays precise.
+    look_clock: f32,
     /// Leftover simulation time: whole ticks are consumed by the fixed
     /// 20 Hz sim loop below, the fraction becomes the render alpha.
     accumulator: Duration,
@@ -261,6 +268,7 @@ impl App {
             cursor_grabbed: false,
             occluded: false,
             last_frame: None,
+            look_clock: 0.0,
             accumulator: Duration::ZERO,
             predictor: None,
             link,
@@ -334,14 +342,19 @@ impl App {
             far_radii: [lod0_ring_radius, furthest_ring_radius],
             ..RenderSettings::from_env()
         };
-        let mut renderer = Renderer::new(&gpu, format);
-        renderer.set_settings(settings);
-        let depth = DepthTarget::new(&gpu.device, config.width, config.height);
+        // MSAA (task 2.15) is fixed here: the pipelines and the depth
+        // target are built for the startup sample count.
+        let mut renderer = Renderer::with_settings(&gpu, format, settings);
+        let depth = DepthTarget::with_samples(
+            &gpu.device,
+            config.width,
+            config.height,
+            settings.msaa_samples,
+        );
         renderer.set_viewport(config.width, config.height);
         self.camera.aspect = config.width as f32 / config.height as f32;
 
-        let (layers, _) = crate::mesh::appearance::builtin_textures();
-        let textures = BlockTextures::new(&gpu, &layers)?;
+        let textures = BlockTextures::builtin(&gpu)?;
         let terrain = TerrainPass::with_settings(
             &gpu,
             format,
@@ -717,6 +730,8 @@ impl App {
         // rebuilt each frame from the settings and the resident set.
         let debug_lines = self.build_debug_lines(&w.terrain, &self.camera, w.renderer.settings());
         w.renderer.set_debug_lines(&w.gpu, &debug_lines);
+        self.look_clock = (self.look_clock + dt.as_secs_f32()) % LOOK_CLOCK_WRAP;
+        w.renderer.set_time(self.look_clock);
         w.renderer.render(
             &w.gpu,
             FrameInputs {

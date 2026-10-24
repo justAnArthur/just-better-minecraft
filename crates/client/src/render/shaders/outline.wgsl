@@ -11,6 +11,12 @@ struct FrameUniforms {
     zenith_color: vec4f,
     ground_color: vec4f,
     viewport: vec4f,
+    // Task 2.15 (see FrameUniforms in render/renderer.rs).
+    sun_dir: vec4f,        // xyz toward the sun, w = time (s)
+    sun_color: vec4f,      // rgb sun radiance, w = sun lighting on
+    ambient_sky: vec4f,    // rgb sky ambient, w = clouds on
+    ambient_ground: vec4f, // rgb ground bounce, w = water shading on
+    camera_wrap: vec4f,    // xyz camera position mod WRAP_PERIOD
 };
 
 @group(0) @binding(0) var<uniform> u: FrameUniforms;
