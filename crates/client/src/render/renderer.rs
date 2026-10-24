@@ -639,14 +639,14 @@ impl Renderer {
         }
     }
 
-    /// Draws one frame: a clear (depth to 0.0), the terrain pass, the sky
-    /// pass over the pixels the terrain left uncovered, the debug lines,
-    /// the target outline (`outline`, task 1.7), then the debug overlay — crosshair included — on top. With
-    /// MSAA (task 2.15) everything before the overlay renders into the
-    /// renderer's multisampled color target and `frame.depth` (which must
-    /// have the same sample count), resolved into `frame.target` before
-    /// the overlay.
-    pub fn render(&mut self, gpu: &Gpu, frame: FrameInputs<'_>) {
+    /// Draws one frame: one scene pass (task 2.16) with the terrain, the
+    /// sky over the pixels the terrain left uncovered, the debug lines
+    /// and the target outline (`outline`, task 1.7), then the debug
+    /// overlay — crosshair included — on top. With MSAA (task 2.15) the
+    /// scene renders into the renderer's multisampled color target and
+    /// `frame.depth` (which must have the same sample count), resolved
+    /// into `frame.target` at the end of the pass.
+    pub fn render(&mut self, gpu: &Gpu, mut frame: FrameInputs<'_>) {
         let samples = self.settings.msaa_samples;
         assert_eq!(
             frame.depth.samples(),
@@ -666,16 +666,18 @@ impl Renderer {
                 samples,
             ));
         }
+        let uniforms = self.build_uniforms(frame.camera);
+        gpu.queue
+            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+
+        let scene_color = frame.target;
         // The scene's color attachment: the multisampled target, or the
         // frame's own target at 1×.
         let msaa = samples > 1;
         let scene_target = match &self.msaa_color {
             Some(color) if msaa => &color.view,
-            _ => frame.target,
+            _ => scene_color,
         };
-        let uniforms = self.build_uniforms(frame.camera);
-        gpu.queue
-            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
         let mut encoder = gpu
             .device
@@ -687,37 +689,13 @@ impl Renderer {
         }
         let timer = self.timer.as_ref();
 
-        // The clear: color, and depth to 0.0 (far in reverse-Z) so the
-        // terrain can depth-test against it. Without terrain the sky pass
-        // clears for itself.
-        let terrain_drawn = frame.terrain.is_some();
-        if let Some(terrain) = frame.terrain {
-            drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("jbm clear pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: scene_target,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: frame.depth.view(),
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(0.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: timer.and_then(|t| t.render_writes("clear")),
-                occlusion_query_set: None,
-                multiview_mask: None,
-            }));
-            // The frame settings (fog, level tint) ride along each draw:
-            // the terrain pass bakes them into its per-frame uniform.
-            terrain.draw(
+        // The terrain's frame work before the scene pass: culling, buffer
+        // writes and — on gpu-cull — the early phase, which clears the
+        // targets (the scene pass then loads them). The frame settings
+        // (fog, level tint) ride along: the terrain pass bakes them into
+        // its per-frame uniform.
+        let cleared = match frame.terrain.as_deref_mut() {
+            Some(terrain) => terrain.prepare(
                 gpu,
                 &mut encoder,
                 scene_target,
@@ -726,16 +704,22 @@ impl Renderer {
                 &self.uniform_bind_group,
                 &self.settings,
                 timer,
-            );
+            ),
+            None => false,
+        };
+        if let Some(block) = frame.outline {
+            self.outline.prepare(gpu, frame.camera, block);
         }
 
-        // Sky pass (task 2.15: after the terrain): a fullscreen triangle at
-        // the far plane, depth-tested Equal against the cleared depth, so
-        // it shades only the pixels no terrain covered — the clouds' noise
-        // is never evaluated under the terrain (a cave frame used to pay
-        // for a full screen of it).
+        // The scene pass (task 2.16): the terrain, the sky, the debug lines
+        // and the outline in one render pass, resolved into the scene's
+        // color as the pass's store action. A pass per stage loaded and
+        // stored the multisampled color and depth each time (≈ 236 MB per
+        // attachment at 5K on a tile-based GPU); in one pass they stay on
+        // chip. The depth is stored only at 1×, where tests read it back.
         {
-            let (color_load, depth_load) = if terrain_drawn {
+            // 0.0 is far in reverse-Z.
+            let (color_load, depth_load) = if cleared {
                 (wgpu::LoadOp::Load, wgpu::LoadOp::Load)
             } else {
                 (
@@ -743,88 +727,77 @@ impl Renderer {
                     wgpu::LoadOp::Clear(0.0),
                 )
             };
+            let store = if msaa {
+                wgpu::StoreOp::Discard
+            } else {
+                wgpu::StoreOp::Store
+            };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("jbm sky pass"),
+                label: Some("jbm scene pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: scene_target,
                     depth_slice: None,
-                    resolve_target: None,
+                    resolve_target: msaa.then_some(scene_color),
                     ops: wgpu::Operations {
                         load: color_load,
-                        store: wgpu::StoreOp::Store,
+                        store,
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: frame.depth.view(),
                     depth_ops: Some(wgpu::Operations {
                         load: depth_load,
-                        store: wgpu::StoreOp::Store,
+                        store,
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: timer.and_then(|t| t.render_writes("sky")),
+                timestamp_writes: timer.and_then(|t| t.render_writes("scene")),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            if let Some(terrain) = frame.terrain.as_deref() {
+                terrain.record(&mut pass, &self.uniform_bind_group);
+            }
+
+            // The sky (task 2.15: after the terrain): a fullscreen triangle
+            // at the far plane, depth-tested Equal against the cleared
+            // depth, so it shades only the pixels no terrain covered — the
+            // clouds' noise is never evaluated under the terrain.
             pass.set_pipeline(&self.sky_pipeline);
             pass.set_bind_group(0, &self.uniform_bind_group, &[]);
             pass.draw(0..3, 0..1);
-        }
 
-        // The task 2.12 debug lines, over the terrain (depth-tested
-        // against it) and under the outline and overlay.
-        if self.lines.vertex_count() > 0 {
-            self.lines.draw(
-                &mut encoder,
-                scene_target,
-                frame.depth.view(),
-                &self.uniform_bind_group,
-            );
-        }
-
-        if let Some(block) = frame.outline {
-            self.outline.draw(
-                gpu,
-                &mut encoder,
-                scene_target,
-                frame.depth.view(),
-                &self.uniform_bind_group,
-                frame.camera,
-                block,
-            );
-        }
-
-        // The MSAA resolve (task 2.15): an empty pass whose only job is
-        // resolving the multisampled scene into the frame's target, so
-        // the overlay (and egui after it) draw at 1× on top.
-        if msaa {
-            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("jbm msaa resolve"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: scene_target,
-                    depth_slice: None,
-                    resolve_target: Some(frame.target),
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Discard,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: timer.and_then(|t| t.render_writes("resolve")),
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
+            // The task 2.12 debug lines, over the terrain (depth-tested
+            // against it) and under the outline and overlay.
+            if self.lines.vertex_count() > 0 {
+                self.lines.record(&mut pass, &self.uniform_bind_group);
+            }
+            if frame.outline.is_some() {
+                self.outline.record(&mut pass, &self.uniform_bind_group);
+            }
         }
 
         if let Some(text) = frame.overlay {
-            self.overlay.draw(
-                gpu,
-                &mut encoder,
-                frame.target,
-                &self.uniform_bind_group,
-                self.viewport,
-                text,
-            );
+            // The overlay draws at 1× on the resolved frame (as egui does
+            // after it).
+            self.overlay.prepare(gpu, self.viewport, text);
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("jbm overlay pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: frame.target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: timer.and_then(|t| t.render_writes("overlay")),
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.overlay.record(&mut pass, &self.uniform_bind_group);
         }
 
         if let Some(timer) = &mut self.timer {

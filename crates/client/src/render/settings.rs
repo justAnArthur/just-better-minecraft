@@ -2,7 +2,7 @@
 //! distances the renderer and the terrain pass must agree on — fog, the
 //! level tint, the far-look radii, the terrain draw-path flags and the
 //! task 2.12 debug views. The renderer owns the one live copy and hands
-//! `&RenderSettings` to `TerrainPass::draw` each frame; the app reads the
+//! `&RenderSettings` to `TerrainPass::prepare` each frame; the app reads the
 //! environment once at startup through [`RenderSettings::from_env`] (the
 //! only place the JBM_* rendering variables are read). The debug panel
 //! edits the same fields live.

@@ -14,18 +14,16 @@ use glam::Vec3;
 use crate::camera::Camera;
 use crate::gpu::Gpu;
 use crate::lod::CubeKey;
-use crate::render::renderer::DepthTarget;
 use crate::render::settings::RenderSettings;
-use crate::render::timing::GpuTimer;
 
-use super::TerrainPass;
 use super::pages::CubeMesh;
-use super::pipelines::{CMD_BYTES, FACE_BYTES};
+use super::pipelines::FACE_BYTES;
 use super::space::{
     Frustum, aabb_distance_squared, camera_split, cube_origin, cube_size, direction_split_blocks,
     visible_directions,
 };
 use super::stats::{CullStats, TerrainStats};
+use super::{SceneDraws, TerrainPass};
 
 /// The culling basis of the frame (task 2.12): the camera split and
 /// frustum the tests run against — the live camera, or the frozen one
@@ -117,19 +115,13 @@ impl TerrainPass {
     /// The cpu-cull frame (also the fallback path's culling): the CPU
     /// frustum and direction tests over the same meta slots, with the
     /// shared origin formula, so the CPU and GPU cull on the same numbers.
-    // The nine parameters are one frame's draw context; a bundling struct
-    // would only be unpacked again here.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn draw_cpu_cull(
+    /// Writes the commands and leaves the draws for the scene pass
+    /// ([`TerrainPass::record`]).
+    pub(super) fn prepare_cpu_cull(
         &mut self,
         gpu: &Gpu,
-        encoder: &mut wgpu::CommandEncoder,
-        target: &wgpu::TextureView,
-        depth: &DepthTarget,
         camera: &Camera,
-        uniforms: &wgpu::BindGroup,
         settings: &RenderSettings,
-        timer: Option<&GpuTimer>,
     ) {
         let terrain_uniforms = self.terrain_uniforms_for(camera, settings);
         gpu.queue.write_buffer(
@@ -265,40 +257,18 @@ impl TerrainPass {
         gpu.queue
             .write_buffer(&self.indirect_buffer, 0, bytemuck::cast_slice(&commands));
 
-        let mut pass = self.begin_pass(encoder, target, depth.view(), timer);
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, uniforms, &[]);
-        pass.set_bind_group(2, &self.shared_bind_group, &[]);
-        let mut draw_calls = 0u64;
+        // One multi-draw per page, or one direct draw per command on the
+        // fallback (which keeps the commands to replay them).
         if self.uses_mdi() {
-            let mut offset = 0u64;
-            for &(page, count) in &page_spans {
-                pass.set_bind_group(1, &self.pages[page].bind_group, &[]);
-                pass.multi_draw_indirect(&self.indirect_buffer, offset * CMD_BYTES, count);
-                offset += u64::from(count);
-                draw_calls += 1;
-            }
+            stats.draw_calls = page_spans.len() as u64;
+            self.scene_draws = SceneDraws::Indirect(page_spans);
         } else {
-            // Fallback: the same commands and buffers as plain direct draws.
-            // Direct draws take a first instance without the feature.
-            let mut cursor = 0usize;
-            for &(page, count) in &page_spans {
-                pass.set_bind_group(1, &self.pages[page].bind_group, &[]);
-                for command in &commands[cursor..cursor + count as usize] {
-                    let first_vertex = command.first_vertex;
-                    let first_instance = command.first_instance;
-                    pass.draw(
-                        first_vertex..first_vertex + command.vertex_count,
-                        first_instance..first_instance + command.instance_count,
-                    );
-                }
-                cursor += count as usize;
-                draw_calls += u64::from(count);
-            }
+            stats.draw_calls = commands.len() as u64;
+            self.scene_draws = SceneDraws::Direct {
+                spans: page_spans,
+                commands,
+            };
         }
-        drop(pass);
-
-        stats.draw_calls = draw_calls;
         self.stats = stats;
     }
 }

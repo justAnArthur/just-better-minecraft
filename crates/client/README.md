@@ -72,7 +72,7 @@ coordinates and cfg-gated off under the crate's own `cube16` passthrough;
 - `render::settings::RenderSettings` — the frame-level settings (fog,
   level tint, far-look radii, the direction-split radius, draw-path
   flags, the task 2.12 debug views) the renderer owns and passes to
-  `TerrainPass::draw`; `from_env()` is the one read of the `JBM_NO_FOG` /
+  `TerrainPass::prepare`; `from_env()` is the one read of the `JBM_NO_FOG` /
   `JBM_LOD_TINT` / `JBM_GPU_CULL` / `JBM_NO_MDI` / `JBM_WIREFRAME` /
   `JBM_WIREFRAME_ONLY` / `JBM_CHUNK_BORDERS` / `JBM_EXPLODE` /
   `JBM_LEVELS` / `JBM_FREEZE_CULL` / `JBM_DIRECTION_SPLIT` /
@@ -512,11 +512,12 @@ fading into a soft haze.
   glow fades out with the gradient's own ground blend, so a pixel fully
   in the ground haze is exactly the ground color — the hole tests'
   sentinel override stays exact (`clouds: false` / `JBM_NO_CLOUDS=1`).
-  The sky pass runs **after** the terrain (a clear pass resets color and
-  depth first): its fullscreen triangle sits at the far plane (depth 0.0)
-  with an `Equal` depth test, so only pixels no terrain covered are
-  shaded and the cloud noise is never paid for under the terrain (a cave
-  frame drops from ~0.8 ms to ~0.35 ms in `terrain_draw`).
+  The sky draws **after** the terrain, in the same scene pass (which
+  clears color and depth first): its fullscreen triangle sits at the far
+  plane (depth 0.0) with an `Equal` depth test, so only pixels no
+  terrain covered are shaded and the cloud noise is never paid for under
+  the terrain (a cave frame drops from ~0.8 ms to ~0.35 ms in
+  `terrain_draw`).
 - **Water** stays an opaque block in the opaque pass. A per-layer
   material buffer (terrain group binding 5, next to `layer_avg`;
   `texture_array::builtin_materials`, keyed by layer name — never by a
