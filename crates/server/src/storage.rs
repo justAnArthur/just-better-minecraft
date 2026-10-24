@@ -461,8 +461,8 @@ impl Storage {
     /// Declares the compiled worldgen graph the server runs, after open
     /// (the stored seed is part of the fingerprint, and only open knows
     /// it). The stored fingerprint in `meta` is compared with
-    /// `hash(graph_fingerprint, seed)`: on a match, stored LOD records are
-    /// usable; on a mismatch (different worldgen wrote them) they are
+    /// `hash(graph_fingerprint, seed, RULE_VERSION)`: on a match, stored LOD records are
+    /// usable; on a mismatch (different worldgen or rule wrote them) they are
     /// deleted in the same transaction that overwrites the stored
     /// fingerprint, so no stale record is ever read — not in this run, and
     /// not after a restart. LOD0 records are never deleted either way.
