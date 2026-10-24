@@ -190,7 +190,7 @@ fn bench(c: &mut Criterion) {
             }
         };
         assert!(
-            generator.sample_lod(2, pos).uniform().is_none(),
+            generator.sample_lod(2, pos).0.uniform().is_none(),
             "the filled case must be mixed"
         );
         let fill_generator = arc_generator();

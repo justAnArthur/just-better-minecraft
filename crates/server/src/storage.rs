@@ -8,8 +8,8 @@
 //!   stable across restarts even when the runtime registry orders states
 //!   differently, so cubes decode to the same blocks.
 //! - `cubes`: 13-byte position key → `[record schema][zstd(codec bytes)]`.
-//!   Key kind 0 is a LOD0 cube (schema 1); kind *n* in `1..=4` is a LOD
-//!   level-*n* cube (schema 2, task 2.7).
+//!   Key kind 0 is a LOD0 cube (schema 1); kind *n* ≥ 1 is a LOD
+//!   level-*n* cube (schema 3: cells plus column tops, task 2.14).
 //!
 //! A cube record is written by exactly one transaction, so a crash never
 //! leaves a half-written cube or a half-written batch. [`Storage`] is
@@ -26,10 +26,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use jbm_core::block::{BlockRegistry, BlockStateId, StateInfo};
 use jbm_core::coords::{CUBE_VOLUME, CubePos};
 use jbm_core::cube::Cube;
+use jbm_core::lod::{LodTops, RULE_VERSION};
 use redb::{
     Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
 };
 use zstd::stream::decode_all;
+
+/// One LOD record to save: `(level, pos, cube, column tops, real-octant
+/// mask)`.
+pub type LodRecord<'a> = (u8, CubePos, &'a Cube, &'a LodTops, u8);
 
 /// `meta` table: small named blobs (`format_version`, `seed`, …).
 const META: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("meta");
@@ -49,16 +54,19 @@ const FORMAT_VERSION: u32 = 1;
 /// Cube record schema byte in front of every LOD0 value in `cubes`.
 const RECORD_SCHEMA: u8 = 1;
 
-/// Record schema byte in front of every LOD value in `cubes` (task 2.7):
-/// `[2][known: u8][zstd frame of the cube codec bytes]`, where `known` is
-/// the LOD cube's real-octant bitmask. A record that fails to decode is
-/// logged by the caller and treated as absent.
-const LOD_RECORD_SCHEMA: u8 = 2;
+/// Record schema byte in front of every LOD value in `cubes`:
+/// `[3][known: u8][tops][zstd frame of the cube codec bytes]`, where
+/// `known` is the LOD cube's real-octant bitmask and `tops` its column
+/// tops in the self-delimiting [`LodTops::encode`] form (task 2.14; schema
+/// 2 had no tops). A record that fails to decode is logged by the caller
+/// and treated as absent.
+const LOD_RECORD_SCHEMA: u8 = 3;
 
 /// `meta` key holding the worldgen fingerprint stored LOD was written
-/// under: `hash(compiled graph fingerprint, seed)` as u64 LE. A mismatch
-/// means a different worldgen produced the stored LOD, so it is ignored
-/// and overwritten; LOD0 records are never deleted.
+/// under: `hash(compiled graph fingerprint, seed, lod::RULE_VERSION)` as
+/// u64 LE. A mismatch means a different worldgen — or a different
+/// downsampling rule — produced the stored LOD, so it is ignored and
+/// overwritten; LOD0 records are never deleted.
 const LOD_FINGERPRINT_KEY: &str = "lod_fingerprint";
 
 /// zstd level for cube records.
@@ -159,13 +167,15 @@ fn meta_corrupt(key: &'static str) -> StorageError {
 
 /// The stored-LOD worldgen fingerprint: the compiled graph's fingerprint
 /// mixed with the world seed (the same graph under a different seed is
-/// different worldgen). `DefaultHasher` has fixed keys, so the mix is
-/// stable across runs.
-fn lod_fingerprint(graph_fingerprint: u64, seed: u64) -> u64 {
+/// different worldgen) and the LOD downsampling rule version (stored LOD
+/// built under another rule is stale, task 2.14). `DefaultHasher` has
+/// fixed keys, so the mix is stable across runs.
+fn lod_fingerprint(graph_fingerprint: u64, seed: u64, rule_version: u32) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     graph_fingerprint.hash(&mut hasher);
     seed.hash(&mut hasher);
+    rule_version.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -188,7 +198,7 @@ fn db_err(path: &Path, error: redb::DatabaseError) -> StorageError {
 
 /// 13-byte cube key: `[kind][x][y][z]`, each coordinate an i32 big-endian
 /// with the sign bit flipped so keys sort by coordinate value. `kind = 0` is
-/// a LOD0 cube; kind *n* in `1..=4` is a LOD level-*n* cube (task 2.7).
+/// a LOD0 cube; kind *n* ≥ 1 is a LOD level-*n* cube (task 2.7).
 fn cube_key(pos: CubePos) -> [u8; 13] {
     fn field(out: &mut [u8], v: i32) {
         let bytes = v.to_be_bytes();
@@ -453,12 +463,18 @@ impl Storage {
     /// it). The stored fingerprint in `meta` is compared with
     /// `hash(graph_fingerprint, seed)`: on a match, stored LOD records are
     /// usable; on a mismatch (different worldgen wrote them) they are
-    /// ignored — [`Storage::load_lod`] reads them as absent — and the
-    /// stored fingerprint is overwritten, so the next saves replace the
-    /// stale records. LOD0 records are never deleted either way. Databases
-    /// written before 2.7 have no fingerprint: it is simply written.
+    /// deleted in the same transaction that overwrites the stored
+    /// fingerprint, so no stale record is ever read — not in this run, and
+    /// not after a restart. LOD0 records are never deleted either way.
+    /// Databases written before 2.7 have no fingerprint: it is simply
+    /// written. The
+    /// LOD rule version ([`RULE_VERSION`]) is part of the fingerprint, so
+    /// LOD stored under an older downsampling rule is resampled.
     pub fn set_worldgen_fingerprint(&self, graph_fingerprint: u64) -> Result<(), StorageError> {
-        let expected = lod_fingerprint(graph_fingerprint, self.seed);
+        self.set_lod_fingerprint(lod_fingerprint(graph_fingerprint, self.seed, RULE_VERSION))
+    }
+
+    fn set_lod_fingerprint(&self, expected: u64) -> Result<(), StorageError> {
         let stored = self.meta(LOD_FINGERPRINT_KEY)?;
         match stored.as_deref() {
             Some(bytes)
@@ -474,10 +490,16 @@ impl Storage {
                     .map_err(io_err)?
                     .insert(LOD_FINGERPRINT_KEY, expected.to_le_bytes().as_slice())
                     .map_err(io_err)?;
+                if stored.is_some() {
+                    // Records written under a different fingerprint are
+                    // stale: drop them with the fingerprint change.
+                    txn.open_table(CUBES)
+                        .map_err(io_err)?
+                        .retain(|key, _| key[0] == 0)
+                        .map_err(io_err)?;
+                }
                 txn.commit().map_err(io_err)?;
-                // Records written under a different (or no) fingerprint are
-                // stale: leave them unread until this run overwrites them.
-                self.lod_usable.store(stored.is_none(), Ordering::Release);
+                self.lod_usable.store(true, Ordering::Release);
             }
         }
         Ok(())
@@ -505,12 +527,17 @@ impl Storage {
         self.decode_record(pos, record.value()).map(Some)
     }
 
-    /// Loads the stored LOD cube at `(level, pos)` with its real-octant
-    /// mask, or `None` when never saved — or when the worldgen fingerprint
-    /// does not match (stored LOD from a different worldgen is ignored).
-    /// A damaged record returns [`StorageError::Corrupt`]; the caller logs
-    /// it and samples the cube from worldgen instead. Never panics.
-    pub fn load_lod(&self, level: u8, pos: CubePos) -> Result<Option<(Cube, u8)>, StorageError> {
+    /// Loads the stored LOD cube at `(level, pos)` with its column tops and
+    /// real-octant mask, or `None` when never saved — or when the worldgen
+    /// fingerprint does not match (stored LOD from a different worldgen or
+    /// LOD rule is ignored). A damaged record returns
+    /// [`StorageError::Corrupt`]; the caller logs it and samples the cube
+    /// from worldgen instead. Never panics.
+    pub fn load_lod(
+        &self,
+        level: u8,
+        pos: CubePos,
+    ) -> Result<Option<(Cube, LodTops, u8)>, StorageError> {
         if !self.lod_usable.load(Ordering::Acquire) {
             return Ok(None);
         }
@@ -527,11 +554,18 @@ impl Storage {
         if schema != LOD_RECORD_SCHEMA {
             return Err(corrupt(format!("record schema {schema}")));
         }
-        let Some((&known, frame)) = rest.split_first() else {
+        let Some((&known, rest)) = rest.split_first() else {
             return Err(corrupt("missing known mask".into()));
         };
-        let cube = self.decode_frame(frame).map_err(corrupt)?;
-        Ok(Some((cube, known)))
+        let (tops, used) = LodTops::decode(rest).map_err(|e| corrupt(format!("tops: {e}")))?;
+        if tops.level() != level {
+            return Err(corrupt(format!(
+                "tops level {} in a level {level} record",
+                tops.level()
+            )));
+        }
+        let cube = self.decode_frame(&rest[used..]).map_err(corrupt)?;
+        Ok(Some((cube, tops, known)))
     }
 
     /// Writes every cube in `batch` in one transaction committed with
@@ -549,7 +583,7 @@ impl Storage {
     pub fn save_lod_batch(
         &self,
         lod0: &[(CubePos, &Cube)],
-        lod: &[(u8, CubePos, &Cube, u8)],
+        lod: &[LodRecord<'_>],
         players: &[(String, PlayerRecord)],
     ) -> Result<(), StorageError> {
         self.save_batch_full(lod0, lod, players, &[])
@@ -598,7 +632,7 @@ impl Storage {
     fn save_batch_full(
         &self,
         batch: &[(CubePos, &Cube)],
-        lod: &[(u8, CubePos, &Cube, u8)],
+        lod: &[LodRecord<'_>],
         players: &[(String, PlayerRecord)],
         meta: &[(&str, &[u8])],
     ) -> Result<(), StorageError> {
@@ -625,11 +659,12 @@ impl Storage {
                     .insert(&cube_key(pos), record.as_slice())
                     .map_err(io_err)?;
             }
-            for &(level, pos, cube, known) in lod {
+            for &(level, pos, cube, tops, known) in lod {
                 encode(cube, &mut plain);
                 record.clear();
                 record.push(LOD_RECORD_SCHEMA);
                 record.push(known);
+                tops.encode(&mut record);
                 let frame = zstd::bulk::compress(&plain, ZSTD_LEVEL).map_err(io_err)?;
                 record.extend_from_slice(&frame);
                 cubes
@@ -791,7 +826,10 @@ impl Storage {
 
 #[cfg(test)]
 mod tests {
-    use super::{BLOCK_STATES, CUBES, Storage, StorageError, cube_key, cube_pos};
+    use super::{
+        BLOCK_STATES, CUBES, LodTops, RULE_VERSION, Storage, StorageError, cube_key, cube_pos,
+        lod_fingerprint,
+    };
     use jbm_core::block::builtin::Blocks;
     use jbm_core::block::{BlockDef, BlockRegistry, Property};
     use jbm_core::coords::{CubePos, LocalPos};
@@ -1130,14 +1168,19 @@ mod tests {
     // ------------------------------------------------------------------
     // Stored LOD (task 2.7)
 
-    fn lod_record() -> (Cube, u8) {
+    fn lod_record(level: u8) -> (Cube, LodTops, u8) {
         let mut cube = edited_cube();
         cube.set(
             LocalPos::new_unchecked(9, 9, 9),
             jbm_core::block::BlockStateId(3),
         );
+        // Mixed column tops, so the record carries the full table.
+        let mut tops = LodTops::full(level);
+        tops.set_half(0, 9, 9, 1);
+        tops.set_half(1, 3, 30, 0);
+        tops.set_half(1, 31, 0, 1);
         // A realistic mask: three real octants, five filled.
-        (cube, 0b0001_0110)
+        (cube, tops, 0b0001_0110)
     }
 
     #[test]
@@ -1147,14 +1190,16 @@ mod tests {
         storage
             .set_worldgen_fingerprint(0xABCD_EF01_2345_6789)
             .unwrap();
-        let (cube, known) = lod_record();
+        let (cube, tops, known) = lod_record(2);
         let lod0 = edited_cube();
-        let lod_batch = [(2u8, pos(1, 2, 3), &cube, known)];
+        let lod_batch = [(2u8, pos(1, 2, 3), &cube, &tops, known)];
         storage
             .save_lod_batch(&[(pos(0, 0, 0), &lod0)], &lod_batch, &[])
             .unwrap();
-        let (loaded, loaded_known) = storage.load_lod(2, pos(1, 2, 3)).unwrap().unwrap();
+        let (loaded, loaded_tops, loaded_known) =
+            storage.load_lod(2, pos(1, 2, 3)).unwrap().unwrap();
         assert_eq!(loaded, cube);
+        assert_eq!(loaded_tops, tops);
         assert_eq!(loaded_known, known);
         // The counts see both kinds.
         assert_eq!(storage.cube_count().unwrap(), 2);
@@ -1166,7 +1211,7 @@ mod tests {
             .save_lod_batch(&[(pos(1, 2, 3), &lod0_at_same_pos)], &[], &[])
             .unwrap();
         assert_eq!(storage.load(pos(1, 2, 3)).unwrap(), Some(lod0_at_same_pos));
-        let (loaded, _) = storage.load_lod(2, pos(1, 2, 3)).unwrap().unwrap();
+        let (loaded, ..) = storage.load_lod(2, pos(1, 2, 3)).unwrap().unwrap();
         assert_eq!(loaded, cube, "the LOD record survived");
     }
 
@@ -1176,11 +1221,11 @@ mod tests {
         let storage = storage_in(&dir);
         // No fingerprint yet: nothing is readable (a fresh 2.7 database).
         assert_eq!(storage.load_lod(1, pos(0, 0, 0)).unwrap(), None);
-        let (cube, known) = lod_record();
+        let (cube, tops, known) = lod_record(1);
         // Without a matching fingerprint, saving is still allowed but the
         // record stays unreadable — as if absent.
         storage
-            .save_lod_batch(&[], &[(1, pos(4, 5, 6), &cube, known)], &[])
+            .save_lod_batch(&[], &[(1, pos(4, 5, 6), &cube, &tops, known)], &[])
             .unwrap();
         assert_eq!(
             storage.load_lod(1, pos(4, 5, 6)).unwrap(),
@@ -1188,10 +1233,10 @@ mod tests {
             "no fingerprint declared: records read as absent"
         );
         storage.set_worldgen_fingerprint(42).unwrap();
-        let (loaded, loaded_known) = storage.load_lod(1, pos(4, 5, 6)).unwrap().unwrap();
-        assert_eq!((loaded, loaded_known), (cube, known));
-        // A different worldgen fingerprint ignores (and, on the next save,
-        // overwrites) the stored records; LOD0 records stay.
+        let loaded = storage.load_lod(1, pos(4, 5, 6)).unwrap().unwrap();
+        assert_eq!(loaded, (cube, tops, known));
+        // A different worldgen fingerprint drops the stored records; LOD0
+        // records stay.
         storage.set_worldgen_fingerprint(43).unwrap();
         assert_eq!(
             storage.load_lod(1, pos(4, 5, 6)).unwrap(),
@@ -1205,9 +1250,9 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let storage = storage_in(&dir);
         storage.set_worldgen_fingerprint(7).unwrap();
-        let (cube, known) = lod_record();
+        let (cube, tops, known) = lod_record(3);
         storage
-            .save_lod_batch(&[], &[(3, pos(7, 7, 7), &cube, known)], &[])
+            .save_lod_batch(&[], &[(3, pos(7, 7, 7), &cube, &tops, known)], &[])
             .unwrap();
         storage.damage_lod_record(3, pos(7, 7, 7)).unwrap();
         let error = storage.load_lod(3, pos(7, 7, 7)).unwrap_err();
@@ -1217,5 +1262,38 @@ mod tests {
         );
         // A LOD0 record at the same position is unaffected.
         assert_eq!(storage.load(pos(7, 7, 7)).unwrap(), None);
+    }
+
+    #[test]
+    fn lod_stored_under_another_rule_version_resamples() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let graph = 0x005E_ED0F_6A4F;
+        let (cube, tops, known) = lod_record(2);
+        {
+            // A world whose LOD was written under the previous downsampling
+            // rule (same graph, same seed).
+            let storage = storage_in(&dir);
+            let old = lod_fingerprint(graph, storage.seed(), RULE_VERSION - 1);
+            storage.set_lod_fingerprint(old).unwrap();
+            storage
+                .save_lod_batch(&[], &[(2, pos(1, 1, 1), &cube, &tops, known)], &[])
+                .unwrap();
+            assert!(storage.load_lod(2, pos(1, 1, 1)).unwrap().is_some());
+        }
+        // Reopened by this build: the rule version differs, so the stored
+        // LOD is gone (the pyramid resamples it from worldgen) …
+        let storage = storage_in(&dir);
+        storage.set_worldgen_fingerprint(graph).unwrap();
+        assert_eq!(storage.load_lod(2, pos(1, 1, 1)).unwrap(), None);
+        assert_eq!(storage.lod_record_count().unwrap(), 0);
+        // … and what this run saves is readable again.
+        storage
+            .save_lod_batch(&[], &[(2, pos(1, 1, 1), &cube, &tops, known)], &[])
+            .unwrap();
+        assert!(storage.load_lod(2, pos(1, 1, 1)).unwrap().is_some());
+        drop(storage);
+        let storage = storage_in(&dir);
+        storage.set_worldgen_fingerprint(graph).unwrap();
+        assert!(storage.load_lod(2, pos(1, 1, 1)).unwrap().is_some());
     }
 }

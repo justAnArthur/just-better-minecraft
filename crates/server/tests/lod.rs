@@ -11,7 +11,7 @@ use jbm_core::block::builtin::Blocks;
 use jbm_core::coords::{BlockPos, CUBE_SIZE, CubePos, LocalPos};
 use jbm_core::cube::Cube;
 use jbm_core::link::{ClientLink, in_process_pair};
-use jbm_core::lod::{octant_offset, parent};
+use jbm_core::lod::{LodTops, octant_offset, parent};
 use jbm_core::protocol::{ClientMsg, PROTOCOL_VERSION, ServerMsg};
 use jbm_server::lod::LodPyramid;
 use jbm_server::storage::Storage;
@@ -110,7 +110,8 @@ fn surface_y(server: &Server) -> i64 {
 
 /// The incremental-vs-reference property: every cube the incremental
 /// pyramid holds **ready** must equal the reference (which only ever holds
-/// ready cubes), cell for cell and `known` for `known`. Mid-stream the
+/// ready cubes), cell for cell, top for top and `known` for `known`.
+/// Mid-stream the
 /// incremental may additionally hold pending cubes whose fills have not
 /// run; `full` (the final check, after everything was requested and
 /// drained) also demands the cube sets match exactly.
@@ -121,14 +122,14 @@ fn assert_pyramids_equal(incremental: &LodPyramid, rebuilt: &LodPyramid, full: b
         "{what}: level counts differ"
     );
     for level in 1..=incremental.max_levels() {
-        let a: HashMap<CubePos, (u8, Cube)> = incremental
+        let a: HashMap<CubePos, (u8, Cube, LodTops)> = incremental
             .iter(level)
             .filter(|(_, lc)| lc.ready())
-            .map(|(&pos, lc)| (pos, (lc.known, lc.cube.clone())))
+            .map(|(&pos, lc)| (pos, (lc.known, lc.cube.clone(), lc.tops.clone())))
             .collect();
-        let b: HashMap<CubePos, (u8, Cube)> = rebuilt
+        let b: HashMap<CubePos, (u8, Cube, LodTops)> = rebuilt
             .iter(level)
-            .map(|(&pos, lc)| (pos, (lc.known, lc.cube.clone())))
+            .map(|(&pos, lc)| (pos, (lc.known, lc.cube.clone(), lc.tops.clone())))
             .collect();
         if full {
             assert_eq!(
@@ -139,7 +140,7 @@ fn assert_pyramids_equal(incremental: &LodPyramid, rebuilt: &LodPyramid, full: b
                 b.keys().filter(|k| !a.contains_key(*k)).collect::<Vec<_>>()
             );
         }
-        for (pos, (known, cube)) in &a {
+        for (pos, (known, cube, tops)) in &a {
             let other = b
                 .get(pos)
                 .unwrap_or_else(|| panic!("{what}: level {level} misses {pos:?}"));
@@ -157,6 +158,26 @@ fn assert_pyramids_equal(incremental: &LodPyramid, rebuilt: &LodPyramid, full: b
                     }
                 }
             }
+            if tops != &other.2 {
+                for half in 0..2 {
+                    for z in 0..CUBE_SIZE as u8 {
+                        for x in 0..CUBE_SIZE as u8 {
+                            let (mine, theirs) =
+                                (tops.half_top(half, x, z), other.2.half_top(half, x, z));
+                            assert_eq!(
+                                mine, theirs,
+                                "{what}: level {level} {pos:?} top of half {half} column \
+                                 ({x}, {z}): incremental {mine} rebuild {theirs} \
+                                 (known {known:08b})"
+                            );
+                        }
+                    }
+                }
+            }
+            assert!(
+                tops.consistent_with(cube),
+                "{what}: level {level} {pos:?} tops disagree with the cells"
+            );
         }
     }
 }
@@ -296,21 +317,46 @@ fn tree_trunk_survives_lod1_and_lod2_and_keeps_log() {
 }
 
 #[test]
-fn a_single_floating_block_vanishes_at_lod1() {
-    // Expected behavior: one filled child of eight is below the occupancy
-    // threshold, so the feature disappears from every LOD level.
+fn a_single_floating_block_survives_as_one_short_cell() {
+    // Task 2.14: any filled child fills the cell, and the cell's top sits
+    // at the block's own top: y 6 is the lower half of level-1 cell 3
+    // (blocks 6..8), so height 1; and three blocks into level-2 cell 1
+    // (blocks 4..8), so height 3.
     let planks = blocks().oak_planks;
-    let mut pyramid = LodPyramid::new(2);
-    let cube = lod0_cube(|x, y, z| {
-        if (x, y, z) == (7, 7, 7) {
-            planks
-        } else {
-            BlockStateId::AIR
-        }
-    });
-    pyramid.insert_lod0(CubePos { x: 0, y: 0, z: 0 }, &cube);
-    let lod1 = pyramid.get(1, CubePos { x: 0, y: 0, z: 0 }).unwrap();
-    assert_eq!(lod1.cube.uniform(), Some(BlockStateId::AIR));
+    let mut pyramid = LodPyramid::new(4);
+    // The parent's whole footprint is inserted so the chain is fully real.
+    insert_footprint(
+        &mut pyramid,
+        CubePos { x: 0, y: 0, z: 0 },
+        CubePos { x: 1, y: 1, z: 1 },
+        |pos| {
+            if pos == (CubePos { x: 0, y: 0, z: 0 }) {
+                lod0_cube(|x, y, z| {
+                    if (x, y, z) == (7, 6, 7) {
+                        planks
+                    } else {
+                        BlockStateId::AIR
+                    }
+                })
+            } else {
+                Cube::filled(BlockStateId::AIR)
+            }
+        },
+    );
+    for (level, cell, h) in [(1u8, 3u8, 1u8), (2, 1, 3)] {
+        let lod = pyramid.get(level, CubePos { x: 0, y: 0, z: 0 }).unwrap();
+        let filled: Vec<LocalPos> = (0..jbm_core::coords::CUBE_VOLUME)
+            .map(LocalPos::from_index)
+            .filter(|&local| lod.cube.get(local) != BlockStateId::AIR)
+            .collect();
+        assert_eq!(
+            filled,
+            vec![LocalPos::new_unchecked(cell, cell, cell)],
+            "level {level}"
+        );
+        assert_eq!(lod.cube.get(filled[0]), planks, "level {level}");
+        assert_eq!(lod.tops.get(cell, cell), h, "level {level} height");
+    }
 }
 
 #[test]
@@ -709,16 +755,16 @@ fn storage_backed_content_model_property_holds_for_ten_seeds() {
 fn flush_lod(pyramid: &mut LodPyramid, storage: &Storage) {
     drain_pyramid(pyramid);
     let dirty = pyramid.take_store_dirty();
-    let records: Vec<(u8, CubePos, Cube, u8)> = dirty
+    let records: Vec<(u8, CubePos, Cube, LodTops, u8)> = dirty
         .iter()
         .map(|&(level, pos)| {
             let lc = pyramid.get(level, pos).expect("dirty cubes are held");
-            (level, pos, lc.cube.clone(), lc.known)
+            (level, pos, lc.cube.clone(), lc.tops.clone(), lc.known)
         })
         .collect();
-    let lod_refs: Vec<(u8, CubePos, &Cube, u8)> = records
+    let lod_refs: Vec<jbm_server::storage::LodRecord<'_>> = records
         .iter()
-        .map(|(level, pos, cube, known)| (*level, *pos, cube, *known))
+        .map(|(level, pos, cube, tops, known)| (*level, *pos, cube, tops, *known))
         .collect();
     storage.save_lod_batch(&[], &lod_refs, &[]).unwrap();
 }
@@ -1135,14 +1181,14 @@ fn eviction_and_regeneration_leave_the_pyramid_unchanged() {
     let (mut server, client) = settled_server(streaming_config());
     // Snapshot the whole pyramid: position, known mask and content.
     let snapshot = |server: &Server| {
-        let mut cubes: Vec<(u8, CubePos, u8, Cube)> = Vec::new();
+        let mut cubes: Vec<(u8, CubePos, u8, Cube, LodTops)> = Vec::new();
         for level in 1..=4u8 {
             for (pos, lc) in server.lod_pyramid().iter(level) {
-                cubes.push((level, *pos, lc.known, lc.cube.clone()));
+                cubes.push((level, *pos, lc.known, lc.cube.clone(), lc.tops.clone()));
             }
         }
         // (level, pos) is unique per entry, so ordering by it is total.
-        cubes.sort_unstable_by_key(|(level, pos, _, _)| (*level, *pos));
+        cubes.sort_unstable_by_key(|(level, pos, ..)| (*level, *pos));
         cubes
     };
     let before = snapshot(&server);
@@ -1179,13 +1225,15 @@ fn eviction_and_regeneration_leave_the_pyramid_unchanged() {
 // ---------------------------------------------------------------------
 // Worldgen LOD sampling (task 2.7)
 
-/// The exact level-`level` downsample at `pos`: generated LOD0 cubes,
-/// downsampled octant by octant all the way up. Level 0 is `generate`.
-fn exact_cube(generator: &Generator, level: u8, pos: CubePos) -> Cube {
+/// The exact level-`level` downsample at `pos`, cells and column tops:
+/// generated LOD0 cubes, downsampled octant by octant all the way up.
+/// Level 0 is `generate`.
+fn exact_cube(generator: &Generator, level: u8, pos: CubePos) -> (Cube, LodTops) {
     if level == 0 {
-        return generator.generate(pos);
+        return (generator.generate(pos), LodTops::LOD0);
     }
     let mut cube = Cube::filled(BlockStateId::AIR);
+    let mut tops = LodTops::empty(level);
     for octant in 0..8u8 {
         let [dx, dy, dz] = octant_offset(octant).map(i32::from);
         let child = CubePos {
@@ -1193,10 +1241,10 @@ fn exact_cube(generator: &Generator, level: u8, pos: CubePos) -> Cube {
             y: pos.y * 2 + dy,
             z: pos.z * 2 + dz,
         };
-        let child_cube = exact_cube(generator, level - 1, child);
-        jbm_core::lod::downsample_octant(&child_cube, &mut cube, octant);
+        let (child_cube, child_tops) = exact_cube(generator, level - 1, child);
+        jbm_core::lod::downsample_octant(&child_cube, &child_tops, &mut cube, &mut tops, octant);
     }
-    cube
+    (cube, tops)
 }
 
 /// Seeded level-`level` positions whose column intersects the surface,
@@ -1278,7 +1326,8 @@ fn level_1_exactness(generator: Generator) {
         let expected = exact_cube(&generator, 1, pos);
         let generates = generator.generate_calls();
         let sampled = generator.sample_lod(1, pos);
-        assert_eq!(sampled, expected, "level 1 at {pos:?}");
+        assert_eq!(sampled.0, expected.0, "level 1 cells at {pos:?}");
+        assert_eq!(sampled.1, expected.1, "level 1 tops at {pos:?}");
         assert_eq!(
             generator.generate_calls(),
             generates,
@@ -1324,8 +1373,8 @@ fn levels_track(generator: &Generator, rng: &mut XorShift64, n2: u64, n3: u64, n
         let mut within_one = 0usize;
         let mut same_material = 0usize;
         for &pos in &positions {
-            let sampled = generator.sample_lod(level, pos);
-            let expected = exact_cube(generator, level, pos);
+            let sampled = generator.sample_lod(level, pos).0;
+            let expected = exact_cube(generator, level, pos).0;
             let top = |cube: &Cube, x: u8, z: u8| -> Option<(u8, BlockStateId)> {
                 (0..CUBE_SIZE as u8).rev().find_map(|y| {
                     let state = cube.get(LocalPos::new_unchecked(x, y, z));
@@ -1386,7 +1435,11 @@ fn sample_lod_bounds_fast_paths_sample_nothing_and_never_generate() {
                 z: -3,
             },
         );
-        assert_eq!(air, Cube::default(), "air fast path at level {level}");
+        assert_eq!(
+            air,
+            (Cube::default(), LodTops::empty(level)),
+            "air fast path at level {level}"
+        );
         let stone = generator.sample_lod(
             level,
             CubePos {
@@ -1397,7 +1450,7 @@ fn sample_lod_bounds_fast_paths_sample_nothing_and_never_generate() {
         );
         assert_eq!(
             stone,
-            Cube::filled(blocks().stone),
+            (Cube::filled(blocks().stone), LodTops::full(level)),
             "stone fast path at level {level}"
         );
     }
@@ -1462,6 +1515,22 @@ fn assert_octant_equals(
     }
 }
 
+/// Asserts the column tops of `octant`'s half inside `got` equal the
+/// same octant's tops in `expected`.
+fn assert_octant_tops_equal(got: &LodTops, octant: u8, expected: &LodTops, what: &str) {
+    let half = CUBE_SIZE as u8 / 2;
+    let [ox, oy, oz] = octant_offset(octant);
+    for z in oz * half..(oz + 1) * half {
+        for x in ox * half..(ox + 1) * half {
+            assert_eq!(
+                got.half_top(oy, x, z),
+                expected.half_top(oy, x, z),
+                "{what}: top of column ({x}, {z})"
+            );
+        }
+    }
+}
+
 #[test]
 fn no_placeholder_air_half_visited_level_2_cube() {
     // Visit the bottom half of a level-2 cube's footprint only, then ask
@@ -1495,7 +1564,9 @@ fn no_placeholder_air_half_visited_level_2_cube() {
     pyramid.request(2, level2);
     drain_pyramid(&mut pyramid);
 
-    let lod2 = pyramid.ready(2, level2).expect("the level-2 cube is ready");
+    let (lod2, lod2_tops) = pyramid
+        .ready_tops(2, level2)
+        .expect("the level-2 cube is ready");
     let sample = generator.sample_lod(2, level2);
     let base = CubePos {
         x: level2.x * 2,
@@ -1511,26 +1582,35 @@ fn no_placeholder_air_half_visited_level_2_cube() {
         };
         if dy == 0 {
             // Visited: the downsample of the real, filled level-1 child.
-            let child_lod = pyramid
-                .ready(1, child)
+            let (child_lod, child_tops) = pyramid
+                .ready_tops(1, child)
                 .expect("the visited level-1 child is ready");
             let mut want = Cube::filled(BlockStateId::AIR);
-            jbm_core::lod::downsample_octant(child_lod, &mut want, octant);
+            let mut want_tops = LodTops::empty(2);
+            jbm_core::lod::downsample_octant(
+                child_lod,
+                child_tops,
+                &mut want,
+                &mut want_tops,
+                octant,
+            );
             assert_octant_equals(
                 lod2,
                 octant,
                 |cell| want.get(cell),
                 "visited octant (real level-1 child)",
             );
+            assert_octant_tops_equal(lod2_tops, octant, &want_tops, "visited octant");
         } else {
             // Unvisited: the worldgen sample's octant.
-            let expected = sample.clone();
+            let expected = sample.0.clone();
             assert_octant_equals(
                 lod2,
                 octant,
                 move |cell| expected.get(cell),
                 "unvisited octant (worldgen sample)",
             );
+            assert_octant_tops_equal(lod2_tops, octant, &sample.1, "unvisited octant");
         }
     }
 }
@@ -1778,7 +1858,14 @@ fn real_data_wins_over_an_in_flight_sample() {
     assert!(merged.ready());
     // The real octant's content is the child's downsample, not the sample.
     let mut expected = Cube::filled(BlockStateId::AIR);
-    jbm_core::lod::downsample_octant(&cube, &mut expected, octant);
+    let mut expected_tops = LodTops::empty(1);
+    jbm_core::lod::downsample_octant(
+        &cube,
+        &LodTops::LOD0,
+        &mut expected,
+        &mut expected_tops,
+        octant,
+    );
     let expected = expected;
     assert_octant_equals(
         &merged.cube,
@@ -1786,6 +1873,7 @@ fn real_data_wins_over_an_in_flight_sample() {
         |cell| expected.get(cell),
         "the real octant is the child's downsample",
     );
+    assert_octant_tops_equal(&merged.tops, octant, &expected_tops, "the real octant");
 }
 
 #[test]
@@ -2083,7 +2171,13 @@ fn edits_survive_in_lod_without_the_lod0_cube_loaded() {
         .unwrap()
         .expect("stored LOD0");
     let mut expected = Cube::filled(BlockStateId::AIR);
-    jbm_core::lod::downsample_octant(&stored_lod0, &mut expected, parent(ground.split().0).1);
+    jbm_core::lod::downsample_octant(
+        &stored_lod0,
+        &LodTops::LOD0,
+        &mut expected,
+        &mut LodTops::empty(1),
+        parent(ground.split().0).1,
+    );
     let got = server.lod_ready(1, cube1).unwrap();
     assert_eq!(
         got.get(cell1),
@@ -2455,16 +2549,16 @@ fn edit_while_child_fills_after_reload_keeps_the_reference_content() {
         assert!(pyramid.ready(2, p2).is_some());
         let dirty = pyramid.take_store_dirty();
         assert_eq!(dirty, vec![(1, p1), (2, p2)], "both cubes became ready");
-        let records: Vec<(u8, CubePos, Cube, u8)> = dirty
+        let records: Vec<(u8, CubePos, Cube, LodTops, u8)> = dirty
             .iter()
             .map(|&(level, pos)| {
                 let lc = pyramid.get(level, pos).unwrap();
-                (level, pos, lc.cube.clone(), lc.known)
+                (level, pos, lc.cube.clone(), lc.tops.clone(), lc.known)
             })
             .collect();
-        let lod_refs: Vec<(u8, CubePos, &Cube, u8)> = records
+        let lod_refs: Vec<jbm_server::storage::LodRecord<'_>> = records
             .iter()
-            .map(|record| (record.0, record.1, &record.2, record.3))
+            .map(|record| (record.0, record.1, &record.2, &record.3, record.4))
             .collect();
         storage.save_lod_batch(&[], &lod_refs, &[]).unwrap();
     }
@@ -2610,7 +2704,7 @@ fn kill_during_save_leaves_lod_records_consistent_with_lod0() {
             "round {round}: some LOD records were committed"
         );
         for (level, pos) in &lod_keys {
-            let (cube, _known) = storage
+            let (cube, tops, _known) = storage
                 .load_lod(*level, *pos)
                 .unwrap_or_else(|e| {
                     panic!("round {round}: LOD {level} {pos:?} failed to decode: {e}")
@@ -2626,12 +2720,25 @@ fn kill_during_save_leaves_lod_records_consistent_with_lod0() {
                     };
                     if let Some(lod0) = storage.load(child).expect("lod0 load") {
                         let mut expected = Cube::filled(BlockStateId::AIR);
-                        jbm_core::lod::downsample_octant(&lod0, &mut expected, octant);
+                        let mut expected_tops = LodTops::empty(1);
+                        jbm_core::lod::downsample_octant(
+                            &lod0,
+                            &LodTops::LOD0,
+                            &mut expected,
+                            &mut expected_tops,
+                            octant,
+                        );
                         assert_octant_equals(
                             &cube,
                             octant,
                             |cell| expected.get(cell),
                             "round {round}: stored LOD disagrees with stored LOD0",
+                        );
+                        assert_octant_tops_equal(
+                            &tops,
+                            octant,
+                            &expected_tops,
+                            "stored LOD tops disagree with stored LOD0",
                         );
                     }
                 }

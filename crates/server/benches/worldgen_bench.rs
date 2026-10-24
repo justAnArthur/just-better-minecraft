@@ -136,7 +136,7 @@ fn bench(c: &mut Criterion) {
                 z: 0,
             };
             assert!(
-                generator.sample_lod(level, pos).uniform().is_none(),
+                generator.sample_lod(level, pos).0.uniform().is_none(),
                 "level {level} surface case must be mixed"
             );
             b.iter(|| generator.sample_lod(level, black_box(pos)))
@@ -146,7 +146,7 @@ fn bench(c: &mut Criterion) {
         let generator = generator();
         let pos = CubePos { x: 0, y: 100, z: 0 };
         assert_eq!(
-            generator.sample_lod(2, pos).uniform(),
+            generator.sample_lod(2, pos).0.uniform(),
             Some(jbm_core::block::BlockStateId::AIR),
             "the air case must hit the fast path"
         );
@@ -265,7 +265,7 @@ fn bench(c: &mut Criterion) {
                 z: pos.z >> level,
             };
             assert!(
-                generator.sample_lod(level, pos).uniform().is_none(),
+                generator.sample_lod(level, pos).0.uniform().is_none(),
                 "level {level} surface case must be mixed"
             );
             b.iter(|| generator.sample_lod(level, black_box(pos)))
