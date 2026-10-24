@@ -387,7 +387,9 @@ fn fly_1p5km_over_real_rings_shows_no_holes() {
     }
 
     // Settle the initial view: the queue stays clear for a full second.
-    let settle_deadline = Instant::now() + Duration::from_secs(60);
+    // Since the task 2.13 E defaults (16 / 16 / 5) the first fill takes
+    // ~83 s on an M5 Pro, past the old 60 s budget.
+    let settle_deadline = Instant::now() + Duration::from_secs(180);
     let mut clear_ticks = 0;
     while clear_ticks < 20 {
         fly.frames_for_one_tick(&gpu, &camera);
