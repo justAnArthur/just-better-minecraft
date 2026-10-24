@@ -28,9 +28,10 @@ use jbm_client::camera::Camera;
 use jbm_client::lod::Coverage;
 use jbm_client::lod::CubeKey;
 use jbm_client::mesh;
-use jbm_client::mesh::appearance::{BlockAppearance, builtin_textures};
+use jbm_client::mesh::appearance::BlockAppearance;
 use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
+use jbm_client::render::settings::RenderSettings;
 use jbm_client::render::terrain::{TerrainPass, TerrainPath};
 use jbm_client::render::texture_array::BlockTextures;
 use jbm_client::terrain_sync::TerrainSync;
@@ -424,6 +425,32 @@ fn cameras() -> Vec<(&'static str, Camera, bool)> {
 }
 
 /// Renders one frame with the sentinel sky and returns the image.
+/// The sentinel tests' frame (task 2.15): 1× MSAA. A hole is a pixel
+/// the terrain leaves uncovered; at 4× a sliver hole that misses some
+/// samples resolves to a blend the exact sentinel check would not see,
+/// so the hole tests keep single-sample strictness.
+fn one_sample_frame(
+    gpu: &jbm_client::gpu::Gpu,
+) -> (OffscreenTarget, DepthTarget, Renderer, TerrainPass) {
+    let settings = RenderSettings {
+        msaa_samples: 1,
+        ..RenderSettings::default()
+    };
+    let target = OffscreenTarget::new(&gpu.device, SIZE, SIZE);
+    let depth = DepthTarget::with_samples(&gpu.device, SIZE, SIZE, 1);
+    let mut renderer = Renderer::with_settings(gpu, target.format(), settings);
+    renderer.set_viewport(SIZE, SIZE);
+    let textures = BlockTextures::builtin(gpu).expect("texture array");
+    let terrain = TerrainPass::with_settings(
+        gpu,
+        target.format(),
+        renderer.uniform_layout(),
+        &textures,
+        &settings,
+    );
+    (target, depth, renderer, terrain)
+}
+
 fn render_sentinel(
     gpu: &jbm_client::gpu::Gpu,
     renderer: &mut Renderer,
@@ -474,13 +501,7 @@ fn rings_scene_has_no_holes_below_the_horizon_margin() {
     };
 
     let (world, appearance, _blocks) = build_scene();
-    let target = OffscreenTarget::new(&gpu.device, SIZE, SIZE);
-    let depth = DepthTarget::new(&gpu.device, SIZE, SIZE);
-    let mut renderer = Renderer::new(&gpu, target.format());
-    renderer.set_viewport(SIZE, SIZE);
-    let (layers, _) = builtin_textures();
-    let textures = BlockTextures::new(&gpu, &layers).expect("texture array");
-    let mut terrain = TerrainPass::new(&gpu, target.format(), renderer.uniform_layout(), &textures);
+    let (target, depth, mut renderer, mut terrain) = one_sample_frame(&gpu);
 
     // Mesh from a central camera so distance ordering is realistic.
     settle(
@@ -597,8 +618,7 @@ fn lod0_lod1_border_is_invisible_with_flat_colors() {
     let depth = DepthTarget::new(&gpu.device, SIZE, SIZE);
     let mut renderer = Renderer::new(&gpu, target.format());
     renderer.set_viewport(SIZE, SIZE);
-    let (layers, _) = builtin_textures();
-    let textures = BlockTextures::new(&gpu, &layers).expect("texture array");
+    let textures = BlockTextures::builtin(&gpu).expect("texture array");
     let mut terrain = TerrainPass::new(&gpu, target.format(), renderer.uniform_layout(), &textures);
     settle(
         &gpu,
@@ -697,14 +717,11 @@ fn level_tint_marks_each_drawn_level() {
         return;
     };
     let (world, appearance, _blocks) = build_scene();
-    let target = OffscreenTarget::new(&gpu.device, SIZE, SIZE);
-    let depth = DepthTarget::new(&gpu.device, SIZE, SIZE);
-    let mut renderer = Renderer::new(&gpu, target.format());
-    renderer.set_viewport(SIZE, SIZE);
+    // 1× (task 2.15): the signature is per fragment; at 4× the silhouette
+    // pixels blend a tinted level with the sky or another level, which no
+    // single level's color explains.
+    let (target, depth, mut renderer, mut terrain) = one_sample_frame(&gpu);
     renderer.set_fog(false);
-    let (layers, _) = builtin_textures();
-    let textures = BlockTextures::new(&gpu, &layers).expect("texture array");
-    let mut terrain = TerrainPass::new(&gpu, target.format(), renderer.uniform_layout(), &textures);
     settle(
         &gpu,
         world,
@@ -797,8 +814,7 @@ fn rings_scene_paths_render_pixel_identical() {
     let depth = DepthTarget::new(&gpu.device, SIZE, SIZE);
     let mut renderer = Renderer::new(&gpu, target.format());
     renderer.set_viewport(SIZE, SIZE);
-    let (layers, _) = builtin_textures();
-    let textures = BlockTextures::new(&gpu, &layers).expect("texture array");
+    let textures = BlockTextures::builtin(&gpu).expect("texture array");
     let mut terrain = TerrainPass::new(&gpu, target.format(), renderer.uniform_layout(), &textures);
     settle(
         &gpu,
@@ -902,8 +918,7 @@ fn a_lod1_cube_renders_like_its_pattern_scaled() {
     let depth = DepthTarget::new(&gpu.device, SIZE, SIZE);
     let mut renderer = Renderer::new(&gpu, target.format());
     renderer.set_viewport(SIZE, SIZE);
-    let (layers, _) = builtin_textures();
-    let textures = BlockTextures::new(&gpu, &layers).expect("texture array");
+    let textures = BlockTextures::builtin(&gpu).expect("texture array");
 
     let mut render_at = |level: u8, cube: &Cube| -> RgbaImage {
         let mut terrain =
@@ -1051,13 +1066,7 @@ fn masked_octants_hide_their_volume_and_full_masks_draw_nothing() {
         }
     });
 
-    let target = OffscreenTarget::new(&gpu.device, SIZE, SIZE);
-    let depth = DepthTarget::new(&gpu.device, SIZE, SIZE);
-    let mut renderer = Renderer::new(&gpu, target.format());
-    renderer.set_viewport(SIZE, SIZE);
-    let (layers, _) = builtin_textures();
-    let textures = BlockTextures::new(&gpu, &layers).expect("texture array");
-    let mut terrain = TerrainPass::new(&gpu, target.format(), renderer.uniform_layout(), &textures);
+    let (target, depth, mut renderer, mut terrain) = one_sample_frame(&gpu);
     let mut coverage = Coverage::default();
     let key = CubeKey {
         level: 1,

@@ -16,11 +16,11 @@ use image::RgbaImage;
 use jbm_client::camera::Camera;
 use jbm_client::lod::CubeKey;
 use jbm_client::mesh;
-use jbm_client::mesh::appearance::{
-    BlockAppearance, LAYER_OAK_PLANKS, LAYER_STONE, builtin_textures,
-};
+use jbm_client::mesh::appearance::{BlockAppearance, LAYER_OAK_PLANKS, LAYER_STONE};
 use jbm_client::render::offscreen::OffscreenTarget;
-use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
+use jbm_client::render::renderer::{
+    AMBIENT_SKY, DepthTarget, FrameInputs, Renderer, SUN_COLOR, sun_direction,
+};
 use jbm_client::render::terrain::{
     FADE_END_FRACTION, FADE_START_FRACTION, FOG_END_FRACTION, FOG_START_FRACTION, TerrainPass,
 };
@@ -87,8 +87,7 @@ impl Ctx {
         let depth = DepthTarget::new(&gpu.device, size, size);
         let mut renderer = Renderer::new(&gpu, target.format());
         renderer.set_viewport(size, size);
-        let (layers, _) = builtin_textures();
-        let textures = BlockTextures::new(&gpu, &layers).expect("texture array");
+        let textures = BlockTextures::builtin(&gpu).expect("texture array");
         let terrain = TerrainPass::new(&gpu, target.format(), renderer.uniform_layout(), &textures);
         Ctx {
             gpu,
@@ -161,7 +160,10 @@ fn upload_isolated(
 /// Task 2.9: a single LOD1 cube of one material renders its top face in
 /// the layer's flat average color (times the top shade and the corner AO;
 /// the isolated cube's top corners are all open, so both factors are 1).
-/// No fog, no golden — a direct per-pixel assertion within ±1 LSB.
+/// Task 2.15 restates it for both lighting modes: lighting off is the
+/// flat average exactly, lighting on is the average times the
+/// up-facing sun and sky light. No fog, no golden — a direct per-pixel
+/// assertion within ±1 LSB.
 #[test]
 fn lod1_cube_top_face_is_the_flat_average_color() {
     let Some(gpu) = gpu_or_skip() else {
@@ -172,6 +174,7 @@ fn lod1_cube_top_face_is_the_flat_average_color() {
     let appearance = BlockAppearance::new(&registry);
     let mut ctx = Ctx::new(gpu, SIZE);
     ctx.renderer.set_fog(false);
+    ctx.renderer.settings_mut().sun_lighting = false;
 
     // A stone plateau: filled below local row 8 (16 blocks at level 1),
     // so the top face sits at world y = 16 spanning x, z in 0..64.
@@ -185,7 +188,9 @@ fn lod1_cube_top_face_is_the_flat_average_color() {
         FOV,
         1.0,
     );
-    let image = ctx.render(&camera);
+    let flat = ctx.render(&camera);
+    ctx.renderer.settings_mut().sun_lighting = true;
+    let lit = ctx.render(&camera);
 
     // The plateau's top-face corners, projected; a box shrunk 15% stays
     // strictly inside the face.
@@ -208,24 +213,32 @@ fn lod1_cube_top_face_is_the_flat_average_color() {
     let (y0, y1) = shrink(min_y, max_y);
 
     let avg = ctx.textures.averages()[LAYER_STONE as usize];
-    let expected = [
-        linear_to_srgb(avg[0]),
-        linear_to_srgb(avg[1]),
-        linear_to_srgb(avg[2]),
-    ];
+    // Lighting off: the old flat look, the average times the top shade 1.
+    // Lighting on (task 2.15): the average times the up-facing light —
+    // the sky ambient (an up normal sees only the sky hemisphere and has
+    // no sideways tilt toward the sun) plus the sun at its elevation.
+    let sun_y = sun_direction().y;
+    let top_light: [f32; 3] = std::array::from_fn(|c| AMBIENT_SKY[c] + SUN_COLOR[c] * sun_y);
     let mut checked = 0;
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let pixel = image.get_pixel(x as u32, y as u32);
-            for (c, (&got, &want)) in pixel.0.iter().zip(expected.iter()).enumerate() {
-                assert!(
-                    (i16::from(got) - i16::from(want)).abs() <= 1,
-                    "pixel ({x}, {y}) channel {c}: {got} vs flat average {want}"
-                );
+    for (image, light, what) in [
+        (&flat, [1.0; 3], "flat average"),
+        (&lit, top_light, "sun-lit average"),
+    ] {
+        let expected: [u8; 3] = std::array::from_fn(|c| linear_to_srgb(avg[c] * light[c]));
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let pixel = image.get_pixel(x as u32, y as u32);
+                for (c, (&got, &want)) in pixel.0.iter().zip(expected.iter()).enumerate() {
+                    assert!(
+                        (i16::from(got) - i16::from(want)).abs() <= 1,
+                        "pixel ({x}, {y}) channel {c}: {got} vs {what} {want}"
+                    );
+                }
+                checked += 1;
             }
-            checked += 1;
         }
     }
+    let checked = checked / 2;
     assert!(
         checked > 1000,
         "the shrunk top-face box held only {checked} pixels"
@@ -253,6 +266,10 @@ fn lod0_grass_strip_fades_into_the_flat_average() {
     const FADE_SIZE: u32 = 1024;
     let mut ctx = Ctx::new(gpu, FADE_SIZE);
     ctx.renderer.set_fog(false);
+    // The fade mechanism against the flat average itself: lighting off
+    // (top faces then shade by exactly 1; sun lighting scales reference
+    // and average alike, which the lod1 test covers).
+    ctx.renderer.settings_mut().sun_lighting = false;
 
     // A wide plank sheet: 8 cubes across (x -128..128, covering the whole
     // view) by 10 cubes deep (z 0..320), each cube filled below local row
@@ -388,10 +405,13 @@ fn lod0_grass_strip_fades_into_the_flat_average() {
     assert!(rows > 100, "only {rows} rows of the strip were checked");
 }
 
-/// Task 2.9: with fog on, a terrain pixel at or beyond the fog end equals
-/// the sky color behind it (the pixel's ray is above the horizon, where
-/// the fog's clamped gradient is the sky's own), and a near pixel is
-/// byte-identical with fog off.
+/// Task 2.9, restated for 2.15's haze: with fog on, a terrain pixel at
+/// or beyond the fog end (FOG_END_FRACTION of the furthest ring radius,
+/// the haze's hard end) equals the sky color behind it (the pixel's ray
+/// is above the horizon, where the haze's clamped sky — gradient plus sun
+/// glow — is the sky's own; clouds have faded out that close to the
+/// horizon), and a near pixel is unchanged by fog except for the thin
+/// height haze over its ~70 blocks (within 3 LSB).
 #[test]
 fn fog_matches_the_sky_and_leaves_near_terrain_alone() {
     let Some(gpu) = gpu_or_skip() else {
@@ -471,8 +491,82 @@ fn fog_matches_the_sky_and_leaves_near_terrain_alone() {
     let (nx, ny) = project(&camera, near_world, SIZE);
     let with_fog = fogged.get_pixel(nx.round() as u32, ny.round() as u32);
     let without_fog = clear.get_pixel(nx.round() as u32, ny.round() as u32);
-    assert_eq!(
-        with_fog.0, without_fog.0,
-        "the near pixel must be unchanged by fog"
+    for c in 0..3 {
+        assert!(
+            (i16::from(with_fog.0[c]) - i16::from(without_fog.0[c])).abs() <= 3,
+            "the near pixel must be all but unchanged by fog: {:?} vs {:?}",
+            with_fog.0,
+            without_fog.0
+        );
+    }
+}
+
+/// A cube with a stone box in cells 4..28 on every axis, air around it.
+fn stone_box() -> Cube {
+    let stone = {
+        let mut registry = BlockRegistry::new();
+        Blocks::register(&mut registry).stone
+    };
+    Cube::from_fn(|p| {
+        let inside = |v: i32| (4..28).contains(&v);
+        if inside(p.x as i32) && inside(p.y as i32) && inside(p.z as i32) {
+            stone
+        } else {
+            BlockStateId::AIR
+        }
+    })
+}
+
+/// Task 2.15: the haze is height-aware — thicker in valleys. The same
+/// LOD1 stone wall at the same distance, seen level from a camera near
+/// sea level and from one 384 blocks higher (scene and camera shifted up
+/// together), is closer to the sky behind it down low. The ring fog's
+/// hard end is pushed out of range so only the height haze acts; the
+/// view is level and away from the sun, so the sky behind both walls is
+/// the same horizon color.
+#[test]
+fn haze_is_thicker_in_valleys() {
+    let Some(gpu) = gpu_or_skip() else {
+        return;
+    };
+    let mut registry = BlockRegistry::new();
+    Blocks::register(&mut registry);
+    let appearance = BlockAppearance::new(&registry);
+    let mut ctx = Ctx::new(gpu, SIZE);
+    ctx.renderer.set_view_distance(256.0, 1.0e6);
+
+    // Two LOD1 cubes (64 blocks) holding a stone box with an air margin
+    // (cells 4..28, blocks 8..56 — a filled edge would face the missing
+    // neighbors, which read as opaque, and be culled): one at cube y 0,
+    // one at cube y 6 (384 blocks up), 2048 blocks apart in x so neither
+    // shows in the other's view.
+    let cube = Arc::new(stone_box());
+    for (x, y) in [(0, 0), (32, 6)] {
+        let input = mesh::MeshInput::isolated_at_level(Arc::clone(&cube), 1);
+        let output = mesh::mesh(&input, &appearance);
+        let key = CubeKey {
+            level: 1,
+            pos: CubePos { x, y, z: 0 },
+        };
+        ctx.terrain.upload(&ctx.gpu, key, &output);
+    }
+    // Level views of each wall's +z face center from 600 blocks away
+    // (looking toward -z, away from the sun).
+    let mut gap_to_sky = |center: DVec3| {
+        let eye = center + DVec3::new(0.0, 0.0, 600.0);
+        let camera = Camera::looking_at(eye, center, FOV, 1.0);
+        let wall = ctx.render(&camera);
+        let sky = ctx.render_sky(&camera);
+        let c = SIZE / 2;
+        let (w, k) = (wall.get_pixel(c, c).0, sky.get_pixel(c, c).0);
+        (0..3)
+            .map(|i| (i32::from(w[i]) - i32::from(k[i])).abs())
+            .sum::<i32>()
+    };
+    let low = gap_to_sky(DVec3::new(32.0, 32.0, 56.0));
+    let high = gap_to_sky(DVec3::new(2048.0 + 32.0, 384.0 + 32.0, 56.0));
+    assert!(
+        low + 6 < high,
+        "the low wall ({low} from the sky) is not hazier than the high one ({high})"
     );
 }
