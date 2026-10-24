@@ -7,6 +7,9 @@
 //! - `checkerboard`: the worst case (16384 x 6 faces, no merging).
 //! - `uniform_stone_air_neighbors`: the non-fast uniform path.
 //! - `padded_build`: only the padded 34^3 build from 27 cubes.
+//! - `terrain_like_lod2`: the `terrain_like` cells meshed as a level-2
+//!   ring cube (octant splits, skirts, lids and — task 2.14 — partial
+//!   column tops).
 //!
 //! Suballoc case:
 //! - `churn_10k`: the seeded 10,000-operation alloc/free churn from the
@@ -103,6 +106,12 @@ fn bench(c: &mut Criterion) {
         neighbors: uniform_neighbors(Some(Arc::clone(&stone))),
     };
 
+    let lod2_input = MeshInput {
+        level: 2,
+        center: Arc::new(terrain_like_cube(&blocks)),
+        neighbors: terrain_neighbors(&air, &stone),
+    };
+
     let mut group = c.benchmark_group("mesh");
     group.bench_function("terrain_like", |b| {
         b.iter(|| {
@@ -127,6 +136,9 @@ fn bench(c: &mut Criterion) {
                 black_box(&appearance),
             ))
         })
+    });
+    group.bench_function("terrain_like_lod2", |b| {
+        b.iter(|| black_box(mesh::mesh(black_box(&lod2_input), black_box(&appearance))))
     });
     group.bench_function("padded_build", |b| {
         b.iter(|| {
