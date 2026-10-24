@@ -16,6 +16,7 @@ use crate::gpu::Gpu;
 use crate::lod::CubeKey;
 use crate::render::renderer::DepthTarget;
 use crate::render::settings::RenderSettings;
+use crate::render::timing::GpuTimer;
 
 use super::TerrainPass;
 use super::pages::CubeMesh;
@@ -116,7 +117,7 @@ impl TerrainPass {
     /// The cpu-cull frame (also the fallback path's culling): the CPU
     /// frustum and direction tests over the same meta slots, with the
     /// shared origin formula, so the CPU and GPU cull on the same numbers.
-    // The eight parameters are one frame's draw context; a bundling struct
+    // The nine parameters are one frame's draw context; a bundling struct
     // would only be unpacked again here.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn draw_cpu_cull(
@@ -128,6 +129,7 @@ impl TerrainPass {
         camera: &Camera,
         uniforms: &wgpu::BindGroup,
         settings: &RenderSettings,
+        timer: Option<&GpuTimer>,
     ) {
         let terrain_uniforms = self.terrain_uniforms_for(camera, settings);
         gpu.queue.write_buffer(
@@ -263,7 +265,7 @@ impl TerrainPass {
         gpu.queue
             .write_buffer(&self.indirect_buffer, 0, bytemuck::cast_slice(&commands));
 
-        let mut pass = self.begin_pass(encoder, target, depth.view());
+        let mut pass = self.begin_pass(encoder, target, depth.view(), timer);
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, uniforms, &[]);
         pass.set_bind_group(2, &self.shared_bind_group, &[]);

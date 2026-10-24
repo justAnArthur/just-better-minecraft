@@ -69,6 +69,11 @@ impl Gpu {
         {
             required_features |= wgpu::Features::INDIRECT_FIRST_INSTANCE;
         }
+        // Pass timestamps (task 2.16) for the GPU frame times, where the
+        // adapter has them; nothing depends on the feature being present.
+        if adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            required_features |= wgpu::Features::TIMESTAMP_QUERY;
+        }
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("jbm device"),
             required_features,

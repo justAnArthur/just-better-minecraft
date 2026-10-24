@@ -12,6 +12,7 @@ use crate::render::outline::OutlinePass;
 use crate::render::overlay::{OverlayRenderer, OverlayText};
 use crate::render::settings::RenderSettings;
 use crate::render::terrain::TerrainPass;
+use crate::render::timing::{GpuTimer, GpuTimings};
 
 /// Depth buffer format. Reverse-Z (cleared to 0.0, `Greater` compare) with
 /// an infinite far plane keeps precision near the camera for Stage 2's
@@ -350,6 +351,8 @@ pub struct Renderer {
     /// draw. Seeded from `RenderSettings::from_env()` by the app through
     /// `set_settings`; defaults otherwise.
     settings: RenderSettings,
+    /// The pass timer (task 2.16), when the device has timestamp queries.
+    timer: Option<GpuTimer>,
 }
 
 impl Renderer {
@@ -472,6 +475,7 @@ impl Renderer {
             color_format,
             msaa_color: None,
             settings,
+            timer: GpuTimer::new(gpu),
         }
     }
 
@@ -483,6 +487,18 @@ impl Renderer {
             msaa_samples: self.settings.msaa_samples,
             ..settings
         };
+    }
+
+    /// The newest GPU pass times (task 2.16), one or two frames late;
+    /// `None` without timestamp queries or before the first readback.
+    pub fn gpu_timings(&self) -> Option<&GpuTimings> {
+        self.timer.as_ref().and_then(GpuTimer::latest)
+    }
+
+    /// Waits for the submitted frames and returns the newest GPU pass
+    /// times (the perf harness).
+    pub fn read_gpu_timings_blocking(&mut self, gpu: &Gpu) -> Option<GpuTimings> {
+        self.timer.as_mut().and_then(|t| t.read_blocking(gpu))
     }
 
     /// The MSAA sample count the pipelines were built for.
@@ -666,6 +682,10 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("jbm frame"),
             });
+        if let Some(timer) = &mut self.timer {
+            timer.begin_frame(gpu);
+        }
+        let timer = self.timer.as_ref();
 
         // The clear: color, and depth to 0.0 (far in reverse-Z) so the
         // terrain can depth-test against it. Without terrain the sky pass
@@ -691,7 +711,7 @@ impl Renderer {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: timer.and_then(|t| t.render_writes("clear")),
                 occlusion_query_set: None,
                 multiview_mask: None,
             }));
@@ -705,6 +725,7 @@ impl Renderer {
                 frame.camera,
                 &self.uniform_bind_group,
                 &self.settings,
+                timer,
             );
         }
 
@@ -741,7 +762,7 @@ impl Renderer {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: timer.and_then(|t| t.render_writes("sky")),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -789,7 +810,7 @@ impl Renderer {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: timer.and_then(|t| t.render_writes("resolve")),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -806,7 +827,13 @@ impl Renderer {
             );
         }
 
+        if let Some(timer) = &mut self.timer {
+            timer.end_frame(&mut encoder);
+        }
         gpu.queue.submit([encoder.finish()]);
+        if let Some(timer) = &mut self.timer {
+            timer.after_submit();
+        }
     }
 }
 

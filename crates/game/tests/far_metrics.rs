@@ -9,13 +9,15 @@
 //! per-cube), the quad-split study (re-meshing with AO, then the texture
 //! layer, dropped from the merge key), server settle time and memory, the
 //! client's face-page bytes, and one frame's CPU cost (encode + GPU wait;
-//! timestamp queries are not enabled on the device, so there is no
-//! separate GPU-time number). Two cameras — spawn and a deterministic
-//! mountain top. The baseline run pins the pre-2.13 rings
+//! the GPU time per pass is `perf_views`'s job). Two cameras — spawn and a
+//! deterministic mountain top. The baseline run pins the pre-2.13 rings
 //! (`view_radius` 8 and 16, `lod_view_radius` 8, `lod_levels` 6); the
 //! task 2.13 E `far_metrics_defaults` run measures the shipped
 //! defaults, and `far_shots` saves the tinted before/after PNGs.
 //! Everything the task's later steps are judged against comes from here.
+//! Task 2.16 adds `perf_views`, the frame-rate harness: CPU and GPU
+//! (timestamp) frame times of the user's view and the look-review cameras
+//! at 2560×1440 and 5120×2880.
 #![cfg(not(feature = "cube16"))]
 
 use std::collections::HashSet;
@@ -29,8 +31,10 @@ use jbm_client::mesh::appearance::BlockAppearance;
 use jbm_client::mesh::{self, MeshInput, MeshTops, neighbor_index};
 use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
+use jbm_client::render::settings::RenderSettings;
 use jbm_client::render::terrain::TerrainPass;
 use jbm_client::render::texture_array::BlockTextures;
+use jbm_client::render::timing::GpuTimings;
 use jbm_client::terrain_sync::TerrainSync;
 use jbm_core::coords::{CUBE_SIZE, CubePos};
 use jbm_core::link::ClientLink;
@@ -87,15 +91,27 @@ struct MetricsClient {
 
 impl MetricsClient {
     fn new(gpu: &Gpu) -> MetricsClient {
+        MetricsClient::with_settings(gpu, RenderSettings::default())
+    }
+
+    /// A client at `WIDTH`×`HEIGHT` whose renderer and terrain pass run
+    /// with `settings` (the perf harness passes `RenderSettings::from_env`).
+    fn with_settings(gpu: &Gpu, settings: RenderSettings) -> MetricsClient {
         let mut registry = jbm_core::block::BlockRegistry::new();
         jbm_core::block::builtin::register(&mut registry);
         let appearance = Arc::new(BlockAppearance::new(&registry));
         let target = OffscreenTarget::new(&gpu.device, WIDTH, HEIGHT);
-        let depth = DepthTarget::new(&gpu.device, WIDTH, HEIGHT);
-        let mut renderer = Renderer::new(gpu, target.format());
+        let depth = DepthTarget::with_samples(&gpu.device, WIDTH, HEIGHT, settings.msaa_samples);
+        let mut renderer = Renderer::with_settings(gpu, target.format(), settings);
         renderer.set_viewport(WIDTH, HEIGHT);
         let textures = BlockTextures::builtin(gpu).expect("texture array");
-        let terrain = TerrainPass::new(gpu, target.format(), renderer.uniform_layout(), &textures);
+        let terrain = TerrainPass::with_settings(
+            gpu,
+            target.format(),
+            renderer.uniform_layout(),
+            &textures,
+            &settings,
+        );
         MetricsClient {
             sync: TerrainSync::new(Arc::clone(&appearance), 0),
             renderer,
@@ -148,6 +164,14 @@ impl MetricsClient {
                 overlay: None,
             },
         );
+    }
+
+    /// Recreates the color and depth targets at `width`×`height`.
+    fn resize(&mut self, gpu: &Gpu, width: u32, height: u32) {
+        self.target = OffscreenTarget::new(&gpu.device, width, height);
+        self.depth =
+            DepthTarget::with_samples(&gpu.device, width, height, self.renderer.msaa_samples());
+        self.renderer.set_viewport(width, height);
     }
 
     fn pump_meshing(&mut self, gpu: &Gpu, camera: &Camera) {
@@ -328,9 +352,8 @@ fn measure_site(
         format!("{} / {}", stats.used_faces, stats.meshed),
     );
 
-    // Frame CPU cost: encode time and GPU wait over FRAMES frames. GPU
-    // timestamp queries are not enabled on the device, so there is no
-    // separate GPU-time number.
+    // Frame CPU cost: encode time and GPU wait over FRAMES frames (the
+    // GPU time per pass is perf_views' job).
     let mut encode = Duration::ZERO;
     let mut wait = Duration::ZERO;
     let mut total = Duration::ZERO;
@@ -358,7 +381,6 @@ fn measure_site(
             total.as_secs_f64() * 1000.0 / FRAMES as f64
         ),
     );
-    row("GPU time", "n/a (no timestamp queries)");
 
     // Mesher timings over the settled LOD0 set: the same mesh() the worker
     // pool runs, timed inline per cube (the pool itself does not time its
@@ -638,6 +660,35 @@ fn far_shots() {
     }
 }
 
+/// The look review's cameras: (tag, feet position, extra height, yaw
+/// degrees, pitch degrees) — spawn at eye level, spawn from 60 blocks up,
+/// the mountain top, the coast looking out to sea, and 300 blocks up
+/// looking down at 30 degrees. Shared by `look_shots` and `perf_views`.
+fn look_sites(nav: &Generator) -> [(&'static str, DVec3, f64, f32, f32); 5] {
+    let side = i64::from(CUBE_SIZE);
+    let spawn = DVec3::from(nav.spawn());
+    let mountain = mountain_top(nav, 2048);
+    // First all-ocean column along +x from spawn, camera 3 columns inland.
+    let ocean_cx = (0..4000)
+        .find(|&cx| nav.column_surface_bounds(cx, 0).1 < jbm_server::terrain::SEA_LEVEL)
+        .expect("an ocean column");
+    let coast_x = i64::from(ocean_cx - 3) * side;
+    let coast = DVec3::new(
+        coast_x as f64,
+        (nav.surface_height(coast_x, 0)
+            .max(jbm_server::terrain::SEA_LEVEL)
+            + 1) as f64,
+        0.0,
+    );
+    [
+        ("spawn_eye", spawn, 0.0, 0.0, -5.0),
+        ("spawn_60up", spawn, 60.0, 0.0, -15.0),
+        ("mountain", mountain, 0.0, 180.0, -10.0),
+        ("coast", coast, 4.0, 90.0, -5.0),
+        ("high_300", spawn, 300.0, 45.0, -30.0),
+    ]
+}
+
 /// The look review: the shipped defaults, fog on, tint off and on, from
 /// the cameras a player actually sees — spawn at eye level, spawn from 60
 /// blocks up, the mountain top, the coast looking out to sea, and 300
@@ -655,38 +706,15 @@ fn look_shots() {
     let mut registry = jbm_core::block::BlockRegistry::new();
     let blocks = jbm_core::block::builtin::Blocks::register(&mut registry);
     let nav = Generator::with_preset(DEFAULT_SEED, blocks, Preset::Overworld);
-    let side = i64::from(CUBE_SIZE);
-    let spawn = DVec3::from(nav.spawn());
-    let mountain = mountain_top(&nav, 2048);
-    // First all-ocean column along +x from spawn, camera 3 columns inland.
-    let ocean_cx = (0..4000)
-        .find(|&cx| nav.column_surface_bounds(cx, 0).1 < jbm_server::terrain::SEA_LEVEL)
-        .expect("an ocean column");
-    let coast_x = i64::from(ocean_cx - 3) * side;
-    let coast = DVec3::new(
-        coast_x as f64,
-        (nav.surface_height(coast_x, 0)
-            .max(jbm_server::terrain::SEA_LEVEL)
-            + 1) as f64,
-        0.0,
-    );
     let shot_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("target")
         .join("look-shots");
     std::fs::create_dir_all(&shot_dir).expect("shot dir");
 
-    // (tag, feet position, extra height, yaw degrees, pitch degrees)
-    let sites = [
-        ("spawn_eye", spawn, 0.0, 0.0, -5.0),
-        ("spawn_60up", spawn, 60.0, 0.0, -15.0),
-        ("mountain", mountain, 0.0, 180.0, -10.0),
-        ("coast", coast, 4.0, 90.0, -5.0),
-        ("high_300", spawn, 300.0, 45.0, -30.0),
-    ];
     // `JBM_LOOK_SHOTS=coast,mountain` renders a subset (look tuning).
     let only = std::env::var("JBM_LOOK_SHOTS").ok();
-    for (tag, feet, up, yaw, pitch) in sites {
+    for (tag, feet, up, yaw, pitch) in look_sites(&nav) {
         if only
             .as_deref()
             .is_some_and(|list| !list.split(',').any(|t| t.trim() == tag))
@@ -720,8 +748,8 @@ fn look_shots() {
             70.0_f32.to_radians(),
             WIDTH as f32 / HEIGHT as f32,
         );
-        camera.set_yaw((yaw as f32).to_radians());
-        camera.set_pitch((pitch as f32).to_radians());
+        camera.set_yaw(yaw.to_radians());
+        camera.set_pitch(pitch.to_radians());
         settle(
             &mut server,
             &mut win,
@@ -751,5 +779,296 @@ fn look_shots() {
                 start.elapsed().as_secs_f64()
             );
         }
+    }
+}
+
+/// The user's view from the task 2.16 report (an M5 Pro, the game
+/// maximized on a 5K display, 41 fps): hovering 233 blocks up over the
+/// hills 4 km from spawn, looking west-south-west and down. The HUD's XYZ
+/// is the eye; yaw and pitch in degrees.
+const USER_VIEW_EYE: DVec3 = DVec3::new(57.60, 232.67, -4087.75);
+const USER_VIEW_YAW: f32 = 257.7;
+const USER_VIEW_PITCH: f32 = -18.8;
+
+/// Frames timed per view and resolution, after the warm-up.
+const PERF_FRAMES: usize = 60;
+const PERF_WARMUP: usize = 10;
+
+/// The p50 and p95 of `samples` (sorted in place).
+fn p50_p95(samples: &mut [f64]) -> (f64, f64) {
+    samples.sort_by(f64::total_cmp);
+    let at = |q: f64| samples[(q * (samples.len() - 1) as f64).round() as usize];
+    (at(0.5), at(0.95))
+}
+
+/// `JBM_PERF_RES=2560x1440,5120x2880` (the default): the target sizes.
+fn perf_resolutions() -> Vec<(u32, u32)> {
+    let list = std::env::var("JBM_PERF_RES").unwrap_or_else(|_| "2560x1440,5120x2880".into());
+    list.split(',')
+        .map(|item| {
+            let (w, h) = item.trim().split_once('x').expect("WxH");
+            (w.parse().expect("width"), h.parse().expect("height"))
+        })
+        .collect()
+}
+
+/// Task 2.16's perf harness: the user's view and the five look-review
+/// cameras on the default world, settled with the shipped server
+/// defaults, rendered offscreen without vsync at each resolution of
+/// `JBM_PERF_RES` (default 2560×1440 and 5120×2880). Per view and
+/// resolution it prints the CPU time of `Renderer::render` (encode and
+/// submit; the frame's own CPU work) and the GPU time from pass
+/// timestamps (the frame span and each pass), p50 / p95 over
+/// `PERF_FRAMES` frames, plus the frame's faces, commands and draw calls.
+/// Rendering settings come from the environment like the game's
+/// (`JBM_MSAA`, `JBM_GPU_CULL`, `JBM_NO_CLOUDS`, …), so a lever can be
+/// measured without a rebuild; `JBM_PERF_VIEWS=user,coast` limits the
+/// views. Run with
+/// `cargo test --release -p jbm-game --test far_metrics perf_views -- --ignored --nocapture`.
+#[test]
+#[ignore = "slow real-server measurement; run with --ignored"]
+fn perf_views() {
+    let start = Instant::now();
+    let Some(gpu) = jbm_client::testing::screenshot::gpu_or_skip() else {
+        return;
+    };
+    let mut registry = jbm_core::block::BlockRegistry::new();
+    let blocks = jbm_core::block::builtin::Blocks::register(&mut registry);
+    let nav = Generator::with_preset(DEFAULT_SEED, blocks, Preset::Overworld);
+    let settings = RenderSettings::from_env();
+    let info = gpu.adapter.get_info();
+    println!(
+        "perf_views: {} ({:?}), msaa {}, timestamps {}",
+        info.name,
+        info.backend,
+        settings.msaa_samples,
+        gpu.device
+            .features()
+            .contains(wgpu::Features::TIMESTAMP_QUERY)
+    );
+
+    // (tag, eye, yaw degrees, pitch degrees)
+    let mut views = vec![("user", USER_VIEW_EYE, USER_VIEW_YAW, USER_VIEW_PITCH)];
+    for (tag, feet, up, yaw, pitch) in look_sites(&nav) {
+        views.push((tag, feet + DVec3::new(0.0, up + 1.62, 0.0), yaw, pitch));
+    }
+    let only = std::env::var("JBM_PERF_VIEWS").ok();
+    let resolutions = perf_resolutions();
+    let variants = perf_variants();
+    let mut table = Vec::new();
+    for (tag, eye, yaw, pitch) in views {
+        if only
+            .as_deref()
+            .is_some_and(|list| !list.split(',').any(|t| t.trim() == tag))
+        {
+            continue;
+        }
+        let mut server = Server::with_config(ServerConfig {
+            gen_threads: 6,
+            ..ServerConfig::default()
+        });
+        let (mut client, server_end) = jbm_core::link::in_process_pair();
+        server.add_connection(server_end);
+        client
+            .send(ClientMsg::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                name: "perf".to_owned(),
+            })
+            .unwrap();
+        let mut win = MetricsClient::with_settings(&gpu, settings);
+        let feet = eye - DVec3::new(0.0, 1.62, 0.0);
+        join_and_teleport(
+            &mut server,
+            &mut win,
+            &mut client,
+            &gpu,
+            feet,
+            start + TEST_TIMEOUT,
+        );
+        let mut camera = Camera::new(eye, 70.0_f32.to_radians(), WIDTH as f32 / HEIGHT as f32);
+        camera.set_yaw(yaw.to_radians());
+        camera.set_pitch(pitch.to_radians());
+        let settle_secs = settle(
+            &mut server,
+            &mut win,
+            &mut client,
+            &gpu,
+            &camera,
+            start + TEST_TIMEOUT,
+        );
+        println!("\n{tag}: settled in {settle_secs:.1} s");
+        let levels = win
+            .terrain
+            .level_stats()
+            .iter()
+            .map(|l| {
+                format!(
+                    "L{} {}/{} {}k",
+                    l.level,
+                    l.resident,
+                    l.drawn,
+                    l.faces / 1000
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("  ");
+        println!("  resident/drawn cubes, resident faces: {levels}");
+
+        for &(width, height) in &resolutions {
+            win.resize(&gpu, width, height);
+            camera.aspect = width as f32 / height as f32;
+            // Variants take turns frame by frame, so background load on
+            // the machine hits them alike.
+            let mut samples: Vec<VariantSamples> = variants
+                .iter()
+                .map(|&(name, _)| VariantSamples::new(name))
+                .collect();
+            for frame in 0..(PERF_WARMUP + PERF_FRAMES) * variants.len() {
+                let index = frame % variants.len();
+                win.renderer.set_settings((variants[index].1)(settings));
+                let begin = Instant::now();
+                win.render_frame(&gpu, &camera);
+                let cpu_ms = begin.elapsed().as_secs_f64() * 1000.0;
+                let timings = win.renderer.read_gpu_timings_blocking(&gpu);
+                if frame >= PERF_WARMUP * variants.len() {
+                    samples[index].push(cpu_ms, timings);
+                }
+            }
+            win.renderer.set_settings(settings);
+            win.render_frame(&gpu, &camera);
+            let cull = win.terrain.read_cull_stats_blocking(&gpu);
+            let stats = win.terrain.stats();
+            for sample in &mut samples {
+                let summary = sample.summary();
+                let line = format!(
+                    "{tag:<11}{:>10} {:<10}{}  faces {:>8}  cmds {:>6}  draws {:>4}  occluded {:>5}",
+                    format!("{width}x{height}"),
+                    sample.name,
+                    summary,
+                    cull.faces,
+                    cull.commands,
+                    stats.draw_calls,
+                    cull.occluded,
+                );
+                println!("{line}");
+                table.push(line);
+            }
+        }
+    }
+    println!(
+        "\nperf_views ({}, msaa {}): ms over {PERF_FRAMES} frames per variant",
+        win_path_note(),
+        settings.msaa_samples
+    );
+    for line in &table {
+        println!("{line}");
+    }
+    println!("perf_views done in {:.0} s", start.elapsed().as_secs_f64());
+}
+
+/// A settings variant of the perf harness: a name and the change it
+/// makes to the base settings.
+type Variant = (&'static str, fn(RenderSettings) -> RenderSettings);
+
+/// The variants `JBM_PERF_VARIANTS` names (comma-separated; `base` alone
+/// by default): live-switchable levers measured against the base in the
+/// same run, frame by frame.
+fn perf_variants() -> Vec<Variant> {
+    let all: [Variant; 8] = [
+        ("base", |s| s),
+        ("no_clouds", |s| RenderSettings { clouds: false, ..s }),
+        ("no_water", |s| RenderSettings { water: false, ..s }),
+        ("no_sun", |s| RenderSettings {
+            sun_lighting: false,
+            ..s
+        }),
+        ("no_fog", |s| RenderSettings { fog: false, ..s }),
+        // The cheapest terrain fragment shader there is: edges only.
+        ("flat_fs", |s| RenderSettings {
+            wireframe_only: true,
+            ..s
+        }),
+        ("gpu_cull", |s| RenderSettings {
+            prefer_gpu_cull: true,
+            ..s
+        }),
+        ("cpu_cull", |s| RenderSettings {
+            prefer_gpu_cull: false,
+            force_cpu_cull: true,
+            ..s
+        }),
+    ];
+    let list = std::env::var("JBM_PERF_VARIANTS").unwrap_or_else(|_| "base".into());
+    list.split(',')
+        .map(|name| {
+            *all.iter()
+                .find(|(n, _)| *n == name.trim())
+                .unwrap_or_else(|| panic!("unknown perf variant {name}"))
+        })
+        .collect()
+}
+
+/// One variant's samples: CPU ms, GPU frame ms and GPU ms per pass.
+struct VariantSamples {
+    name: &'static str,
+    cpu: Vec<f64>,
+    gpu: Vec<f64>,
+    passes: Vec<(&'static str, Vec<f64>)>,
+}
+
+impl VariantSamples {
+    fn new(name: &'static str) -> VariantSamples {
+        VariantSamples {
+            name,
+            cpu: Vec::new(),
+            gpu: Vec::new(),
+            passes: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, cpu_ms: f64, timings: Option<GpuTimings>) {
+        self.cpu.push(cpu_ms);
+        let Some(timings) = timings else {
+            return;
+        };
+        self.gpu.push(timings.frame_ms);
+        for (label, ms) in timings.passes {
+            match self.passes.iter_mut().find(|(l, _)| *l == label) {
+                Some((_, samples)) => samples.push(ms),
+                None => self.passes.push((label, vec![ms])),
+            }
+        }
+    }
+
+    /// `cpu p50 / p95  gpu min / p50 / p95  [pass p50, …]`. The GPU min
+    /// is the least disturbed by other work on the machine.
+    fn summary(&mut self) -> String {
+        let (cpu50, cpu95) = p50_p95(&mut self.cpu);
+        let (gpu_min, gpu50, gpu95) = if self.gpu.is_empty() {
+            (f64::NAN, f64::NAN, f64::NAN)
+        } else {
+            let (p50, p95) = p50_p95(&mut self.gpu);
+            (self.gpu[0], p50, p95)
+        };
+        let passes = self
+            .passes
+            .iter_mut()
+            .map(|(label, samples)| format!("{label} {:.2}", p50_p95(samples).0))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "cpu {cpu50:5.2} / {cpu95:5.2}  gpu {gpu_min:6.2} / {gpu50:6.2} / {gpu95:6.2}  [{passes}]"
+        )
+    }
+}
+
+/// The draw path the environment selects, for the table's title.
+fn win_path_note() -> &'static str {
+    if std::env::var_os("JBM_NO_MDI").is_some_and(|v| v == "1") {
+        "fallback"
+    } else if std::env::var_os("JBM_GPU_CULL").is_some_and(|v| v == "1") {
+        "gpu-cull"
+    } else {
+        "cpu-cull"
     }
 }

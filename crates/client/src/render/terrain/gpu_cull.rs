@@ -10,6 +10,7 @@ use crate::gpu::Gpu;
 use crate::render::hiz::HizPyramid;
 use crate::render::renderer::DepthTarget;
 use crate::render::settings::RenderSettings;
+use crate::render::timing::GpuTimer;
 
 use super::TerrainPass;
 use super::layout::{CullParams, cull_debug_words};
@@ -22,7 +23,7 @@ impl TerrainPass {
     /// per-cube work is the frustum pass that sizes the command regions.
     /// Phase order: early cull/draw, then Hi-Z build and late cull in one
     /// compute pass, then the late draw.
-    // The eight parameters are one frame's draw context; a bundling struct
+    // The nine parameters are one frame's draw context; a bundling struct
     // would only be unpacked again here.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn draw_gpu_cull(
@@ -34,6 +35,7 @@ impl TerrainPass {
         camera: &Camera,
         uniforms: &wgpu::BindGroup,
         settings: &RenderSettings,
+        timer: Option<&GpuTimer>,
     ) {
         // Complete any stats readback from earlier frames (non-blocking)
         // and arm the maps for the slots copied last frame.
@@ -170,7 +172,7 @@ impl TerrainPass {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("jbm terrain early cull"),
-                timestamp_writes: None,
+                timestamp_writes: timer.and_then(|t| t.compute_writes("cull")),
             });
             pass.set_pipeline(&self.cull_early_pipeline);
             pass.set_bind_group(0, uniforms, &[]);
@@ -181,7 +183,7 @@ impl TerrainPass {
         // 2. Early draw.
         let mut draw_calls = 0u64;
         {
-            let mut pass = self.begin_pass(encoder, target, depth.view());
+            let mut pass = self.begin_pass(encoder, target, depth.view(), timer);
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, uniforms, &[]);
             pass.set_bind_group(2, &self.shared_bind_group, &[]);
@@ -200,7 +202,7 @@ impl TerrainPass {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("jbm terrain hiz + late cull"),
-                timestamp_writes: None,
+                timestamp_writes: timer.and_then(|t| t.compute_writes("hiz+cull")),
             });
             self.hiz.as_ref().expect("created above").record(&mut pass);
             pass.set_pipeline(&self.cull_late_pipeline);
@@ -211,7 +213,7 @@ impl TerrainPass {
 
         // 5. Late draw.
         {
-            let mut pass = self.begin_pass(encoder, target, depth.view());
+            let mut pass = self.begin_pass(encoder, target, depth.view(), timer);
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, uniforms, &[]);
             pass.set_bind_group(2, &self.shared_bind_group, &[]);

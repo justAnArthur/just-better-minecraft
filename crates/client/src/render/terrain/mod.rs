@@ -53,6 +53,7 @@ use crate::render::hiz::HizPyramid;
 use crate::render::renderer::DepthTarget;
 use crate::render::settings::RenderSettings;
 use crate::render::texture_array::BlockTextures;
+use crate::render::timing::GpuTimer;
 
 use layout::{debug_uniform_words, far_uniform_words, meta_flags, meta_for, tint_uniform_words};
 use pages::{FacePage, MeshBookkeeping};
@@ -740,7 +741,7 @@ impl TerrainPass {
     /// modules. `settings` is the renderer-owned frame state (fog, level
     /// tint, the task 2.12 debug views) — its path flags are re-applied
     /// every draw, so the panel's force checkboxes switch the path live.
-    // The seven parameters are one frame's draw context; a bundling
+    // The eight parameters are one frame's draw context; a bundling
     // struct would only be unpacked again in each path.
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
@@ -752,6 +753,7 @@ impl TerrainPass {
         camera: &Camera,
         uniforms: &wgpu::BindGroup,
         settings: &RenderSettings,
+        timer: Option<&GpuTimer>,
     ) {
         // Live path switching (task 2.12): a settings change (the panel)
         // is applied on the next draw. The set_force_* setters hold
@@ -775,12 +777,12 @@ impl TerrainPass {
         );
         self.update_frozen(gpu, camera, settings);
         match self.active_path() {
-            TerrainPath::GpuCull => {
-                self.draw_gpu_cull(gpu, encoder, target, depth, camera, uniforms, settings)
-            }
-            TerrainPath::CpuCull | TerrainPath::Fallback => {
-                self.draw_cpu_cull(gpu, encoder, target, depth, camera, uniforms, settings)
-            }
+            TerrainPath::GpuCull => self.draw_gpu_cull(
+                gpu, encoder, target, depth, camera, uniforms, settings, timer,
+            ),
+            TerrainPath::CpuCull | TerrainPath::Fallback => self.draw_cpu_cull(
+                gpu, encoder, target, depth, camera, uniforms, settings, timer,
+            ),
         }
     }
 
@@ -791,6 +793,7 @@ impl TerrainPass {
         encoder: &'a mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         depth: &wgpu::TextureView,
+        timer: Option<&GpuTimer>,
     ) -> wgpu::RenderPass<'a> {
         encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("jbm terrain pass"),
@@ -811,7 +814,7 @@ impl TerrainPass {
                 }),
                 stencil_ops: None,
             }),
-            timestamp_writes: None,
+            timestamp_writes: timer.and_then(|t| t.render_writes("terrain")),
             occlusion_query_set: None,
             multiview_mask: None,
         })
