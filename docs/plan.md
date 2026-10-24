@@ -104,8 +104,8 @@ Blocks are hardcoded in Rust for now.
 | E | [x] 2.11 Code review and restructuring: module boundaries, file sizes, duplicated logic, dead code, naming, docs | all | Review findings triaged; agreed refactors land with no behavior change (goldens, benches unchanged) |
 | E | [x] 2.12 Playground: a debug world and an egui panel (faces/triangles/draws, wireframe, chunk borders, exploded cubes, per-level toggles, view radius, freeze culling) | `client`, `game`, `server` | You can switch every view on and off live and read the stats |
 | E | [x] 2.13 Meshing optimization and a larger full-detail radius (LOD only far away) | `client`, `server` | Full detail to ~512 blocks at frame budget; triangle count measured before/after |
-| E | [ ] 2.14 Height-exact Distant-Horizons-style LOD (per-column exact top and material) | `core`, `server`, `client` | Coarse surface within a block of the true one; you approve the look |
-| E | [ ] 2.15 The look: sun and sky light, sun disk and clouds, shaded water, MSAA, aerial haze | `client` | The five look shots read as a polished game; frame budget holds; you approve the look |
+| E | [x] 2.14 Height-exact Distant-Horizons-style LOD (per-column exact top and material) | `core`, `server`, `client` | Coarse surface within a block of the true one; you approve the look |
+| E | [x] 2.15 The look: sun and sky light, sun disk and clouds, shaded water, MSAA, aerial haze | `client` | The five look shots read as a polished game; frame budget holds; you approve the look |
 
 **Gate:** fly across kilometres without frame hitches; bench records frame times. Then `/clear`.
 
