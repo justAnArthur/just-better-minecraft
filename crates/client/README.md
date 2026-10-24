@@ -76,9 +76,15 @@ coordinates and cfg-gated off under the crate's own `cube16` passthrough;
   `JBM_LOD_TINT` / `JBM_GPU_CULL` / `JBM_NO_MDI` / `JBM_WIREFRAME` /
   `JBM_WIREFRAME_ONLY` / `JBM_CHUNK_BORDERS` / `JBM_EXPLODE` /
   `JBM_LEVELS` / `JBM_FREEZE_CULL` / `JBM_DIRECTION_SPLIT` /
-  `JBM_NO_SUN` / `JBM_NO_CLOUDS` / `JBM_NO_WATER` / `JBM_MSAA` variables,
-  done by the app at startup (the F3 panel edits the same fields live;
-  `msaa_samples` is fixed at startup).
+  `JBM_NO_SUN` / `JBM_NO_CLOUDS` / `JBM_NO_WATER` / `JBM_MSAA` /
+  `JBM_RENDER_SCALE` variables, done by the app at startup (the F3 panel
+  edits the same fields live; `msaa_samples` is fixed at startup).
+- `render::composite::CompositePass` — the render-scale upscale (task
+  2.16): the scene color texture and a Catmull-Rom composite into the
+  window (see "Frame rate" below).
+- `render::timing::GpuTimer` — per-pass GPU times from timestamp queries
+  (task 2.16), read back a few frames late; the perf harness reads them
+  blocking.
 - `render::hiz::HizPyramid` — the hierarchical-Z depth pyramid the GPU
   cull tests occlusion against.
 - `render::suballoc::Suballocator` — the CPU-side free-list suballocator
@@ -552,9 +558,9 @@ fading into a soft haze.
 - **MSAA 4×** (`RenderSettings::msaa_samples`, `JBM_MSAA=1|4`, default
   4, applied at startup and read-only in the panel). The renderer owns
   a multisampled color target; terrain, sky, debug lines and the outline
-  draw into it with the (equally multisampled) `DepthTarget`, then an
-  empty pass resolves it into the frame target, and the overlay (and
-  egui after it) draw at 1×. The Hi-Z fill reads the multisampled depth
+  draw into it with the (equally multisampled) `DepthTarget` in one
+  scene pass that resolves it as its store action (task 2.16), and the
+  overlay (and egui after it) draw at 1×. The Hi-Z fill reads the multisampled depth
   through `hiz_fill_ms.wgsl` and takes the **min over the samples**
   (the farthest, in reverse-Z), so occlusion stays conservative. The
   cutout discard is kept instead of alpha-to-coverage: leaves and glass
@@ -564,6 +570,46 @@ fading into a soft haze.
   sentinel hole tests and the tint test run at 1× so the exact sentinel
   check keeps single-sample strictness). The three draw paths stay
   pixel-identical at 4×.
+
+### Frame rate: one scene pass, render scale (task 2.16)
+
+On a tile-based GPU (Apple) a render pass loads its attachments into
+tile memory and stores them back. A pass per stage moved the 4×
+color and depth through memory again and again: about 236 MB per
+attachment per load or store at 5120×2880.
+
+- **One scene pass.** The terrain, the sky, the debug lines and the
+  outline draw in one render pass. Each of them splits into `prepare`
+  (culling, buffer writes, and on gpu-cull the early pass and the
+  Hi-Z cull) and `record` (draws inside the pass).
+  `TerrainPass::prepare` returns whether it already cleared the
+  targets (gpu-cull's early pass), so the scene pass loads them;
+  otherwise the scene pass clears. With MSAA the resolve is the pass's
+  `resolve_target`, and the multisampled color and depth are discarded
+  (stored at 1×, where the tests read the depth back).
+- **Render scale** (`RenderSettings::render_scale`,
+  `JBM_RENDER_SCALE=auto|<0.25..1>`, live in the panel). The scene
+  renders at the `DepthTarget`'s size. `Renderer::scene_size()` gives
+  that size for the viewport, and the app resizes its depth target to it
+  every frame. When the scene is smaller than the frame's target, it
+  resolves into a 1× scene color texture, and `CompositePass` upscales it
+  in a fullscreen pass (`composite.wgsl`: a Catmull-Rom filter from nine
+  bilinear taps, sharper than bilinear). The overlay draws in the same
+  pass at native resolution, and egui after it. Auto (0, the default) is
+  native up to 2560×1600 pixels (`AUTO_SCALE_BUDGET`). Above that it scales
+  to that pixel count: 5120×2880 renders at 2698×1518, 5120×2560 at
+  2862×1431. Rigs that size the depth to the target, as every test does,
+  render natively.
+- **Direction split everywhere.** `direction_split_radius` now defaults
+  to `u32::MAX`, so every cube draws one command per visible direction
+  (see "Drawing" below). That doubles the commands to about 6.5k. It
+  also keeps about 35 % of the faces in a 2M-face view (the far cubes'
+  back faces) out of the vertex shader, which is the geometry floor of
+  the frame.
+
+At the user's view (docs/tasks/2.16.md) the 5120×2880 GPU frame went from
+16.5 to 4.6 ms (min). `far_metrics::perf_views` measures it (see the
+game README).
 
 ### Level tint debug view (task 2.10)
 
@@ -746,8 +792,10 @@ camera-relative cube AABB (from the same origin formula) against 5
 planes, then, in sorted `CubePos` order, `push_cube_commands`
 (cpu_cull.rs, pure and unit-tested) emits per cube either
 
-- **far beyond `direction_split_radius`** (a `RenderSettings` field, 4
-  cubes = 128 blocks by default, `JBM_DIRECTION_SPLIT=<cubes>`): ONE
+- **far beyond `direction_split_radius`** (a `RenderSettings` field,
+  `JBM_DIRECTION_SPLIT=<cubes>`; task 2.13 used 4 cubes = 128 blocks,
+  and since task 2.16 the default `u32::MAX` takes no cube this way):
+  ONE
   command over the cube's whole face range — the per-direction ranges
   are contiguous in the page, so the whole range is one span. The
   rasterizer's back-face culling then drops exactly the faces the
@@ -987,7 +1035,8 @@ its startup environment variable:
 | clouds | `JBM_NO_CLOUDS=1` | the cloud layer off |
 | water shading | `JBM_NO_WATER=1` | off: water draws its flat average color |
 | MSAA (read-only) | `JBM_MSAA=1\|4` | the sample count, fixed at startup (default 4) |
-| direction split | `JBM_DIRECTION_SPLIT=<cubes>` | beyond this radius (default 4 cubes) a cube draws all its face directions in one command; 0 is one command everywhere |
+| direction split | `JBM_DIRECTION_SPLIT=<cubes>` | beyond this radius a cube draws all its face directions in one command; 0 is one command everywhere, the default (`u32::MAX`) is per direction everywhere |
+| render scale | `JBM_RENDER_SCALE=auto\|<0.25..1>` | the scene's resolution per axis, upscaled to the window; auto (the default) is native up to 2560×1600 pixels |
 | prefer gpu cull / force cpu cull / force fallback | `JBM_GPU_CULL=1` / `JBM_NO_MDI=1` | the path flags are re-read from the settings every draw, so the panel switches paths live |
 
 The **World** section's sliders steer the server's view radii through

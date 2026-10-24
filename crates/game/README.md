@@ -133,6 +133,32 @@ cargo test --release -p jbm-game --test far_metrics look_shots -- --ignored --no
 JBM_LOOK_SHOTS=coast,mountain cargo test --release -p jbm-game --test far_metrics look_shots -- --ignored --nocapture
 ```
 
+**Frame rate (task 2.16).** `far_metrics::perf_views` (ignored) settles
+the real world at the user's view and the five look sites. It then
+renders offscreen without vsync and prints one line per view, size and
+variant: CPU (`Renderer::render`) p50/p95; GPU frame min/p50/p95 from
+pass timestamps (`render::timing::GpuTimer`), with the per-pass p50s;
+faces, commands and draw calls. Variants are interleaved frame by
+frame, so a busy machine's drift hits each of them alike.
+
+- `JBM_PERF_RES` is a list of sizes, each with an optional `@scale`.
+  The default is `2560x1440,5120x2880@1,5120x2880`. A bare size uses
+  the auto render scale; `@1` is native.
+- `JBM_PERF_VIEWS` takes `user`, `spawn_eye`, `spawn_60up`, `mountain`,
+  `coast` and `high_300`.
+- `JBM_PERF_VARIANTS` takes `base` (the default), `no_clouds`,
+  `no_water`, `no_sun`, `no_fog`, `flat_fs`, `gpu_cull`, `cpu_cull` and
+  `split_4` (task 2.13's direction-split radius).
+- `JBM_PERF_SHOTS=1` saves each view and size's base frame under
+  `target/perf-shots/`.
+
+```bash
+JBM_PERF_VIEWS=user,coast JBM_PERF_VARIANTS=base,gpu_cull cargo test --release -p jbm-game --test far_metrics perf_views -- --ignored --nocapture
+```
+
+The game's render scale is `JBM_RENDER_SCALE=auto|<0.25..1>`. The F3
+panel changes it live.
+
 **LOD rings (task 2.6).** `terrain_draw` adds `rings/cpu_cull` and
 `rings/gpu_cull`: the rings scene at game scale (default
 `lod_view_radius`, 5 levels since task 2.13 E) built in
