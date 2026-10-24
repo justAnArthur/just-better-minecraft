@@ -30,6 +30,7 @@ use jbm_client::mesh::{self, MeshInput, neighbor_index};
 use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
 use jbm_client::render::terrain::TerrainPass;
+use jbm_client::render::texture_array::BlockTextures;
 use jbm_client::terrain_sync::TerrainSync;
 use jbm_core::coords::{CUBE_SIZE, CubePos};
 use jbm_core::link::ClientLink;
@@ -93,9 +94,7 @@ impl MetricsClient {
         let depth = DepthTarget::new(&gpu.device, WIDTH, HEIGHT);
         let mut renderer = Renderer::new(gpu, target.format());
         renderer.set_viewport(WIDTH, HEIGHT);
-        let (layers, _) = jbm_client::mesh::appearance::builtin_textures();
-        let textures = jbm_client::render::texture_array::BlockTextures::new(gpu, &layers)
-            .expect("texture array");
+        let textures = BlockTextures::builtin(gpu).expect("texture array");
         let terrain = TerrainPass::new(gpu, target.format(), renderer.uniform_layout(), &textures);
         MetricsClient {
             sync: TerrainSync::new(Arc::clone(&appearance), 0),
@@ -643,7 +642,8 @@ fn far_shots() {
 /// blocks up, the mountain top, the coast looking out to sea, and 300
 /// blocks up looking down at 30 degrees. Saved under `target/look-shots/`.
 /// Run with
-/// `cargo test --release -p jbm-game --test far_metrics look_shots -- --ignored --nocapture`.
+/// `cargo test --release -p jbm-game --test far_metrics look_shots -- --ignored --nocapture`;
+/// `JBM_LOOK_SHOTS=coast,mountain` limits the run to the named shots.
 #[test]
 #[ignore = "slow real-server screenshots; run with --ignored"]
 fn look_shots() {
@@ -683,7 +683,15 @@ fn look_shots() {
         ("coast", coast, 4.0, 90.0, -5.0),
         ("high_300", spawn, 300.0, 45.0, -30.0),
     ];
+    // `JBM_LOOK_SHOTS=coast,mountain` renders a subset (look tuning).
+    let only = std::env::var("JBM_LOOK_SHOTS").ok();
     for (tag, feet, up, yaw, pitch) in sites {
+        if only
+            .as_deref()
+            .is_some_and(|list| !list.split(',').any(|t| t.trim() == tag))
+        {
+            continue;
+        }
         let mut server = Server::with_config(ServerConfig {
             gen_threads: 6,
             ..ServerConfig::default()

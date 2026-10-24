@@ -7,7 +7,7 @@
 use glam::DVec3;
 use jbm_client::camera::Camera;
 use jbm_client::mesh;
-use jbm_client::mesh::appearance::{BlockAppearance, builtin_textures};
+use jbm_client::mesh::appearance::BlockAppearance;
 use jbm_client::render::offscreen::OffscreenTarget;
 use jbm_client::render::overlay::OverlayText;
 use jbm_client::render::renderer::{DepthTarget, FrameInputs, Renderer};
@@ -171,8 +171,7 @@ fn edited_spawn_scene_matches_golden() {
     let depth = DepthTarget::new(&gpu.device, 256, 256);
     let mut renderer = Renderer::new(&gpu, target.format());
     renderer.set_viewport(256, 256);
-    let (layers, _) = builtin_textures();
-    let textures = BlockTextures::new(&gpu, &layers).expect("texture array");
+    let textures = BlockTextures::builtin(&gpu).expect("texture array");
     let mut terrain = TerrainPass::new(&gpu, target.format(), renderer.uniform_layout(), &textures);
     for (pos, _, input) in dirty {
         terrain.upload(&gpu, pos, &mesh::mesh(&input, &appearance));

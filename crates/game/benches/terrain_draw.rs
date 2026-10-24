@@ -170,8 +170,7 @@ fn bench(c: &mut Criterion) {
     let depth = DepthTarget::new(&gpu.device, WIDTH, HEIGHT);
     let mut renderer = Renderer::new(&gpu, target.format());
     renderer.set_viewport(WIDTH, HEIGHT);
-    let (layers, _) = jbm_client::mesh::appearance::builtin_textures();
-    let textures = BlockTextures::new(&gpu, &layers).expect("texture array");
+    let textures = BlockTextures::builtin(&gpu).expect("texture array");
 
     // Every bench gets its own pass (each path forces its own flags); grab
     // what the passes need before `gpu`/`renderer` move into `frames`.
