@@ -119,6 +119,11 @@ fn cube_origin(pos: vec3i, level: u32) -> vec3f {
 // The outward quad expansion, in blocks (see vs_main).
 const EDGE_EXPAND_BLOCKS: f32 = 1.0 / 512.0;
 
+// How far inside its edges a face's UV is clamped, in tiles (task 2.17):
+// 1/64 of a texel, and still a distinct float at the largest UV a face
+// reaches (32 cells of 64 blocks).
+const UV_EDGE_INSET: f32 = 1.0 / 1024.0;
+
 // The cell scale of a level: cell offsets and UVs multiply by 2^level,
 // since one cell spans 2^level blocks.
 fn cell_scale(level: u32) -> f32 {
@@ -256,7 +261,13 @@ struct VsOut {
     @builtin(position) pos: vec4f,
     // UV in whole-texture tiles: one tile per block.
     @location(0) uv: vec2f,
-    @location(1) @interpolate(flat) layer: u32,
+    // The face's texture layer (bits 0..16), its cube's LOD level (task
+    // 2.9, bits 16..20: far_color switches on it) and its direction (task
+    // 2.15, bits 20..23: the fragment shader's normal), flat. One packed
+    // slot rather than three (task 2.17), so the UV extent below adds no
+    // vertex output: on a tiler every varying is written per vertex, and
+    // vertex work is the frame's floor (task 2.16).
+    @location(1) @interpolate(flat) face: u32,
     // The corner's (level-softened) AO factor, interpolated (task 2.15:
     // the fragment shader lights with it; it used to arrive premultiplied
     // by a fixed per-direction shade).
@@ -266,15 +277,19 @@ struct VsOut {
     // exact for positions (affine in clip space via perspective-correct
     // varying interpolation) and the length is taken per fragment.
     @location(3) rel: vec3f,
-    // The cube's LOD level (task 2.9), flat: far_color switches on it.
-    @location(4) @interpolate(flat) level: u32,
     // Barycentric coordinates within the triangle (task 2.12): one
     // component is 1 at each of the triangle's corners. The wireframe
     // view draws a fragment as edge where the smallest one is within a
     // pixel or so of zero, measured in screen space (fwidth).
     @location(5) bary: vec3f,
-    // The face direction (task 2.15), flat: the fragment shader's normal.
-    @location(6) @interpolate(flat) dir: u32,
+    // The face's UV extent (task 2.17), flat: uv runs over [0, uv_max].
+    // Under MSAA an edge pixel is shaded at its center even when only
+    // some samples are covered, and past the face's edge the UV runs off
+    // its range; the repeat sampler then wraps it to the far side of the
+    // tile — a grass side's bottom edge drew a hairline of its green top
+    // row, its top edge one of dirt. The fragment shader clamps the UV
+    // into the face first.
+    @location(4) @interpolate(flat) uv_max: vec2f,
 };
 
 @vertex
@@ -375,8 +390,9 @@ fn vs_main(
     // BLOCK (not per cell), so tiles line up across ring borders.
     // The insets shorten a side face from both ends; texture v keeps one
     // tile per block (the face's top edge sits on a whole block).
-    let uv = vec2f(c.x * width * scale,
-        (1.0 - c.y) * (height * scale - f32(va.y) * (inset_bottom + inset_top)));
+    let uv_max = vec2f(width * scale,
+        height * scale - f32(va.y) * (inset_bottom + inset_top));
+    let uv = vec2f(c.x, 1.0 - c.y) * uv_max;
 
     // Octant masking (level >= 1): a ready child replaces this octant, so
     // the cube's faces here must produce no fragments. Collapsing every
@@ -391,11 +407,10 @@ fn vs_main(
         var out: VsOut;
         out.pos = vec4f(0.0, 0.0, 0.0, 1.0);
         out.uv = vec2f(0.0);
-        out.layer = layer;
+        out.uv_max = vec2f(1.0);
+        out.face = layer;
         out.ao = 0.0;
-        out.dir = 0u;
         out.rel = vec3f(0.0);
-        out.level = 0u;
         out.bary = vec3f(1.0);
         return out;
     }
@@ -407,11 +422,10 @@ fn vs_main(
     var out: VsOut;
     out.pos = u.view_proj * vec4f(relative_expanded, 1.0);
     out.uv = uv;
-    out.layer = layer;
+    out.uv_max = uv_max;
+    out.face = layer | (level << 16u) | (direction << 20u);
     out.ao = ao;
-    out.dir = direction;
     out.rel = relative_expanded;
-    out.level = level;
     out.bary = array<vec3f, 3>(
         vec3f(1.0, 0.0, 0.0), vec3f(0.0, 1.0, 0.0), vec3f(0.0, 0.0, 1.0),
     )[corner_index % 3u];
@@ -619,6 +633,9 @@ fn haze_amount(rel: vec3f, dist: f32) -> f32 {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
+    let layer = in.face & 0xFFFFu;
+    let level = (in.face >> 16u) & 15u;
+    let dir = in.face >> 20u;
     // Wireframe-only (task 2.12): the edges over a flat background — no
     // textures, shade, tint or fog. Bright lines on near-black, so the
     // pure geometry reads at any distance.
@@ -635,7 +652,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     // arrives as a flat varying the uniformity analysis cannot prove
     // constant — so the level >= 1 path fetches the texel it then ignores;
     // far_color drops its value exactly (mix(x, y, 1.0) == y).
-    let tex = textureSample(block_textures, block_sampler, in.uv, in.layer);
+    // The UV clamped into the face (see uv_max), a hair inside so an edge
+    // pixel samples the face's own edge texel. Inside the face the clamp
+    // is the identity, so only pixels on a face's outer edge change;
+    // triangle diagonals are inside and keep their exact UV (a centroid
+    // UV would fix the edges too, but its derivatives jump along every
+    // diagonal and shift the mip level there). Minified interiors may
+    // still move by a few levels: the mip level now comes from a computed
+    // coordinate rather than the plain varying.
+    let uv = clamp(in.uv, vec2f(UV_EDGE_INSET), in.uv_max - UV_EDGE_INSET);
+    let tex = textureSample(block_textures, block_sampler, uv, layer);
     // The fragment's footprint on a horizontal surface, in blocks: the
     // water ripples fade by it (derivatives need uniform control flow,
     // so it is taken here, ahead of the discard and the water branch).
@@ -645,21 +671,21 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     // only while any texture still shows (level 0, not fully faded; a LOD
     // cell is solid by the downsampling rule). The alpha test leads so
     // opaque fragments (almost all terrain) never evaluate the fade.
-    if (tex.a < 0.5 && in.level == 0u && fade(dist) < 1.0) {
+    if (tex.a < 0.5 && level == 0u && fade(dist) < 1.0) {
         discard;
     }
-    let n = face_normal(in.dir);
+    let n = face_normal(dir);
     var color: vec3f;
-    if (layer_material[in.layer].flags.x > 0.5 && u.ambient_ground.w > 0.5) {
+    if (layer_material[layer].flags.x > 0.5 && u.ambient_ground.w > 0.5) {
         color = water_color(n, in.rel, dist, in.ao, footprint);
     } else {
-        color = far_color(tex, in.layer, dist, in.level) * lighting(n, in.ao);
+        color = far_color(tex, layer, dist, level) * lighting(n, in.ao);
     }
     // Level tint (task 2.10): the debug view that shows which level draws
     // where, before fog. One uniform flag, shared by every draw path
     // (they share this fragment shader).
     if (terrain.tint.x > 0.5) {
-        color = color * lod_tint(in.level);
+        color = color * lod_tint(level);
     }
     // The haze (see above): toward the sky along this fragment's ray. The
     // direction reuses the already-computed distance instead of a second
