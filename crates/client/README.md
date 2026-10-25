@@ -106,9 +106,9 @@ coordinates and cfg-gated off under the crate's own `cube16` passthrough;
   (see below).
 - `hud` — the debug overlay's text: `HudSnapshot` (one frame's stats:
   fps, camera, target, player, terrain/cull/level counters, LOD queue,
-  tint flag) and `hud::lines(&snapshot) -> Vec<String>`. The app fills
-  the snapshot once per frame; the 2.12 egui debug panel reads the same
-  struct.
+  tint flag, active debug views) and `hud::lines(&snapshot) ->
+  Vec<String>`. The app fills the snapshot once per frame; the 2.12 egui
+  debug panel reads the same struct.
 - `app::run(link)` — opens the window and runs the frame loop against a
   server link, with the default view distances; `app::run_with_view`
   takes a `ViewSetup` (the server's `view_radius`, `lod_view_radius` and
@@ -570,6 +570,24 @@ fading into a soft haze.
   sentinel hole tests and the tint test run at 1× so the exact sentinel
   check keeps single-sample strictness). The three draw paths stay
   pixel-identical at 4×.
+- **No texture seams at quad edges** (task 2.17). A 4× edge pixel is
+  shaded once at its center, which can lie outside the triangle; the
+  interpolated UV then runs past the face's extent and the repeat
+  sampler wraps it to the far side of the tile — a grass side's green
+  top on its bottom edge, a dirt line under every terrace. The vertex
+  shader passes the face's UV extent as a flat `uv_max`, and the
+  fragment shader clamps the UV to `[UV_EDGE_INSET, uv_max −
+  UV_EDGE_INSET]` (1/1024 tile) before the implicit `textureSample`:
+  identity inside the face, so only edge pixels change (and the
+  derivatives, hence the mip, come from the unclamped varying's
+  neighborhood as before, except for minified pixels straddling an
+  edge). Centroid interpolation was rejected: its derivatives jump
+  along every triangle edge, diagonals included, and shift the mip
+  there. To keep the vertex output count — the terrain pass is
+  vertex-bound on the TBDR GPU, and an extra vec2 cost ~0.3 ms at
+  2560×1440 — layer, level and direction share one flat `face: u32`
+  (layer bits 0..16, level 16..20, direction 20..23).
+  `tests/look.rs::quad_edges_draw_no_texture_seam_at_4x` pins it.
 
 ### Frame rate: one scene pass, render scale (task 2.16)
 
@@ -993,7 +1011,10 @@ over a sliding 0.5 s window (pure logic, unit-tested). The app fills a
 lines `FPS`, `XYZ` (2 decimals), `CUBE` (32-block cube coordinates),
 `YAW`/`PITCH` in degrees, `CUBES`/`MESHED`/`PENDING`,
 `FACES`/`PAGES`/`CMDS`/`DRAWS` (+ draw path), `TARGET` (block position
-and state name) and `HOTBAR`.
+and state name) and `HOTBAR`, plus `VIEWS …` naming every non-default
+debug view (`RenderSettings::debug_view_names`: `WIREFRAME`,
+`CHUNK-BORDERS`, `NO-FOG`, …; task 2.17 — a wireframe left on reads as
+seams in a screenshot).
 Whenever an overlay is drawn, a centered crosshair (white with a dark
 outline) is drawn too.
 
