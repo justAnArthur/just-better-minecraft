@@ -49,7 +49,7 @@ pub struct RenderSettings {
     /// Force the direct-draw fallback; on via `JBM_NO_MDI=1`.
     pub force_fallback: bool,
     /// The wireframe debug view (task 2.12): the terrain fragment shader
-    /// brightens the outer edge of every greedy quad; on via
+    /// darkens every triangle edge (quad outlines and diagonals); on via
     /// `JBM_WIREFRAME=1`.
     pub wireframe: bool,
     /// Wireframe only (task 2.12): the edges over a flat background, no
@@ -132,6 +132,50 @@ impl Default for RenderSettings {
             msaa_samples: DEFAULT_MSAA_SAMPLES,
             render_scale: AUTO_RENDER_SCALE,
         }
+    }
+}
+
+impl RenderSettings {
+    /// The debug views and look toggles that are off their defaults, by
+    /// name, for the HUD (task 2.17). The wireframe overlay draws a dark
+    /// line along every triangle edge; left on from the panel with the
+    /// panel closed, it reads as broken rendering, so the HUD names it
+    /// (and every other non-default view) while it is on. The level tint
+    /// has its own legend line.
+    pub fn debug_view_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        if self.wireframe_only {
+            names.push("WIREFRAME-ONLY".to_owned());
+        } else if self.wireframe {
+            names.push("WIREFRAME".to_owned());
+        }
+        if self.chunk_borders {
+            names.push("CHUNK-BORDERS".to_owned());
+        }
+        if self.explode > 0 {
+            names.push(format!("EXPLODE {}", self.explode));
+        }
+        if self.level_mask != ALL_LEVELS {
+            let shown: Vec<String> = (0..LOD_LEVELS)
+                .filter(|level| self.level_mask >> level & 1 != 0)
+                .map(|level| level.to_string())
+                .collect();
+            names.push(format!("LEVELS {}", shown.join(",")));
+        }
+        if self.freeze_cull {
+            names.push("FREEZE-CULL".to_owned());
+        }
+        for (on, name) in [
+            (self.fog, "NO-FOG"),
+            (self.sun_lighting, "NO-SUN"),
+            (self.clouds, "NO-CLOUDS"),
+            (self.water, "NO-WATER"),
+        ] {
+            if !on {
+                names.push(name.to_owned());
+            }
+        }
+        names
     }
 }
 
@@ -352,6 +396,30 @@ mod tests {
             no_clouds: false,
             no_water: false,
         }
+    }
+
+    /// The HUD names no view at the defaults, and each non-default
+    /// debug view and look toggle once (task 2.17).
+    #[test]
+    fn debug_view_names_list_the_non_default_views() {
+        assert!(RenderSettings::default().debug_view_names().is_empty());
+        let settings = RenderSettings {
+            wireframe: true,
+            explode: 2,
+            level_mask: 0b101,
+            water: false,
+            ..RenderSettings::default()
+        };
+        assert_eq!(
+            settings.debug_view_names(),
+            vec!["WIREFRAME", "EXPLODE 2", "LEVELS 0,2", "NO-WATER"]
+        );
+        let only = RenderSettings {
+            wireframe: true,
+            wireframe_only: true,
+            ..RenderSettings::default()
+        };
+        assert_eq!(only.debug_view_names(), vec!["WIREFRAME-ONLY"]);
     }
 
     #[test]

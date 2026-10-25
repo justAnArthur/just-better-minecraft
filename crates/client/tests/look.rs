@@ -317,3 +317,78 @@ fn silhouette_edges_blend_at_4x_and_are_pure_at_1x() {
     }
     assert!(blends >= 40, "only {blends} blended edge pixels at 4x");
 }
+
+/// A grass-topped dirt wall (task 2.17): blocks x 4..28, z 4..16, dirt at
+/// y 6..14 under one grass row at y 14. Its +z side is a grass-side quad
+/// (the green band on top, dirt below it) over a dirt quad.
+fn upload_grass_wall(rig: &mut OffscreenRig, gpu: &Gpu) {
+    let mut registry = BlockRegistry::new();
+    let blocks = Blocks::register(&mut registry);
+    let appearance = BlockAppearance::new(&registry);
+    let cube = Arc::new(Cube::from_fn(|p| {
+        let (x, y, z) = (p.x as i32, p.y as i32, p.z as i32);
+        if !(4..28).contains(&x) || !(4..16).contains(&z) {
+            BlockStateId::AIR
+        } else if y == 14 {
+            blocks.grass_block
+        } else if (6..14).contains(&y) {
+            blocks.dirt
+        } else {
+            BlockStateId::AIR
+        }
+    }));
+    let input = mesh::MeshInput::isolated_at_level(cube, 0);
+    let output = mesh::mesh(&input, &appearance);
+    rig.terrain
+        .upload(gpu, CubeKey::lod0(CubePos { x: 0, y: 0, z: 0 }), &output);
+}
+
+/// No texture seam at quad edges under MSAA (task 2.17). An edge pixel is
+/// shaded at its center even where only some samples are covered; a
+/// center past the face's edge ran the UV off the tile, and the repeat
+/// sampler wrapped it to the far side: the grass side's bottom edge drew
+/// a hairline of its green top row across the dirt wall. Every pixel the
+/// 1× render shows as dirt (with dirt all around it) must stay dirt at
+/// 4×. The camera is tilted and turned so the quad boundary slants across
+/// pixel rows and crosses every sub-pixel offset.
+#[test]
+fn quad_edges_draw_no_texture_seam_at_4x() {
+    let Some(gpu) = gpu_or_skip() else {
+        return;
+    };
+    let camera = Camera::looking_at(
+        DVec3::new(13.0, 13.2, 26.0),
+        DVec3::new(16.5, 12.4, 16.0),
+        FOV,
+        1.0,
+    );
+    let mut images = Vec::new();
+    for samples in [1, 4] {
+        let mut rig = rig(&gpu, samples);
+        rig.renderer.set_fog(false);
+        upload_grass_wall(&mut rig, &gpu);
+        images.push(render(&mut rig, &gpu, &camera));
+    }
+    let (one, four) = (&images[0], &images[1]);
+    // Dirt reads clearly red over green; the grass band and the sky do not.
+    let dirt = |p: [u8; 3]| i32::from(p[0]) > i32::from(p[1]) + 15;
+    let mut checked = 0;
+    for y in 1..SIZE - 1 {
+        for x in 1..SIZE - 1 {
+            let interior = (-1i32..=1).all(|dy| {
+                (-1i32..=1).all(|dx| dirt(rgb(one, (x as i32 + dx) as u32, (y as i32 + dy) as u32)))
+            });
+            if !interior {
+                continue;
+            }
+            checked += 1;
+            let p = rgb(four, x, y);
+            assert!(
+                dirt(p),
+                "pixel ({x}, {y}) is dirt at 1x {:?} but {p:?} at 4x: a texture seam",
+                rgb(one, x, y)
+            );
+        }
+    }
+    assert!(checked > 2000, "only {checked} dirt pixels checked");
+}

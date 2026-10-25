@@ -54,6 +54,9 @@ pub struct HudSnapshot {
     pub lod_queue: usize,
     /// Whether the level tint debug view is on.
     pub lod_tint: bool,
+    /// The debug views off their defaults
+    /// (`RenderSettings::debug_view_names`); none at the defaults.
+    pub views: Vec<String>,
 }
 
 /// Formats the snapshot into the overlay lines, in draw order.
@@ -133,6 +136,12 @@ pub fn lines(snap: &HudSnapshot) -> Vec<String> {
     }
     lod.push_str(&format!(" Q {}", snap.lod_queue));
     lines.push(lod);
+    // Any debug view that changes the picture is named, so a view left on
+    // with the panel closed (the wireframe's edge lines) cannot pass for
+    // a rendering fault.
+    if !snap.views.is_empty() {
+        lines.push(format!("VIEWS {}", snap.views.join(" ")));
+    }
     // While the level tint is on, the legend names each level's color.
     if snap.lod_tint {
         lines.push(
@@ -203,6 +212,7 @@ mod tests {
             ],
             lod_queue: 5,
             lod_tint: true,
+            views: vec!["WIREFRAME".to_string(), "NO-FOG".to_string()],
         }
     }
 
@@ -226,6 +236,7 @@ mod tests {
                 "FACES 123456 PAGES 4 CMDS 928 DRAWS 8 cpu-cull",
                 "CULL DRAWN 928 FRUSTUM 40 OCCLUDED 7",
                 "LOD L1 60/52 M11 Q 5",
+                "VIEWS WIREFRAME NO-FOG",
                 "LOD TINT L1 2x2 red L2 4x4 yellow L3 8x8 green L4 16x16 cyan L5 32x32 blue L6 64x64 purple",
             ]
         );
@@ -233,7 +244,7 @@ mod tests {
 
     /// Before the Welcome, and with no target, the player block is one
     /// placeholder line and TARGET shows the dash; level 0 alone leaves
-    /// a bare `LOD ... Q 0` line and no tint legend.
+    /// a bare `LOD ... Q 0` line, no views line and no tint legend.
     #[test]
     fn minimal_snapshot_marks_the_missing_player_and_target() {
         let mut snap = full();
@@ -242,6 +253,7 @@ mod tests {
         snap.levels.truncate(1);
         snap.lod_queue = 0;
         snap.lod_tint = false;
+        snap.views.clear();
         let lines = lines(&snap);
         assert_eq!(lines[4], "TARGET ---");
         assert_eq!(lines[6], "MODE --- (not joined)");

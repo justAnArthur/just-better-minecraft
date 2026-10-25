@@ -1116,3 +1116,178 @@ fn win_path_note() -> &'static str {
         "cpu-cull"
     }
 }
+
+/// Task 2.17's seam probe: cracks are pixels where the sky shows through
+/// solid terrain. Each view and size of `JBM_PERF_RES` renders twice with
+/// the whole sky overridden to two different colors (fog, water shading
+/// and clouds off, so no terrain fragment reads the sky); a pixel that
+/// differs between the two shows the sky in some sample. The sky itself
+/// and the AA edges of silhouettes against it are one big component
+/// touching the image border; everything else is a crack. Prints the
+/// crack components per view and saves the frame with the cracks painted
+/// red (and grown, so a single pixel shows) under `target/seam-probe/`.
+/// `JBM_MSAA=1` makes every crack sample a full pixel. Run with
+/// `cargo test --release -p jbm-game --test far_metrics seam_probe -- --ignored --nocapture`.
+#[test]
+#[ignore = "slow real-server measurement; run with --ignored"]
+fn seam_probe() {
+    let start = Instant::now();
+    let Some(gpu) = jbm_client::testing::screenshot::gpu_or_skip() else {
+        return;
+    };
+    let mut registry = jbm_core::block::BlockRegistry::new();
+    let blocks = jbm_core::block::builtin::Blocks::register(&mut registry);
+    let nav = Generator::with_preset(DEFAULT_SEED, blocks, Preset::Overworld);
+    let settings = RenderSettings {
+        fog: false,
+        water: false,
+        clouds: false,
+        ..RenderSettings::from_env()
+    };
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/seam-probe");
+    std::fs::create_dir_all(&dir).expect("probe dir");
+
+    let mut views = vec![("user", USER_VIEW_EYE, USER_VIEW_YAW, USER_VIEW_PITCH)];
+    for (tag, feet, up, yaw, pitch) in look_sites(&nav) {
+        views.push((tag, feet + DVec3::new(0.0, up + 1.62, 0.0), yaw, pitch));
+    }
+    let only = std::env::var("JBM_PERF_VIEWS").ok();
+    let mut table = Vec::new();
+    for (tag, eye, yaw, pitch) in views {
+        if only
+            .as_deref()
+            .is_some_and(|list| !list.split(',').any(|t| t.trim() == tag))
+        {
+            continue;
+        }
+        let mut server = Server::with_config(ServerConfig {
+            gen_threads: 6,
+            ..ServerConfig::default()
+        });
+        let (mut client, server_end) = jbm_core::link::in_process_pair();
+        server.add_connection(server_end);
+        client
+            .send(ClientMsg::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                name: "seams".to_owned(),
+            })
+            .unwrap();
+        let mut win = MetricsClient::with_settings(&gpu, settings);
+        let feet = eye - DVec3::new(0.0, 1.62, 0.0);
+        join_and_teleport(
+            &mut server,
+            &mut win,
+            &mut client,
+            &gpu,
+            feet,
+            start + TEST_TIMEOUT,
+        );
+        let mut camera = Camera::new(eye, 70.0_f32.to_radians(), WIDTH as f32 / HEIGHT as f32);
+        camera.set_yaw(yaw.to_radians());
+        camera.set_pitch(pitch.to_radians());
+        settle(
+            &mut server,
+            &mut win,
+            &mut client,
+            &gpu,
+            &camera,
+            start + TEST_TIMEOUT,
+        );
+        for (width, height, scale) in perf_resolutions() {
+            win.renderer.set_settings(RenderSettings {
+                render_scale: scale.unwrap_or(settings.render_scale),
+                ..settings
+            });
+            win.resize(&gpu, width, height);
+            camera.aspect = width as f32 / height as f32;
+            let mut frames = Vec::new();
+            for sky in [[1.0, 0.0, 1.0, 1.0], [0.0, 1.0, 0.0, 1.0]] {
+                win.renderer.set_sky_colors(Some((sky, sky, sky)));
+                for _ in 0..WARMUP_FRAMES {
+                    win.render_frame(&gpu, &camera);
+                }
+                win.render_frame(&gpu, &camera);
+                frames.push(win.target.read_rgba(&gpu));
+            }
+            win.renderer.set_sky_colors(None);
+            let cracks = crack_components(&frames[0], &frames[1]);
+            let pixels: usize = cracks.iter().map(Vec::len).sum();
+            let largest = cracks.iter().map(Vec::len).max().unwrap_or(0);
+            let size = match scale {
+                Some(scale) => format!("{width}x{height}@{scale}"),
+                None => format!("{width}x{height}"),
+            };
+            let mut shot = frames[1].clone();
+            for &(x, y) in cracks.iter().flatten() {
+                for dy in -2..=2_i64 {
+                    for dx in -2..=2_i64 {
+                        let (px, py) = (i64::from(x) + dx, i64::from(y) + dy);
+                        if px >= 0 && py >= 0 && px < i64::from(width) && py < i64::from(height) {
+                            shot.put_pixel(px as u32, py as u32, image::Rgba([255, 0, 0, 255]));
+                        }
+                    }
+                }
+            }
+            let path = dir.join(format!("{tag}_{size}.png"));
+            shot.save(&path).expect("save probe");
+            let line = format!(
+                "{tag:<11}{size:>14}  crack components {:>5}  pixels {:>6}  largest {:>4}",
+                cracks.len(),
+                pixels,
+                largest
+            );
+            println!("{line}  ({})", path.display());
+            table.push(line);
+        }
+    }
+    println!("\nseam_probe (msaa {}):", settings.msaa_samples);
+    for line in &table {
+        println!("{line}");
+    }
+}
+
+/// The 8-connected components of pixels that differ between `a` and `b`
+/// (more than 3 levels in any channel), without the ones touching the
+/// image border (the sky and silhouettes against it).
+fn crack_components(a: &image::RgbaImage, b: &image::RgbaImage) -> Vec<Vec<(u32, u32)>> {
+    let (w, h) = a.dimensions();
+    let differs = |x: u32, y: u32| {
+        let (p, q) = (a.get_pixel(x, y).0, b.get_pixel(x, y).0);
+        (0..3).any(|c| p[c].abs_diff(q[c]) > 3)
+    };
+    let mut seen = vec![false; (w * h) as usize];
+    let mut out = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            if seen[(y * w + x) as usize] || !differs(x, y) {
+                continue;
+            }
+            seen[(y * w + x) as usize] = true;
+            let mut stack = vec![(x, y)];
+            let mut component = Vec::new();
+            let mut border = false;
+            while let Some((cx, cy)) = stack.pop() {
+                component.push((cx, cy));
+                border |= cx == 0 || cy == 0 || cx == w - 1 || cy == h - 1;
+                for dy in -1..=1_i64 {
+                    for dx in -1..=1_i64 {
+                        let (nx, ny) = (i64::from(cx) + dx, i64::from(cy) + dy);
+                        if nx < 0 || ny < 0 || nx >= i64::from(w) || ny >= i64::from(h) {
+                            continue;
+                        }
+                        let (nx, ny) = (nx as u32, ny as u32);
+                        let index = (ny * w + nx) as usize;
+                        if !seen[index] && differs(nx, ny) {
+                            seen[index] = true;
+                            stack.push((nx, ny));
+                        }
+                    }
+                }
+            }
+            if !border {
+                out.push(component);
+            }
+        }
+    }
+    out
+}

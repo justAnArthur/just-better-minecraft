@@ -159,6 +159,19 @@ JBM_PERF_VIEWS=user,coast JBM_PERF_VARIANTS=base,gpu_cull cargo test --release -
 The game's render scale is `JBM_RENDER_SCALE=auto|<0.25..1>`. The F3
 panel changes it live.
 
+**Seam probe (task 2.17).** `far_metrics::seam_probe` (ignored) counts
+pixels where the sky shows through solid terrain. Each view and size of
+`JBM_PERF_RES` / `JBM_PERF_VIEWS` renders twice, the whole sky overridden
+to magenta and then green, with fog, water shading and clouds off. A
+pixel that differs between the two shows the sky in some sample; the
+components that do not touch the image border are cracks. It prints
+their count, pixels and largest component per view and size, and saves
+the frame with the cracks painted red under `target/seam-probe/`.
+
+```bash
+JBM_PERF_VIEWS=user,spawn_60up cargo test --release -p jbm-game --test far_metrics seam_probe -- --ignored --nocapture
+```
+
 **LOD rings (task 2.6).** `terrain_draw` adds `rings/cpu_cull` and
 `rings/gpu_cull`: the rings scene at game scale (default
 `lod_view_radius`, 5 levels since task 2.13 E) built in

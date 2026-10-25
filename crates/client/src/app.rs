@@ -692,6 +692,7 @@ impl App {
             // share of the in-flight mesh jobs (tracked by `TerrainSync`).
             lod_queue: self.sync.world().lod_dirty_count() + self.sync.in_flight_lod(),
             lod_tint: w.renderer.lod_tint(),
+            views: w.renderer.settings().debug_view_names(),
         };
         let mut overlay = OverlayText::new();
         if self.panel_open {
